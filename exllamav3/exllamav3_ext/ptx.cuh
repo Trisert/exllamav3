@@ -383,10 +383,9 @@ __device__ inline void cp_async_wait()
 }
 
 // Load 16x16 matrix fragment from shared memory, directly in tensor core layout.
-// Pre-Turing has no ldmatrix: gather the same per-lane fragment with synchronous shared-memory
-// loads (same layout as exl3_ldsm4 in rocm/ptx_rocm.cuh; __shfl_sync with a full mask lowers to
-// the legacy shfl on sm_60). The host dispatch excludes these devices from the tensor kernels,
-// so this branch only ever runs if one is forced there.
+// Pre-Turing has no ldmatrix. The host dispatch excludes these devices from the tensor kernels,
+// so the sub-sm_75 branch only keeps the sm_60 target compiling (same no-op pattern as the
+// ptx_mma_* branches above); the __trap() makes forcing one there loud, never silent-wrong.
 
 __device__ inline void ldsm4(FragA& frag_a, const void* smem_ptr)
 {
@@ -401,19 +400,12 @@ __device__ inline void ldsm4(FragA& frag_a, const void* smem_ptr)
         : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(smem)
     );
 #else
-    // ldmatrix.sync.aligned.m8n8.x4: lanes 8i..8i+7 supply the row addresses of matrix i, and
-    // lane l receives, for each matrix i, the two b16 values at row l/4, columns 2*(l%4) and +1.
-    int lane = threadIdx.x & 31;
-    unsigned long long base = (unsigned long long) (uintptr_t) smem_ptr;
-    int row = lane >> 2;
-    int col_bytes = (lane & 3) * 4;
-    uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
-    #pragma unroll
-    for (int i = 0; i < 4; ++i)
-    {
-        unsigned long long row_ptr = __shfl_sync(0xffffffffu, base, 8 * i + row);
-        a[i] = *reinterpret_cast<const uint32_t*>((uintptr_t) row_ptr + col_bytes);
-    }
+    // Pre-Turing has no ldmatrix and no verified emulated layout: no-op + trap, same pattern
+    // as the ptx_mma_* branches above (host dispatch excludes these devices, so this only
+    // keeps the sm_60 target compiling; forcing one here traps loudly instead of computing
+    // a silently-wrong fragment).
+    (void) frag_a; (void) smem_ptr;
+    __trap();
 #endif
 }
 

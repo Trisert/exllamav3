@@ -113,8 +113,15 @@ int select_gemm_shape(int cc, int size_m, int size_k, int size_n, int K, bool mu
     size_k *= bszm_in;
     size_n *= bszm_out;
 
+    // CC_PASCAL (=6) has no case below on purpose: it falls through to `return 0`, which the
+    // select_exl3_{gemm,mgemm}_kernel callers turn into a loud TORCH_CHECK (Pascal has no
+    // tensor-core shapes; entry guards decline before this is reached). Ordered-comparison
+    // hazard: CC_PASCAL=6 > CC_BLACKWELL=5, so never test `cc < X` here -- a future
+    // `cc < CC_HOPPER`-style test would misclassify Pascal; use explicit equality instead.
     switch(cc)
     {
+        case CC_PASCAL:
+            return 0;
         case CC_OLD:
         case CC_AMPERE:
             if (mod_256 && K <= 4)
