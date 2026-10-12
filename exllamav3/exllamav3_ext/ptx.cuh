@@ -190,6 +190,21 @@ __device__ inline void barrier_acquire
     __syncthreads();
     // Every wave acquires at device scope, so none reads the other blocks' data through a stale per-CU cache
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700)
+    // sm_60 has no ld.acquire: a volatile re-read plus a system fence per
+    // iteration is enough for the unidirectional arrival flag used here.
+    if (threadIdx.x == 0)
+    {
+        volatile int* vlock = lock;
+        int state = -1;
+        do
+        {
+            state = *vlock;
+            __threadfence_system();
+        }
+        while (state != stage);
+    }
+    __syncthreads();
 #else
     if (threadIdx.x == 0)
     {
@@ -224,6 +239,22 @@ __device__ inline void barrier_release
             return;
         }
         __hip_atomic_fetch_add(lock, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700)
+    // sm_60 has no fence.acq_rel/red.relaxed: publish the block's writes with
+    // a system fence, then update the arrival counter. atomicAdd keeps the
+    // multi-block arrival count exact; the reset path is a single-writer flag.
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        if (reset)
+        {
+            __threadfence_system();
+            *reinterpret_cast<volatile int*>(lock) = 0;
+            return;
+        }
+        __threadfence_system();
+        atomicAdd(lock, val);
     }
 #else
     __syncthreads();
@@ -470,27 +501,53 @@ __device__ __forceinline__ uint4 ldg_cv_u128(const uint4* p)
 
 __device__ __forceinline__ uint32_t ldg_acquire_sys_u32(const uint32_t* p)
 {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700)
+    // No ld.acquire on sm_60: volatile re-read + system fence. Weaker than
+    // acquire, sufficient for unidirectional flags.
+    uint32_t v = *reinterpret_cast<const volatile uint32_t*>(p);
+    __threadfence_system();
+    return v;
+#else
     uint32_t v;
     asm volatile("ld.global.acquire.sys.u32 %0, [%1];"
                  : "=r"(v) : "l"(p) : "memory");
     return v;
+#endif
 }
 
 __device__ __forceinline__ uint64_t ldg_acquire_sys_u64(const uint64_t* p)
 {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700)
+    uint64_t v = *reinterpret_cast<const volatile uint64_t*>(p);
+    __threadfence_system();
+    return v;
+#else
     uint64_t v;
     asm volatile("ld.global.acquire.sys.u64 %0, [%1];" : "=l"(v) : "l"(p) : "memory");
     return v;
+#endif
 }
 
 __device__ __forceinline__ void stg_release_sys_u32(uint32_t* p, uint32_t v)
 {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700)
+    // No st.release on sm_60: fence first so prior writes are visible before
+    // the flag store, then a volatile store.
+    __threadfence_system();
+    *reinterpret_cast<volatile uint32_t*>(p) = v;
+#else
     asm volatile("st.global.release.sys.u32 [%0], %1;" :: "l"(p), "r"(v) : "memory");
+#endif
 }
 
 __device__ __forceinline__ void stg_release_sys_u64(uint64_t* p, uint64_t v)
 {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700)
+    __threadfence_system();
+    *reinterpret_cast<volatile uint64_t*>(p) = v;
+#else
     asm volatile("st.global.release.sys.u64 [%0], %1;" :: "l"(p), "l"(v) : "memory");
+#endif
 }
 
 // Global time in nanoseconds
