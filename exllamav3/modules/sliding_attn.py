@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
-from ..model.config import Config
+from ..model.config import Config, is_pascal_device
 from ..util.device_copy import host_to_device
 from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2, g_tensor_cache
@@ -947,6 +947,10 @@ class SlidingAttention(Module):
         """Graph-captured decode step over the sliding-window state (projections through
         o_proj as one replayed CUDA graph). Returns the block output, or None when the
         configuration is unsupported."""
+        # The graph-captured step replays tensor-core kernels; on Pascal take the
+        # regular python path (per-linear reconstruct fallback) instead
+        if is_pascal_device(x.device):
+            return None
         if x.dtype != torch.float16 or not x.is_contiguous():
             return None
         layer_instance = (self.layer_idx, params.get("layer_instance", 0))

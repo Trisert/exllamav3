@@ -1,6 +1,6 @@
 from __future__ import annotations
 import torch
-from ...model.config import Config
+from ...model.config import Config, is_pascal_device
 from .exl3_lib.quantize import frac_k, preapply_had_l, preapply_had_r, had_k, had_n
 from ...ext import exllamav3_ext as ext
 from ...util.tensor import g_tensor_cache
@@ -138,8 +138,11 @@ class LinearEXL3:
         if not reconstruct:
             rows = x.numel() // x.shape[-1]
             if rows <= AUTO_RECONSTRUCT_THRESHOLD or self.config.infer_params.no_reconstruct:
-                dtype = out_dtype or self.default_out_dtype
-                return self.bc.run_alloc(x, self.out_features, dtype == torch.float)
+                # No tensor-core path for the fused GEMM on Pascal and older; the
+                # reconstruct + cuBLAS path below runs there (gated strictly on CC_PASCAL)
+                if not is_pascal_device(x.device):
+                    dtype = out_dtype or self.default_out_dtype
+                    return self.bc.run_alloc(x, self.out_features, dtype == torch.float)
 
         return self.reconstruct_hgemm(x, out_dtype)
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
-from ..model.config import Config
+from ..model.config import Config, is_pascal_device
 from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2
 from . import Module, Linear, RMSNorm, LayerNorm
@@ -961,6 +961,10 @@ class Attention(Module):
         """
         from ..cache import CacheLayer
 
+        # The graph-captured block replays tensor-core kernels; on Pascal take the
+        # regular python path (per-linear reconstruct fallback) instead
+        if is_pascal_device(x.device):
+            return None
         if cache is None or x.dtype != torch.float16 or not x.is_contiguous():
             return None
         if params.get("sim_kvq") is not None:

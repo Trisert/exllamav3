@@ -3,7 +3,7 @@ from typing_extensions import override
 import torch
 import torch.nn.functional as F
 from torch import nn
-from ..model.config import Config
+from ..model.config import Config, is_pascal_device
 from ..util.tensor import to2
 from . import Module, Linear
 from ..ext import exllamav3_ext as ext
@@ -865,7 +865,12 @@ class GatedMLP(Module):
 
             for s in r:
 
-                if self.bc is not None and bsz * q_len <= MAX_BSZN:
+                # BC_GatedMLP replays fused tensor-core kernels; on Pascal take the unfused
+                # path below (per-linear reconstruct fallback) instead
+                if (
+                    self.bc is not None and bsz * q_len <= MAX_BSZN and
+                    not is_pascal_device(x.device)
+                ):
                     d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
                     xv = x.view(1, bsz * q_len, dim)     # local view: x itself feeds every slice
                     self.bc.run_bszN(xv, d.view(xv.shape))

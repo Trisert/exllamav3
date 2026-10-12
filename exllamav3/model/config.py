@@ -9,6 +9,29 @@ from ..loader import SafetensorsCollection
 from ..util.file import read_dict, no_value, no_default
 import uuid
 
+# CC_PASCAL from exllamav3_ext/quant/exl3_devctx.cuh. Pascal and older have no tensor
+# cores, so the fused exl3_gemm/exl3_mgemm kernels trap there; the Python-side decode
+# fallbacks (reconstruct + unfused) key off this. g_get_cc itself is cached in DevCtx,
+# so the lookup is cheap; the result is cached per device below as well.
+CC_PASCAL = 6
+_pascal_device_cache: dict[int, bool] = {}
+
+
+def is_pascal_device(device) -> bool:
+    """True when `device` is a CUDA device without tensor cores (Pascal and older)."""
+    if device is None:
+        return False
+    device = torch.device(device)
+    if device.type != "cuda" or device.index is None:
+        return False
+    cached = _pascal_device_cache.get(device.index)
+    if cached is None:
+        from ..ext import exllamav3_ext as ext
+        cached = ext.g_get_cc(device.index) == CC_PASCAL
+        _pascal_device_cache[device.index] = cached
+    return cached
+
+
 @dataclass
 class InferParams:
     """
@@ -70,6 +93,11 @@ class InferParams:
         self.embed_stream_from_disk = os.environ.get("EXL3_EMBED_STREAM", "0") != "0"
 
     def use_mgemm(self, K: int, out_features: int, mul1: bool = False, device = None) -> bool:
+        # Pascal and older have no tensor cores: the fused mgemm kernel traps, so take
+        # the existing unfused path on every caller (their per-row linears in turn take
+        # the reconstruct fallback). Gated strictly on CC_PASCAL; sm_75+ unchanged.
+        if device is not None and is_pascal_device(device):
+            return False
         # Unfusing only pays when the separate GEMV calls can actually take the int8 path, which
         # requires the mul1 codebook; other tensors always keep the fused MGEMM
         if not mul1:

@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing_extensions import override
 import torch
 import torch.nn.functional as F
-from ..model.config import Config
+from ..model.config import Config, is_pascal_device
 from ..util.tensor import get_for_device, to2
 from . import Module, Linear
 from ..ext import exllamav3_ext as ext
@@ -1244,11 +1244,13 @@ class GatedDeltaNet(Module):
         # (_BC_MAX_BSZ, _BC_MAX_QLEN) and over save_history (needed for MTP draft/verify). Runs
         # the entire layer in one call, replayed through an internal CUDA graph per (bsz, seqlen,
         # history) shape from the third invocation of that shape on
+        # The fused C++ path replays tensor-core kernels; on Pascal take the torch path
+        # below (per-linear reconstruct fallback) instead
         if (
             self.bc_split and save_state and
             recurrent_slots is not None and
             1 <= bsz <= _BC_MAX_BSZ and 1 <= seqlen <= _BC_MAX_QLEN and
-            not spec_step
+            not spec_step and not is_pascal_device(x.device)
         ):
             stage_key = id(rsl) if save_history else 0
             if self.bc.needs_configure(bsz, seqlen, save_history, stage_key):
