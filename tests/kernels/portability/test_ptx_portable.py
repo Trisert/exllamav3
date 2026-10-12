@@ -88,6 +88,85 @@ def reference(a, b, c, pos, length):
     return ref.astype(np.uint32)
 
 
+DP4A_SIGN_SRC = r"""
+#include <torch/extension.h>
+#include "ptx_portable.cuh"
+
+// exl3_dp4a_us only: no __dp4a builtin and no dp4a inline PTX, so this compiles (and runs) on
+// every arch including sm_60, where the dp4a instruction does not exist.
+__global__ void dp4a_us_kernel(const uint32_t* a, const uint32_t* b, const int* c, uint32_t* out, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = static_cast<uint32_t>(exl3_dp4a_us(a[i], b[i], c[i]));
+}
+
+torch::Tensor run_dp4a(torch::Tensor a, torch::Tensor b, torch::Tensor c)
+{
+    int n = a.numel();
+    auto out = torch::zeros({n}, a.options());
+    dp4a_us_kernel<<<(n + 255) / 256, 256>>>(
+        (const uint32_t*) a.data_ptr(), (const uint32_t*) b.data_ptr(),
+        c.data_ptr<int>(), (uint32_t*) out.data_ptr(), n);
+    return out;
+}
+"""
+
+DP4A_SIGN_CPP = "torch::Tensor run_dp4a(torch::Tensor a, torch::Tensor b, torch::Tensor c);"
+
+
+def test_dp4a_us_sign_extension(device, tmp_path):
+    """exl3_dp4a_us must implement dp4a.u32.s32: unsigned bytes of a times SIGNED bytes of b.
+
+    Edge vectors: b = 0x01010101 with a bytes 0x80/0xFF (the mul1 byte-sum call pattern used by
+    codebook.cuh and exl3_gemv_kernel.cuh), plus a general section where b itself carries
+    0x80/0xFF bytes so an unsigned*unsigned model cannot pass. Compared against the NumPy model
+    with bb viewed as int8 (the same model as reference() column 6).
+    """
+    header = os.path.join(EXT_DIR, "ptx_portable.cuh")
+    with open(header, "rb") as f:
+        digest = hashlib.sha256(f.read()).hexdigest()
+    inc = EXT_DIR
+    if HIP:
+        shutil.copy(header, tmp_path)
+        inc = str(tmp_path)
+    ext = load_inline(
+        name = "ptx_portable_dp4a_test", cpp_sources = DP4A_SIGN_CPP,
+        cuda_sources = f"// ptx_portable.cuh {digest}\n" + DP4A_SIGN_SRC,
+        functions = ["run_dp4a"],
+        extra_include_paths = [inc], verbose = False,
+    )
+    a_vals, b_vals, c_vals = [], [], []
+    # Section 1: the kernels' call pattern, b = 0x01010101, a over 0x80/0xFF edge bytes
+    edge_words = [0x00000000, 0x01010101, 0x7f7f7f7f, 0x80808080, 0xffffffff,
+                 0x807f00ff, 0xff800100, 0x80000000, 0x00000080, 0x000000ff, 0x7f0080ff]
+    for w in edge_words:
+        a_vals.append(w); b_vals.append(0x01010101); c_vals.append(0)
+    for w in edge_words:
+        a_vals.append(w); b_vals.append(0x01010101); c_vals.append(0x6400)
+    for w in [0x80808080, 0xffffffff, 0x807f00ff]:
+        a_vals.append(w); b_vals.append(0x01010101); c_vals.append(-7)
+    # Section 2: b itself carries 0x80/0xFF bytes (locks the signedness of the second operand)
+    for b in [0x00000000, 0x01010101, 0x7f7f7f7f, 0x80808080, 0xffffffff, 0xff7f0180, 0x80017fff]:
+        for a in [0x00000000, 0x01010101, 0x80808080, 0xffffffff, 0x7f0080ff]:
+            a_vals.append(a); b_vals.append(b); c_vals.append(0x6400)
+    a = np.array(a_vals, dtype = np.uint32)
+    b = np.array(b_vals, dtype = np.uint32)
+    c = np.array(c_vals, dtype = np.int32)
+    n = len(a)
+    pos = np.zeros(n, dtype = np.int32)
+    length = np.zeros(n, dtype = np.int32)
+    ref = reference(a, b, c, pos, length)[:, 6]
+    t = lambda x: torch.from_numpy(x.view(np.int32)).to(device)
+    out = ext.run_dp4a(t(a), t(b), t(c)).cpu().numpy().view(np.uint32)
+    bad = np.nonzero(out != ref)[0]
+    assert not len(bad), (
+        f"exl3_dp4a_us sign-extension mismatch at row {bad[0]}: "
+        f"a={a[bad[0]]:#010x} b={b[bad[0]]:#010x} c={c[bad[0]]} "
+        f"got={out[bad[0]]:#010x} want={ref[bad[0]]:#010x}"
+    )
+
+
 def test_ptx_portable(device, tmp_path):
     # On ROCm the header is compiled from a copy, since torch hipifies the include directories in place. On CUDA the
     # source tree is included directly, which keeps the include path (part of the build hash) stable between runs.

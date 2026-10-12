@@ -61,6 +61,9 @@ __device__ __forceinline__ int dp4a_us(uint32_t a, uint32_t b, int c)
 {
 #if defined(USE_ROCM)
     return exl3_dp4a_us(a, b, c);
+#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 610)
+    // No dp4a instruction on sm_60: the portable C++ dot in ptx_portable.cuh (via ptx.cuh) stands in
+    return exl3_dp4a_us(a, b, c);
 #else
     int d;
     asm ("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));

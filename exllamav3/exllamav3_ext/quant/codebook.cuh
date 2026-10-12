@@ -42,8 +42,15 @@ __device__ inline half2 decode_mul1_product_2(uint32_t x0, uint32_t x1)
     // uint32_t sum1;
     // asm ("vabsdiff4.u32.u32.u32.add %0, %1, %2, %3;" : "=r"(sum0) : "r"(x0), "r"(0), "r"(acc) : );
     // asm ("vabsdiff4.u32.u32.u32.add %0, %1, %2, %3;" : "=r"(sum1) : "r"(x1), "r"(0), "r"(acc) : );
+    // Byte sum via dp4a, bit-identical to the previous vabsdiff4(x, 0, acc) but native on Blackwell
+    // (__dp4a needs sm_61+: on sm_60 the portable C++ dot in ptx_portable.cuh stands in)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 610)
+    uint32_t sum0 = (uint32_t) exl3_dp4a_us(x0, 0x01010101u, (int) acc);
+    uint32_t sum1 = (uint32_t) exl3_dp4a_us(x1, 0x01010101u, (int) acc);
+#else
     uint32_t sum0 = __dp4a(x0, 0x01010101u, acc);
     uint32_t sum1 = __dp4a(x1, 0x01010101u, acc);
+#endif
     half2 k_inv_h2 = __half2half2(__ushort_as_half(0x1eee));  //  0.00677 = 1/147.7
     half2 k_bias_h2 = __half2half2(__ushort_as_half(0xc931));  // -10.39 = (-1024.0 - 510.0) * k_inv_h
     half_uint16 h0((uint16_t) sum0);
@@ -89,9 +96,14 @@ __device__ inline half decode_3inst(uint32_t x)
         const uint32_t acc = 0x6400u;  // 0x6400 -> 1024.0 ..  0x67FF -> 2047.0
         // Byte sum via dp4a, bit-identical to the previous vabsdiff4(x, 0, acc) but native on Blackwell
         // where vabsdiff4 is emulated. dp4a also wins om Ampere now, possibly after compiler changes, and ties on Ada
+        // (__dp4a needs sm_61+: on sm_60 the portable C++ dot in ptx_portable.cuh stands in)
         // uint32_t sum;
         // asm ("vabsdiff4.u32.u32.u32.add %0, %1, %2, %3;" : "=r"(sum) : "r"(x), "r"(0), "r"(acc) : );
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 610)
+        uint32_t sum = (uint32_t) exl3_dp4a_us(x, 0x01010101u, (int) acc);
+#else
         uint32_t sum = __dp4a(x, 0x01010101u, acc);
+#endif
         const __half k_inv_h = __ushort_as_half(0x1eee);  //  0.00677 = 1/147.7
         const __half k_bias_h = __ushort_as_half(0xc931);  // -10.39 = (-1024.0 - 510.0) * k_inv_h
         half_uint16 h((uint16_t) sum);
