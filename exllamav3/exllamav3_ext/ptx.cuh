@@ -528,6 +528,18 @@ static __forceinline__ __device__ uint32_t bfe64(uint32_t lo, uint32_t hi, int o
     #define BFE16_IMM(dst, src, imm) asm("bfe.u32 %0, %1, " #imm ", 16;" : "=r"(dst) : "r"(src))
 #endif
 
+// __nanosleep exists only on sm_70+. On sm_60 the spin-waits below only need pacing, not a
+// real sleep, so a short clock() spin stands in. Pacing-only: no correctness semantics.
+// (ROCm precedent: rocm/compat.h s_sleep shim.)
+#if !defined(USE_ROCM) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700)
+__device__ __forceinline__ void __nanosleep(unsigned ns)
+{
+    clock_t start = clock();
+    clock_t spins = (clock_t) (ns > 32u ? 32u : ns);
+    while ((clock() - start) < spins) { }
+}
+#endif
+
 // Inter-block barrier
 
 __device__ inline void group_barrier
