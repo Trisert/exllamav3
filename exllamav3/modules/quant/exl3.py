@@ -13,6 +13,29 @@ RECONSTRUCT_SLICE_GRANULARITY_N = 128
 
 no_fused_reconstruct = os.environ.get("EXL3_NO_FUSED_RECONSTRUCT", "0") != "0"
 
+# Decode weight cache for the reconstruct_hgemm fallback path (Pascal hetero decode runs it
+# once per linear per token). Dequantized blocks are read-only and deterministic, so keeping
+# them across tokens is bitwise identical to rebuilding them. Fill is adaptive: an entry is
+# kept only while the device still has more than EXL3_RECON_CACHE_MARGIN_MB free afterwards,
+# so a nearly-full card (e.g. the 27B P100 shard) transparently gets little or no cache
+# instead of an OOM. EXL3_RECON_CACHE=0 disables the cache entirely.
+recon_cache_disabled = os.environ.get("EXL3_RECON_CACHE", "1") == "0"
+try:
+    recon_cache_margin = int(os.environ.get("EXL3_RECON_CACHE_MARGIN_MB", "1024")) << 20
+except ValueError:
+    recon_cache_margin = 1024 << 20
+
+
+def _recon_cache_keep(device: torch.device, num_bytes: int) -> bool:
+    """Whether a freshly built (already allocated) weight block may be kept cached."""
+    if recon_cache_disabled:
+        return False
+    try:
+        free, _ = torch.cuda.mem_get_info(device)
+    except Exception:
+        return False
+    return free - num_bytes > recon_cache_margin
+
 class LinearEXL3:
 
     quant_type: str = "exl3"
@@ -81,6 +104,7 @@ class LinearEXL3:
         assert self.frac is None or self.mul1, f"{key}: half-integer bitrate {self.K} requires the mul1 codebook"
 
         self._fused_reconstruct = None
+        self._recon_w_cache: dict[tuple[bool, int, int], torch.Tensor] = {}
         self.bsz1_xh_args = (self.trellis.device, (1, self.in_features), self.out_dtype)
         # K is the bitrate (int, or float for the half-integer rates); the C++ side decomposes it
         self.bc = ext.BC_LinearEXL3(
@@ -97,7 +121,7 @@ class LinearEXL3:
 
     def unload(self):
         # g_tensor_cache.drop(*self.bsz1_xh_args)
-        pass
+        self._recon_w_cache.clear()
 
 
     def get_tensors(self, key: str):
@@ -144,7 +168,11 @@ class LinearEXL3:
                     dtype = out_dtype or self.default_out_dtype
                     return self.bc.run_alloc(x, self.out_features, dtype == torch.float)
 
-        return self.reconstruct_hgemm(x, out_dtype)
+        # Autosplit measuring forwards must observe (and leave) the same memory state as
+        # an uncached run: retaining dequantized blocks here would shift every subsequent
+        # fit decision and invalidate the loader's transient accounting
+        keep_cache = not params.get("autosplit_measure", False)
+        return self.reconstruct_hgemm(x, out_dtype, keep_cache)
 
 
     def unpack_bf(self, bitfield: torch.Tensor):
@@ -166,7 +194,7 @@ class LinearEXL3:
         return expanded.contiguous().to(device)
 
 
-    def reconstruct_hgemm(self, x: torch.Tensor, out_dtype):
+    def reconstruct_hgemm(self, x: torch.Tensor, out_dtype, keep_cache: bool = True):
 
         shape = x.shape
         rows = x.numel() // shape[-1]
@@ -198,24 +226,12 @@ class LinearEXL3:
             ext.had_r_128(x, xh, self.suh, None, 1.0)
 
         if self.out_features <= MAX_RECONSTRUCT_SLICE_N:
-            w = torch.empty((self.in_features, self.out_features), dtype = torch.half, device = self.trellis.device)
-            if use_fused:
-                ext.reconstruct_had_slice(w, self.trellis, self.suh, self.svh, self.K, self.mcg, self.mul1, 0)
-            else:
-                self._reconstruct_inner(w, 0)
+            w = self._recon_weight(0, self.out_features, use_fused, keep_cache)
             ext.hgemm_recon(xh, w, y_)
         else:
-            numel_ = self.in_features * MAX_RECONSTRUCT_SLICE_N
-            w_ = torch.empty((numel_,), dtype = torch.half, device = self.trellis.device)
             for n_start in range(0, self.out_features, MAX_RECONSTRUCT_SLICE_N):
                 n_end = min(n_start + MAX_RECONSTRUCT_SLICE_N, self.out_features)
-                numel = self.in_features * (n_end - n_start)
-                w = w_[:numel].view(self.in_features, n_end - n_start)
-                if use_fused:
-                    ext.reconstruct_had_slice(
-                        w, self.trellis, self.suh, self.svh[n_start:], self.K, self.mcg, self.mul1, n_start)
-                else:
-                    self._reconstruct_inner(w, n_start)
+                w = self._recon_weight(n_start, n_end, use_fused, keep_cache)
                 ext.hgemm_recon(xh, w, y_[:, n_start:n_end])
 
         if not use_fused:
@@ -232,6 +248,34 @@ class LinearEXL3:
             ext.reconstruct(w, self.trellis, self.K, self.mcg, self.mul1)
         else:
             ext.reconstruct_slice(w, self.trellis, self.K, self.mcg, self.mul1, n_start)
+
+
+    def _recon_weight(self, n_start: int, n_end: int, use_fused: bool,
+                      keep_cache: bool = True) -> torch.Tensor:
+        """Dequantized (in_features, n_end - n_start) weight block for reconstruct_hgemm.
+
+        Hits are bitwise identical to rebuilding: the block is a pure function of the
+        immutable quantized tensors, and hgemm_recon only reads it. Misses build into a
+        temporary that is kept only when keep_cache allows and device headroom allows
+        (see _recon_cache_keep), otherwise it is freed on return exactly as before.
+        """
+        key = (use_fused, n_start, n_end)
+        w = self._recon_w_cache.get(key)
+        if w is not None:
+            return w
+        w = torch.empty((self.in_features, n_end - n_start), dtype = torch.half,
+                        device = self.trellis.device)
+        if use_fused:
+            svh = self.svh if (n_start == 0 and n_end == self.out_features) else self.svh[n_start:]
+            ext.reconstruct_had_slice(w, self.trellis, self.suh, svh, self.K, self.mcg, self.mul1, n_start)
+        else:
+            self._reconstruct_inner(w, n_start)
+        # Only the rotated-basis (non-fused) blocks are kept: decode rows=1 never takes
+        # the fused path, and prefill is not the bottleneck, so fused blocks always rebuild
+        if keep_cache and not use_fused and \
+                _recon_cache_keep(self.trellis.device, w.numel() * w.element_size()):
+            self._recon_w_cache[key] = w
+        return w
 
     def get_inner_weight_tensor(self, n_offset: int = 0, n_features: int | None = None):
         w = torch.empty((self.in_features, self.out_features), dtype = torch.half, device = self.trellis.device)
@@ -260,6 +304,7 @@ class LinearEXL3:
     def swap_cpu(self):
         if self.swap_device is not None:
             return
+        self._recon_w_cache.clear()
         self.swap_device = self.trellis.device
         if self.su is not None: self.su = self.su.cpu()
         if self.sv is not None: self.sv = self.sv.cpu()
