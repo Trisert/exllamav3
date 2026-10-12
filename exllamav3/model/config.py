@@ -22,13 +22,18 @@ def is_pascal_device(device) -> bool:
     if device is None:
         return False
     device = torch.device(device)
-    if device.type != "cuda" or device.index is None:
+    if device.type != "cuda":
         return False
-    cached = _pascal_device_cache.get(device.index)
+    index = device.index
+    if index is None:
+        # Index-less "cuda" means the current device; resolve it so future callers
+        # passing an unindexed device still get the right per-device answer
+        index = torch.cuda.current_device()
+    cached = _pascal_device_cache.get(index)
     if cached is None:
         from ..ext import exllamav3_ext as ext
-        cached = ext.g_get_cc(device.index) == CC_PASCAL
-        _pascal_device_cache[device.index] = cached
+        cached = ext.g_get_cc(index) == CC_PASCAL
+        _pascal_device_cache[index] = cached
     return cached
 
 
