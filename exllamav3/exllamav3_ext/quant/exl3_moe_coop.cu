@@ -117,7 +117,12 @@ static bool moe_coop_pick_wide(int kslices, int slots, int device)
 {
     const int mode = moe_coop_wide_mode();
     if (mode >= 0) return mode != 0;
-    if (DevCtx::instance().get_cc(device) < CC_BLACKWELL) return true;
+    const int cc = DevCtx::instance().get_cc(device);
+    // Pascal never reaches the coop kernels (rejected at entry), but it must not fall through to
+    // the ordered comparison below: CC_PASCAL is numerically above CC_BLACKWELL, so keep it in
+    // the pre-Blackwell class it split from instead of misclassifying it as Blackwell-or-newer.
+    if (cc == CC_PASCAL) return true;
+    if (cc < CC_BLACKWELL) return true;
     return kslices >= 256 || (kslices >= 128 && slots >= 32);
 }
 
