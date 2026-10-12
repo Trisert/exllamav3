@@ -17,7 +17,18 @@
 //                          runtime (DevCtx::get_smem_max) and shapes that do not fit are
 //                          filtered out of kernel selection rather than failing at launch.
 //
-// ldmatrix, __nanosleep, __dp4a and tanh.approx.f32 are all sm_75-capable and need no gate.
+// ldmatrix, __nanosleep, __dp4a and tanh.approx.f32 are NOT all sm_75-capable. Real floors:
+//
+//   __dp4a                        sm_61+  (sm_60 uses the exl3_dp4a_us fallback in ptx_portable.cuh)
+//   __nanosleep, ld.acquire,
+//   red.relaxed, fence.acq_rel   sm_70+  (sm_60 spins on clock()/volatile + __threadfence_system())
+//   ldmatrix, mma.sync,
+//   tanh.approx.f32               sm_75+  (below: synchronous copies / no-op MMA + host exclusion)
+//   cp.async                      sm_80+  (below: synchronous 16 B copies)
+//
+// Pascal (sm_60) has no tensor cores at all, so unlike Turing it cannot run the EXL3 GEMM/MoE/GEMV
+// kernels even with fallbacks: DevCtx reports CC_PASCAL there and the dispatchers exclude those
+// devices from every mma/ldmatrix/cp.async path (dense shapes fall back to cuBLAS).
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
     #define EXL3_SM75 1

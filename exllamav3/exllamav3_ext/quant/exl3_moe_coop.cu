@@ -305,6 +305,9 @@ void exl3_moe_coop_run
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     const int device = x.device().index();
+    // Pascal (sm_60) has no tensor cores: the coop MoE kernels only compile there, they cannot run.
+    TORCH_CHECK(DevCtx::instance().get_cc(device) != CC_PASCAL,
+                "exl3_moe_coop: no tensor cores on this device (Pascal and older)");
 
     // Per-call checks kept to what can actually vary between calls
     TORCH_CHECK(x.dim() == 2 && x.stride(1) == 1, "exl3_moe_coop: x must be (bsz, H) with unit column stride");

@@ -25,6 +25,11 @@
 #define WORKSPACE_SIZE (16*1024*1024)
 
 #define MAX_DEVICES 16
+// CC_PASCAL is deliberately not 0: cc[device] == 0 means "not queried yet" (see get_cc).
+// Pascal and older have no tensor cores at all, so unlike CC_OLD (Turing and Volta, which have
+// them) they are excluded from every mma/ldmatrix/cp.async path at dispatch; the dense shapes
+// fall back to cuBLAS instead.
+#define CC_PASCAL     6
 #define CC_OLD        1
 #define CC_AMPERE     2
 #define CC_ADA        3

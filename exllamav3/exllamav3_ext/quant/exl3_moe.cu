@@ -408,6 +408,8 @@ void exl3_moe
     cudaGetDevice(&device);
     int num_sms = DevCtx::instance().get_num_sms(device);
     int cc = DevCtx::instance().get_cc(device);
+    // Pascal (sm_60) has no tensor cores: the fused MoE kernels only compile there, they cannot run.
+    TORCH_CHECK(cc != CC_PASCAL, "exl3_moe: no tensor cores on this device (Pascal and older)");
     int* locks = DevCtx::instance().get_locks(device);
     // Every MoE instantiation fits in 44 KB (TILESIZE_N caps at 256, unlike the GEMM's 512),
     // so clamping the request to the device limit never excludes a shape here; it only stops

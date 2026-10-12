@@ -27,6 +27,9 @@ using FragC_h = Vec<half2, 2>;
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#matrix-fragments-for-mma-m8n8k4-with-f16-floating-point-type
 
 #if !defined(USE_ROCM)
+// mma.sync.m8n8k4 needs sm_70+. Below that the host dispatch excludes the kernel, so this
+// branch only keeps the sm_60 target compiling (same no-op pattern as det_gemm.cuh).
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
 __device__ inline void ptx_mma_m8n8k4
 (
     const Vec<half2, 2>& frag_a,
@@ -51,6 +54,17 @@ __device__ inline void ptx_mma_m8n8k4
            "f"(d[0]), "f"(d[1]), "f"(d[2]), "f"(d[3]), "f"(d[4]), "f"(d[5]), "f"(d[6]), "f"(d[7])
     );
 }
+#else
+__device__ inline void ptx_mma_m8n8k4
+(
+    const Vec<half2, 2>& frag_a,
+    const Vec<half2, 2>& frag_b,
+    Vec<float, 8>& frag_c
+)
+{
+    (void) frag_a; (void) frag_b; (void) frag_c;
+}
+#endif
 #endif
 
 // m16n8k16 tensor core matmul
@@ -79,7 +93,7 @@ __device__ inline void ptx_mma_m16n8k16
 {
 #if defined(USE_ROCM)
     exl3_mma_m16n8k16_f32(frag_a, frag_b, frag_c);
-#else
+#elif !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 750
     const uint32_t* a = reinterpret_cast<const uint32_t*>(&frag_a);
     const uint32_t* b = reinterpret_cast<const uint32_t*>(&frag_b);
     float* c = reinterpret_cast<float*>(&frag_c);
@@ -118,6 +132,10 @@ __device__ inline void ptx_mma_m16n8k16
            "f"(d[0]), "f"(d[1]), "f"(d[2]), "f"(d[3])
     );
 #endif
+#else
+    // Pre-Turing has no tensor cores. The host dispatch excludes these devices, so this branch
+    // only keeps the sm_60 target compiling (same no-op pattern as det_gemm.cuh).
+    (void) frag_a; (void) frag_b; (void) frag_c;
 #endif
 }
 
@@ -131,7 +149,7 @@ __device__ inline void ptx_mma_m16n8k16
 {
 #if defined(USE_ROCM)
     exl3_mma_m16n8k16_f16(frag_a, frag_b, frag_c);
-#else
+#elif !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 750
     const uint32_t* a = reinterpret_cast<const uint32_t*>(&frag_a);
     const uint32_t* b = reinterpret_cast<const uint32_t*>(&frag_b);
     uint32_t* c = reinterpret_cast<uint32_t*>(&frag_c);
@@ -170,6 +188,10 @@ __device__ inline void ptx_mma_m16n8k16
            "r"(d[0]), "r"(d[1])
     );
 #endif
+#else
+    // Pre-Turing has no tensor cores. The host dispatch excludes these devices, so this branch
+    // only keeps the sm_60 target compiling (same no-op pattern as det_gemm.cuh).
+    (void) frag_a; (void) frag_b; (void) frag_c;
 #endif
 }
 
@@ -360,13 +382,17 @@ __device__ inline void cp_async_wait()
 #endif
 }
 
-// Load 16x16 matrix fragment from shared memory, directly in tensor core layout
+// Load 16x16 matrix fragment from shared memory, directly in tensor core layout.
+// Pre-Turing has no ldmatrix: gather the same per-lane fragment with synchronous shared-memory
+// loads (same layout as exl3_ldsm4 in rocm/ptx_rocm.cuh; __shfl_sync with a full mask lowers to
+// the legacy shfl on sm_60). The host dispatch excludes these devices from the tensor kernels,
+// so this branch only ever runs if one is forced there.
 
 __device__ inline void ldsm4(FragA& frag_a, const void* smem_ptr)
 {
 #if defined(USE_ROCM)
     exl3_ldsm4(frag_a, smem_ptr);
-#else
+#elif !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 750
     uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
     uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
     asm volatile
@@ -374,6 +400,20 @@ __device__ inline void ldsm4(FragA& frag_a, const void* smem_ptr)
         "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
         : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(smem)
     );
+#else
+    // ldmatrix.sync.aligned.m8n8.x4: lanes 8i..8i+7 supply the row addresses of matrix i, and
+    // lane l receives, for each matrix i, the two b16 values at row l/4, columns 2*(l%4) and +1.
+    int lane = threadIdx.x & 31;
+    unsigned long long base = (unsigned long long) (uintptr_t) smem_ptr;
+    int row = lane >> 2;
+    int col_bytes = (lane & 3) * 4;
+    uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
+    #pragma unroll
+    for (int i = 0; i < 4; ++i)
+    {
+        unsigned long long row_ptr = __shfl_sync(0xffffffffu, base, 8 * i + row);
+        a[i] = *reinterpret_cast<const uint32_t*>((uintptr_t) row_ptr + col_bytes);
+    }
 #endif
 }
 

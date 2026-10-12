@@ -43,7 +43,8 @@ int DevCtx::get_cc(int device)
 #else
         cudaDeviceProp prop;
         cuda_check(cudaGetDeviceProperties(&prop, device));
-        if (prop.major >= 10) cc[device] = CC_BLACKWELL;
+        if (prop.major < 7) cc[device] = CC_PASCAL;
+        else if (prop.major >= 10) cc[device] = CC_BLACKWELL;
         else if (prop.major >= 9) cc[device] = CC_HOPPER;
         else if (prop.major >= 8 && prop.minor >= 9) cc[device] = CC_ADA;
         else if (prop.major >= 8) cc[device] = CC_AMPERE;

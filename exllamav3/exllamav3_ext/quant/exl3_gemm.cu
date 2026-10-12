@@ -163,6 +163,9 @@ int exl3_gemm_gr
     cudaGetDevice(&device);
     int num_sms = force_num_sms ? force_num_sms : DevCtx::instance().get_num_sms(device);
     int cc = DevCtx::instance().get_cc(device);
+    // Pascal (sm_60) has no tensor cores: the EXL3 kernels only compile there, they cannot run.
+    // (Dense fp16 shapes serve pre-Ampere devices through cuBLAS; see hgemm_f16acc/routing_gemm.)
+    TORCH_CHECK(cc != CC_PASCAL, "exl3_gemm: no tensor cores on this device (Pascal and older)");
     int* locks = DevCtx::instance().get_locks(device);
     // Turing allows only 64 KB of dynamic shared memory per block, so the fixed SMEM_MAX
     // request would fail the launch there. Ask for what this device actually permits.
@@ -625,6 +628,8 @@ int exl3_mgemm_gr
     int smem_max = DevCtx::instance().get_smem_request(device);
     int num_sms = force_num_sms ? force_num_sms : total_sms;
     int cc = DevCtx::instance().get_cc(device);
+    // Pascal (sm_60) has no tensor cores: the EXL3 kernels only compile there, they cannot run.
+    TORCH_CHECK(cc != CC_PASCAL, "exl3_mgemm: no tensor cores on this device (Pascal and older)");
     int* locks = DevCtx::instance().get_locks(device);
 
     // Dispatch
