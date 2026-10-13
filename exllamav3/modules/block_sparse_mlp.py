@@ -3,7 +3,7 @@ from typing_extensions import override
 import os
 import torch
 import torch.nn.functional as F
-from ..model.config import Config
+from ..model.config import Config, is_pascal_device
 from ..util.device_copy import host_to_device
 from ..util.tensor import to2
 from . import Module, Linear
@@ -946,7 +946,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         return total
 
     def _run_batch_recon(self, recon, y, fhs_ext, token_sorted, weight_sorted, expert_count_list, groups,
-                         scratch = None, tables = None):
+                         scratch = None, tables = None, fused_slots = True):
         """Run the planned groups through the batched reconstruct tier. With a slot scratch each
         group's down projection lands in its slots (summed later by exl3_moe_gather); otherwise
         each group accumulates into fhs_ext (rows + 1, the last row a padding sink). Returns the
@@ -962,8 +962,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         slot = None
         if scratch is not None:
             # groups were laid out after the fused slots, in plan order, len(grp) * cmax each
+            # (no fused slots on Pascal: the fused tier is disabled there, groups start at 0)
             slot = sum(c for c in expert_count_list[:self.num_local_experts or self.num_experts]
-                       if 0 < c <= self.fused_rows) if self.fused_mode_buffers is not None else 0
+                       if 0 < c <= self.fused_rows) if fused_slots else 0
         for grp in groups:
             out_slab = None
             if scratch is not None:
@@ -976,6 +977,52 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 out_slab = out_slab)
             handled.update(grp)
         return handled
+
+    def _pascal_bszn_forward(self, y, selected_experts, routing_weights, params, eshape):
+        """Decode fallback for Pascal and older (no tensor cores): the fused coop kernels trap,
+        so each picked expert runs through its Linears (reconstruct_hgemm on Pascal) with the
+        router-weighted sum accumulated in torch. Slots are grouped by expert like the dense
+        per-expert path; picks outside this module's expert slice (TP shard, CPU split)
+        contribute exact zeros, as the kernel's range masking would."""
+        B, K = selected_experts.shape
+        E = self.num_local_experts or self.num_experts
+        out = torch.zeros((B, self.expert_size), dtype = torch.float, device = y.device)
+        flat_exp = selected_experts.reshape(-1)
+        flat_w = routing_weights.reshape(-1)
+        flat_tok = buffered_interleaved_arange(B, K, device = y.device)
+        if self.num_local_experts == self.num_experts:
+            local = flat_exp
+        else:
+            local = flat_exp - (self.routing_first or 0)
+            valid = (local >= 0) & (local < E)
+            local = torch.where(valid, local, torch.full_like(local, E))
+        order = local.argsort()
+        tok_sorted = flat_tok[order]
+        w_sorted = flat_w[order]
+        counts = torch.bincount(local, minlength = E + 1).tolist()
+        start = 0
+        for e in range(E):
+            c = counts[e]
+            if c == 0:
+                continue
+            end = start + c
+            top_x = tok_sorted[start:end]
+            w = w_sorted[start:end].unsqueeze(1)
+            xc = y.index_select(0, top_x)
+            u = self.ups[e].forward(xc, params)
+            if self.gated:
+                g = self.gates[e].forward(xc, params)
+                a = u if self.interm_dtype == torch.half else torch.empty_like(u, dtype = torch.half)
+                self.activation_fn_call(g, u, a, self.act_limit)
+            else:
+                a = self.gateless_act(u)
+                if a.dtype != torch.half:
+                    a = a.half()
+            h = self.downs[e].forward(a, params)
+            h.mul_(w)
+            out.index_add_(0, top_x, h)
+            start = end
+        return out.view(eshape)
 
     @override
     def unload(self):
@@ -1029,6 +1076,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # inside the kernel (out-of-range picks contribute exact zeros). Shared experts run
         # through BC_GatedMLP's own multi-row graph ahead of the kernel (see mlp.py)
         bszn_eligible = self.bc is not None and bsz <= MAX_BSZN
+
+        # Pascal and older have no tensor cores: the fused exl3_moe / coop kernels trap
+        # there, so the fused tiers below fall back to reconstruct + cuBLAS primitives
+        # (gated strictly on CC_PASCAL; sm_75+ behavior unchanged)
+        on_pascal = is_pascal_device(y.device)
 
         # Routing
         if self.router_pre_norm:
@@ -1112,6 +1164,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             fhs_ext = torch.zeros((y.shape[0] + 1, y.shape[1]), dtype = torch.float, device = y.device)
             final_hidden_states = fhs_ext[:y.shape[0]]
 
+            # No fused exl3_moe tier on Pascal (the kernel traps); its experts fall through
+            # to the batched-reconstruct and per-expert tiers below
+            fused_buffers = None if on_pascal else self.fused_mode_buffers
+
             # if self.routing_device is None or self.num_local_experts == self.num_experts:
             #     expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes = self.num_local_experts)
             # else:
@@ -1152,7 +1208,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 # expert can exceed the fused kernel's row capacity, so the readback (a CPU sync
                 # per layer, ~33% idle at MTP verify shapes) is skipped and everything is fused
                 expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
-                if self.fused_mode_buffers is not None and num_tokens * top_k <= self.fused_rows:
+                if fused_buffers is not None and num_tokens * top_k <= self.fused_rows:
                     expert_count_list = None
                 else:
                     expert_count_list = expert_count.tolist()
@@ -1166,7 +1222,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     fused_total = num_tokens * top_k
                 else:
                     fused_total = 0
-                    if self.fused_mode_buffers is not None:
+                    if fused_buffers is not None:
                         min_rows = self.fused_rows
                         fused_total = sum(c for c in expert_count_list[:num_ex] if 0 < c <= self.fused_rows)
                     recon = self._batch_recon_layer(y)
@@ -1205,7 +1261,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         kind = np.zeros(E1, dtype = np.int64)
                         starts_np = np.cumsum([0] + expert_count_list[:-1]).astype(np.int64)
                         n_slots = 0
-                        if self.fused_mode_buffers is not None:
+                        if fused_buffers is not None:
                             for e in range(num_ex):
                                 c = expert_count_list[e]
                                 if 0 < c <= self.fused_rows:
@@ -1258,7 +1314,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     )
 
                 # num_active -1 = unknown (all fused), kernel launches at max concurrency
-                if self.fused_mode_buffers is not None:
+                if fused_buffers is not None:
                     if expert_count_list is None:
                         run_fused(-1)
                     else:
@@ -1282,7 +1338,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 if groups:
                     batched = self._run_batch_recon(
                         recon, y, fhs_ext, token_sorted, weight_sorted, expert_count_list, groups,
-                        scratch, tables)
+                        scratch, tables, fused_slots = fused_buffers is not None)
 
                 # One fixed-order gather over every slot
                 if scratch is not None:
@@ -1309,8 +1365,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     current_state = y.index_select(0, top_x)
 
                     if self.bc is not None and self.support_quant_paths:
-                        # Graph path
-                        if count <= TEMP_ROWS_GRAPH:
+                        # Graph path (exl3_gemm tensor-core kernels trap on Pascal; the DQ tier
+                        # below is reconstruct + cuBLAS and runs there)
+                        if count <= TEMP_ROWS_GRAPH and not on_pascal:
                             self.bc.run_single_expert(current_state, expert_idx)
                             current_state = self.experts_cfg.out_d2[:count]
 
@@ -1381,9 +1438,16 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # quantized paths apply), so this is the last tier
         else:
             assert bszn_eligible
-            self.bc.run_bszN(y, selected_experts, routing_weights)
-            final_hidden_states = self.experts_cfg.out_bszn[:bsz].view(eshape)
-            bc_sh_exp = self.bc_sh_exp
+            if on_pascal:
+                # No tensor cores: the coop kernels trap. Grouped per-expert reconstruct
+                # through the Linears (Pascal-safe) with the router-weighted sum in torch
+                final_hidden_states = self._pascal_bszn_forward(
+                    y, selected_experts, routing_weights, params, eshape)
+                bc_sh_exp = False
+            else:
+                self.bc.run_bszN(y, selected_experts, routing_weights)
+                final_hidden_states = self.experts_cfg.out_bszn[:bsz].view(eshape)
+                bc_sh_exp = self.bc_sh_exp
 
         # Independent shared-expert work can cover the CPU job (split tail or whole layer)
         # before collect enqueues its stream wait. Fused shared experts have already run
