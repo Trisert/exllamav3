@@ -163,9 +163,12 @@ int exl3_gemm_gr
     cudaGetDevice(&device);
     int num_sms = force_num_sms ? force_num_sms : DevCtx::instance().get_num_sms(device);
     int cc = DevCtx::instance().get_cc(device);
-    // Pascal (sm_60) has no tensor cores: the EXL3 kernels only compile there, they cannot run.
-    // (Dense fp16 shapes serve pre-Ampere devices through cuBLAS; see hgemm_f16acc/routing_gemm.)
-    TORCH_CHECK(cc != CC_PASCAL, "exl3_gemm: no tensor cores on this device (Pascal and older)");
+    // Pascal (sm_60) has no tensor cores: the regular EXL3 kernels only compile there, they
+    // cannot run. (Dense fp16 shapes serve pre-Ampere devices through cuBLAS; see
+    // hgemm_f16acc/routing_gemm.) The only kernel path that can serve Pascal is the native
+    // SIMT GEMV below, so the loud trap is deferred until after its attempt: eligible
+    // small-row shapes launch there, everything else still traps as before.
+    const bool pascal = (cc == CC_PASCAL);
     int* locks = DevCtx::instance().get_locks(device);
     // Turing allows only 64 KB of dynamic shared memory per block, so the fixed SMEM_MAX
     // request would fail the launch there. Ask for what this device actually permits.
@@ -223,8 +226,8 @@ int exl3_gemm_gr
     // Experimental fused int8-activation GEMV path (EXL3_INT8_GEMV=1) for mul1 tensors. Rows are
     // processed as successive GEMV launches, so this is only sensible for small m (the reconstruct
     // threshold keeps m <= 144 in practice). Not graph-capturable yet; graphed callers fall through
-    // to the regular kernel.
-    if (mul1 && exl3_gemv_int8_enabled())
+    // to the regular kernel. Pascal keeps its pre-Task-15 behavior (the trap below), never this path.
+    if (mul1 && !pascal && exl3_gemv_int8_enabled())
     {
         if (exl3_gemv_int8(A, B, C, suh, A_had, svh, stream, graph))
             return 0;
@@ -297,6 +300,9 @@ int exl3_gemm_gr
             }
         }
     }
+
+    // Pascal shapes the GEMV path declined have no kernel left to run: trap loudly, as before.
+    TORCH_CHECK(!pascal, "exl3_gemm: no tensor cores on this device (Pascal and older)");
 
 #if defined(USE_ROCM)
     // RDNA: blocks request only the LDS the compatible shapes need rather than the whole workgroup allocation,
