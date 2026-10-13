@@ -169,15 +169,16 @@ class LinearEXL3:
                     return self.bc.run_alloc(x, self.out_features, dtype == torch.float)
                 # Native SIMT GEMV (Tasks 14-15): rows<=8 K=4 mcg/mul1 shapes run the fused
                 # kernel instead of reconstruct. Anything it declines (other rates,
-                # heuristic fall-through, EXL3_GEMV=0) raises the preserved "no tensor
-                # cores" error before launching and falls through below; anything else
-                # propagates.
+                # heuristic fall-through, EXL3_GEMV=0) raises the exl3_gemm decline below
+                # before launching and falls through; anything else propagates. The match
+                # uses the full "exl3_gemm: ..." prefix so a message refactor elsewhere
+                # cannot silently widen or narrow it (mgemm/moe traps never match it).
                 elif rows <= 8 and self.K == 4 and (self.mcg or self.mul1):
                     try:
                         dtype = out_dtype or self.default_out_dtype
                         return self.bc.run_alloc(x, self.out_features, dtype == torch.float)
                     except RuntimeError as e:
-                        if "no tensor cores" not in str(e):
+                        if "exl3_gemm: no tensor cores" not in str(e):
                             raise
 
         # Autosplit measuring forwards must observe (and leave) the same memory state as

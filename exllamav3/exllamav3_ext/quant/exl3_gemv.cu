@@ -126,14 +126,14 @@ bool exl3_gemv_try_launch
     int cc = DevCtx::instance().get_cc(device);
     // Pascal (sm_60) has no tensor cores: the GEMV kernel serves it through the SIMT fallback
     // (Task 14) instead of the tensor path. Production scope is the validated envelope only:
-    // integer K = 4 with the mcg/mul1 codebooks (microbenchmarked on P100, Tasks 14-15).
-    // K = 2/3 and half-integer rates are unmeasured, and K = 6/8 have no kernel instances
-    // (the selector below covers bits 2, 3 and 4 only), so those still decline to the
-    // reconstruct fallback. The forced entry (testing) bypasses the scope gate so other
-    // combos stay measurable the same way.
+    // integer K = 4 with the mcg/mul1 codebooks, fp16 output (microbenchmarked on P100,
+    // Tasks 14-15). K = 2/3, half-integer rates and fp32 output are unmeasured, and K = 6/8
+    // have no kernel instances (the selector below covers bits 2, 3 and 4 only), so those
+    // still decline to the reconstruct fallback. The forced entry (testing) bypasses the
+    // scope gate so other combos stay measurable the same way.
     if (cc == CC_PASCAL && !force)
     {
-        if (half_k || K != 4 || (cb != 1 && cb != 2)) return false;
+        if (half_k || K != 4 || (cb != 1 && cb != 2) || c_fp32) return false;
         // The shape heuristic encodes Ampere-vs-regular-kernel tradeoffs, which do not apply
         // against reconstruct on Pascal: even the heuristic's most pessimistic K = 4 shape
         // (k = 4096, n = 2048) runs the SIMT kernel 2.2x faster than cached reconstruct on
