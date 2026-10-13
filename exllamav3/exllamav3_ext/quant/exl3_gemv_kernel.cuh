@@ -31,6 +31,67 @@
 
 namespace exl3_gemv_ns {
 
+#if !defined(USE_ROCM)
+// SIMT fallback for the m16n8k16 fp16-accumulate MMA below on pre-Turing GPUs (no tensor
+// cores). Same per-lane fragment layouts as the tensor path: with g = lane / 4 and
+// t = lane % 4, A (16x16, row-major) lanes 4g + i hold rows g / g + 8 at k-pairs 2i / 2i + 8
+// in the two half2s of each FragB half, B (16x8, col-major) lanes 4n .. 4n + 3 (n = column)
+// hold k-pairs 2i / 2i + 8 of column n, and C holds rows g / g + 8 and columns 2t / 2t + 1 with
+// elems[0] = row-g pair, elems[1] = row-g+8 pair (the kernel only consumes elems[0]: the g+8
+// rows carry no activation data). Each lane gathers the two A rows and two B columns its
+// outputs need with lane shuffles, runs the 16-element dots as scalar FMAs in fp32, and rounds
+// once back to fp16 on the accumulate. Slow, but it computes the same products from the same
+// registers. Referenced only from the sub-sm_75 branch below; sm_75+ never sees it.
+__device__ __forceinline__ half2 exl3_gemv_shfl_h2(half2 v, int src)
+{
+    const uint32_t* u = reinterpret_cast<const uint32_t*>(&v);
+    uint32_t w = __shfl_sync(0xffffffffu, *u, src);
+    return *reinterpret_cast<half2*>(&w);
+}
+
+__device__ __forceinline__ float exl3_gemv_dot16(const half2 (&a)[8], const half2 (&b)[8])
+{
+    float s = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i)
+    {
+        float2 af = __half22float2(a[i]);
+        float2 bf = __half22float2(b[i]);
+        s = fmaf(af.x, bf.x, s);
+        s = fmaf(af.y, bf.y, s);
+    }
+    return s;
+}
+
+__device__ __forceinline__ void exl3_gemv_mma_h(const FragB& a01, const FragB& a23, const FragB& b, FragC_h& c)
+{
+    int lane = threadIdx.x & 31;
+    int g = lane >> 2;
+    int t = lane & 3;
+    half2 a_rows[2][8], b_cols[2][8];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i)
+    {
+        a_rows[0][i]     = exl3_gemv_shfl_h2(a01.elems[0], 4 * g + i);
+        a_rows[0][4 + i] = exl3_gemv_shfl_h2(a23.elems[0], 4 * g + i);
+        a_rows[1][i]     = exl3_gemv_shfl_h2(a01.elems[1], 4 * g + i);
+        a_rows[1][4 + i] = exl3_gemv_shfl_h2(a23.elems[1], 4 * g + i);
+        b_cols[0][i]     = exl3_gemv_shfl_h2(b.elems[0], 8 * t + i);
+        b_cols[0][4 + i] = exl3_gemv_shfl_h2(b.elems[1], 8 * t + i);
+        b_cols[1][i]     = exl3_gemv_shfl_h2(b.elems[0], 8 * t + 4 + i);
+        b_cols[1][4 + i] = exl3_gemv_shfl_h2(b.elems[1], 8 * t + 4 + i);
+    }
+    float d0 = exl3_gemv_dot16(a_rows[0], b_cols[0]);
+    float d1 = exl3_gemv_dot16(a_rows[0], b_cols[1]);
+    float d2 = exl3_gemv_dot16(a_rows[1], b_cols[0]);
+    float d3 = exl3_gemv_dot16(a_rows[1], b_cols[1]);
+    float2 c0 = __half22float2(c.elems[0]);
+    float2 c1 = __half22float2(c.elems[1]);
+    c.elems[0] = __halves2half2(__float2half_rn(c0.x + d0), __float2half_rn(c0.y + d1));
+    c.elems[1] = __halves2half2(__float2half_rn(c1.x + d2), __float2half_rn(c1.y + d3));
+}
+#endif
+
 // mma.m16n8k16 with the A operand supplied as two FragB halves, fp16 accumulate.
 // On Turing this splits into the two k=8 halves it is already expressed as (a01 pairs with
 // b[0], a23 with b[1]), accumulating through the same c. Same operands and products; one
@@ -77,9 +138,9 @@ __device__ __forceinline__ void mma_ab_h(const FragB& a01, const FragB& a23, con
     );
 #endif
 #else
-    // Pre-Turing has no tensor cores. The host dispatch excludes these devices, so this branch
-    // only keeps the sm_60 target compiling (same no-op pattern as det_gemm.cuh).
-    (void) a01; (void) a23; (void) b; (void) c;
+    // Pre-Turing has no tensor cores: SIMT fallback above (shuffles + scalar FMAs, same
+    // fragment registers as the tensor path). Slow, but it computes real results.
+    exl3_gemv_ns::exl3_gemv_mma_h(a01, a23, b, c);
 #endif
 }
 
