@@ -25,6 +25,7 @@
 #define WORKSPACE_SIZE (16*1024*1024)
 
 #define MAX_DEVICES 16
+#define CC_PASCAL     0
 #define CC_OLD        1
 #define CC_AMPERE     2
 #define CC_ADA        3

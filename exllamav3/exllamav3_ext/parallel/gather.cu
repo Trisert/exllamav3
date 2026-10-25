@@ -23,6 +23,13 @@ struct Offsets {
     __host__ __device__ int  operator[](int i) const { return v[i]; }
 };
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700)
+    #ifdef __grid_constant__
+        #undef __grid_constant__
+    #endif
+    #define __grid_constant__
+#endif
+
 __global__ __launch_bounds__(NUM_THREADS)
 void pg_gather_kernel
 (

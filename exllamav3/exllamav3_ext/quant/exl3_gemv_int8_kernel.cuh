@@ -59,7 +59,7 @@ namespace cg_gemv = cooperative_groups;
 
 __device__ __forceinline__ int dp4a_us(uint32_t a, uint32_t b, int c)
 {
-#if defined(USE_ROCM)
+#if defined(USE_ROCM) || EXL3_SM60
     return exl3_dp4a_us(a, b, c);
 #else
     int d;

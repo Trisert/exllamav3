@@ -448,10 +448,12 @@ void exl3_moe
         // one for the <= 16-row launch, which the caller issues with m_tile 16)
         TORCH_CHECK(cb_idx == 1, "exl3_moe: row tiles above 16 are instantiated for the mul1 codebook only");
         TORCH_CHECK(max_tokens_per_expert >= (size_t) m_tile, "exl3_moe: temp buffers hold fewer rows than the tile");
+        int eff_m_tile = (int) m_tile;
+        if (cc == CC_PASCAL && eff_m_tile > 32) eff_m_tile = 32;
         if (half_k)
-            kernel = m_tile >= 64 ? exl3_moe_kernel_instances_h_m64[K - 1] : exl3_moe_kernel_instances_h_m32[K - 1];
+            kernel = eff_m_tile >= 64 ? exl3_moe_kernel_instances_h_m64[K - 1] : exl3_moe_kernel_instances_h_m32[K - 1];
         else
-            kernel = m_tile >= 64 ? exl3_moe_kernel_instances_m64[K] : exl3_moe_kernel_instances_m32[K];
+            kernel = eff_m_tile >= 64 ? exl3_moe_kernel_instances_m64[K] : exl3_moe_kernel_instances_m32[K];
     }
 #endif
 

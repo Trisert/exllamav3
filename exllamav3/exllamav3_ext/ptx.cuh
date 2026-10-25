@@ -20,6 +20,8 @@ using FragC_h = Vec<half2, 2>;
 #if defined(USE_ROCM)
     // Tensor-core fragment ops and the async copies are emulated on ROCm (see the file for the layouts)
     #include "rocm/ptx_rocm.cuh"
+#elif EXL3_SM60
+    #include "ptx_pascal.cuh"
 #endif
 
 // m8n8k4 tensor core matmul (emulated on Ampere and later), don't use
@@ -77,7 +79,7 @@ __device__ inline void ptx_mma_m16n8k16
     FragC& frag_c
 )
 {
-#if defined(USE_ROCM)
+#if defined(USE_ROCM) || EXL3_SM60
     exl3_mma_m16n8k16_f32(frag_a, frag_b, frag_c);
 #else
     const uint32_t* a = reinterpret_cast<const uint32_t*>(&frag_a);
@@ -129,7 +131,7 @@ __device__ inline void ptx_mma_m16n8k16
     FragC_h& frag_c
 )
 {
-#if defined(USE_ROCM)
+#if defined(USE_ROCM) || EXL3_SM60
     exl3_mma_m16n8k16_f16(frag_a, frag_b, frag_c);
 #else
     const uint32_t* a = reinterpret_cast<const uint32_t*>(&frag_a);
@@ -190,6 +192,14 @@ __device__ inline void barrier_acquire
     __syncthreads();
     // Every wave acquires at device scope, so none reads the other blocks' data through a stale per-CU cache
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+#elif EXL3_SM60
+    if (threadIdx.x == 0)
+    {
+        volatile int* vlock = reinterpret_cast<volatile int*>(lock);
+        while (*vlock != stage);
+        __threadfence();
+    }
+    __syncthreads();
 #else
     if (threadIdx.x == 0)
     {
@@ -225,6 +235,19 @@ __device__ inline void barrier_release
         }
         __hip_atomic_fetch_add(lock, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
+#elif EXL3_SM60
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        if (reset)
+        {
+            __threadfence();
+            *reinterpret_cast<volatile int*>(lock) = 0;
+            return;
+        }
+        __threadfence();
+        atomicAdd(lock, val);
+    }
 #else
     __syncthreads();
     if (threadIdx.x == 0)
@@ -245,7 +268,7 @@ __device__ inline void barrier_release
 
 __device__ inline void cp_async_pred(void* smem_ptr, const void* glob_ptr, bool pred = true)
 {
-#if EXL3_SM75 || defined(USE_ROCM)
+#if EXL3_SM75 || EXL3_SM60 || defined(USE_ROCM)
     if (pred)
     {
         uint4 v = *reinterpret_cast<const uint4*>(glob_ptr);
@@ -266,7 +289,7 @@ __device__ inline void cp_async_pred(void* smem_ptr, const void* glob_ptr, bool 
 
 // Load global to shared memory
 //
-// Turing (sm_75) has no cp.async, so the copy degrades to a synchronous 16 B load/store pair
+// Turing (sm_75) and Pascal (sm_60) have no cp.async, so the copy degrades to a synchronous 16 B load/store pair
 // routed through registers. Correctness is unaffected: cp_async_wait() below becomes a no-op,
 // but every consumer of a staged tile already passes a __syncthreads() (see wait_stage() in
 // exl3_gemm_inner.cuh) before reading it, and a synchronous store has completed by then. The
@@ -274,7 +297,7 @@ __device__ inline void cp_async_pred(void* smem_ptr, const void* glob_ptr, bool 
 
 __device__ inline void cp_async(void* smem_ptr, const void* glob_ptr)
 {
-#if EXL3_SM75 || defined(USE_ROCM)
+#if EXL3_SM75 || EXL3_SM60 || defined(USE_ROCM)
     uint4 v = *reinterpret_cast<const uint4*>(glob_ptr);
     *reinterpret_cast<uint4*>(smem_ptr) = v;
 #else
@@ -292,8 +315,8 @@ __device__ inline void cp_async(void* smem_ptr, const void* glob_ptr)
 
 __device__ inline void cp_async_stream(void* smem_ptr, const void* glob_ptr)
 {
-#if EXL3_SM75 || defined(USE_ROCM)
-    // No cp.async and no createpolicy on Turing; the L2 hint is only an optimization
+#if EXL3_SM75 || EXL3_SM60 || defined(USE_ROCM)
+    // No cp.async and no createpolicy on Turing/Pascal; the L2 hint is only an optimization
     uint4 v = *reinterpret_cast<const uint4*>(glob_ptr);
     *reinterpret_cast<uint4*>(smem_ptr) = v;
 #else
@@ -314,7 +337,7 @@ __device__ inline void cp_async_stream(void* smem_ptr, const void* glob_ptr)
 
 __device__ inline void cp_async_fence()
 {
-#if !EXL3_SM75 && !defined(USE_ROCM)
+#if !EXL3_SM75 && !EXL3_SM60 && !defined(USE_ROCM)
     asm volatile("cp.async.commit_group;\n" ::);
 #endif
 }
@@ -324,7 +347,7 @@ __device__ inline void cp_async_fence()
 template <int n>
 __device__ inline void cp_async_wait()
 {
-#if !EXL3_SM75 && !defined(USE_ROCM)
+#if !EXL3_SM75 && !EXL3_SM60 && !defined(USE_ROCM)
     asm volatile("cp.async.wait_group %0;\n" :: "n"(n));
 #endif
 }
@@ -333,7 +356,7 @@ __device__ inline void cp_async_wait()
 
 __device__ inline void ldsm4(FragA& frag_a, const void* smem_ptr)
 {
-#if defined(USE_ROCM)
+#if defined(USE_ROCM) || EXL3_SM60
     exl3_ldsm4(frag_a, smem_ptr);
 #else
     uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
@@ -431,6 +454,21 @@ __device__ __forceinline__ void stg_release_sys_u64(uint64_t* p, uint64_t v)
     __hip_atomic_store(p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
+__device__ __forceinline__ uint32_t ld_acquire_gpu_u32(const uint32_t* p)
+{
+    return __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+}
+
+__device__ __forceinline__ void st_release_gpu_u32(uint32_t* p, uint32_t v)
+{
+    __hip_atomic_store(p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+}
+
+__device__ __forceinline__ void red_release_gpu_u32(uint32_t* p, uint32_t v)
+{
+    __hip_atomic_fetch_add(p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+}
+
 // Global time in nanoseconds. wall_clock64() is the constant-rate counter (100 MHz on RDNA)
 
 __device__ __forceinline__ uint64_t globaltimer_ns()
@@ -470,27 +508,83 @@ __device__ __forceinline__ uint4 ldg_cv_u128(const uint4* p)
 
 __device__ __forceinline__ uint32_t ldg_acquire_sys_u32(const uint32_t* p)
 {
+#if EXL3_SM60
+    uint32_t v = *reinterpret_cast<const volatile uint32_t*>(p);
+    __threadfence_system();
+    return v;
+#else
     uint32_t v;
     asm volatile("ld.global.acquire.sys.u32 %0, [%1];"
                  : "=r"(v) : "l"(p) : "memory");
     return v;
+#endif
 }
 
 __device__ __forceinline__ uint64_t ldg_acquire_sys_u64(const uint64_t* p)
 {
+#if EXL3_SM60
+    uint64_t v = *reinterpret_cast<const volatile uint64_t*>(p);
+    __threadfence_system();
+    return v;
+#else
     uint64_t v;
     asm volatile("ld.global.acquire.sys.u64 %0, [%1];" : "=l"(v) : "l"(p) : "memory");
     return v;
+#endif
 }
 
 __device__ __forceinline__ void stg_release_sys_u32(uint32_t* p, uint32_t v)
 {
+#if EXL3_SM60
+    __threadfence_system();
+    *reinterpret_cast<volatile uint32_t*>(p) = v;
+#else
     asm volatile("st.global.release.sys.u32 [%0], %1;" :: "l"(p), "r"(v) : "memory");
+#endif
 }
 
 __device__ __forceinline__ void stg_release_sys_u64(uint64_t* p, uint64_t v)
 {
+#if EXL3_SM60
+    __threadfence_system();
+    *reinterpret_cast<volatile uint64_t*>(p) = v;
+#else
     asm volatile("st.global.release.sys.u64 [%0], %1;" :: "l"(p), "l"(v) : "memory");
+#endif
+}
+
+__device__ __forceinline__ uint32_t ld_acquire_gpu_u32(const uint32_t* p)
+{
+#if EXL3_SM60
+    uint32_t v = *reinterpret_cast<const volatile uint32_t*>(p);
+    __threadfence();
+    return v;
+#else
+    uint32_t v;
+    asm volatile("ld.global.acquire.gpu.b32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+#endif
+}
+
+__device__ __forceinline__ void st_release_gpu_u32(uint32_t* p, uint32_t v)
+{
+#if EXL3_SM60
+    __threadfence();
+    *reinterpret_cast<volatile uint32_t*>(p) = v;
+#else
+    asm volatile("st.global.release.gpu.b32 [%0], %1;" :: "l"(p), "r"(v) : "memory");
+#endif
+}
+
+__device__ __forceinline__ void red_release_gpu_u32(uint32_t* p, uint32_t v)
+{
+#if EXL3_SM60
+    __threadfence();
+    atomicAdd(p, v);
+#else
+    asm volatile ("fence.acq_rel.gpu;\n");
+    asm volatile ("red.relaxed.gpu.global.add.s32 [%0], %1;\n" : : "l"(p), "r"(v));
+#endif
 }
 
 // Global time in nanoseconds
@@ -537,6 +631,31 @@ __device__ inline void group_barrier
     int* barrier_counters_sense  // length 2*max(group_id). odd positions are flipped after sync (sense)
 )
 {
+#if EXL3_SM60
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        volatile int* counter_ptr = &barrier_counters_sense[group_id * 2];
+        volatile int* sense_ptr = &barrier_counters_sense[group_id * 2 + 1];
+
+        int old_sense = *sense_ptr;
+        __threadfence();
+        int old = atomicAdd((int*)counter_ptr, 1);
+
+        if (old == group_size - 1)
+        {
+            *counter_ptr = 0;
+            __threadfence();
+            *sense_ptr = 1 - old_sense;
+        }
+        else
+        {
+            while (*sense_ptr == old_sense) __nanosleep(32);
+            __threadfence();
+        }
+    }
+    __syncthreads();
+#else
 #if defined(USE_ROCM)
     // As in barrier_release/barrier_acquire: every wave publishes and refreshes at device scope
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
@@ -565,5 +684,6 @@ __device__ inline void group_barrier
     __syncthreads();
 #if defined(USE_ROCM)
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+#endif
 #endif
 }

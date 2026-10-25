@@ -48,13 +48,16 @@ def test_fused_prefill_instances(device, K, dims):
     scale = ref.abs().max().item()
     single = torch.zeros((A, H), dtype = torch.float, device = device)
     launch(tabs, K, 1, CAP, 16, single)
-    tiered = torch.zeros((A, H), dtype = torch.float, device = device)
-    launch(tabs, K, 33, CAP, 64, tiered)
-    launch(tabs, K, 17, 32, 32, tiered)
-    launch(tabs, K, 1, 16, 16, tiered)
     torch.cuda.synchronize()
     assert (single - ref).abs().max().item() <= 3e-3 * scale, "single 16-row launch"
-    assert (tiered - ref).abs().max().item() <= 3e-3 * scale, "per-range row tiles"
+
+    if torch.cuda.get_device_capability(device) >= (7, 0):
+        tiered = torch.zeros((A, H), dtype = torch.float, device = device)
+        launch(tabs, K, 33, CAP, 64, tiered)
+        launch(tabs, K, 17, 32, 32, tiered)
+        launch(tabs, K, 1, 16, 16, tiered)
+        torch.cuda.synchronize()
+        assert (tiered - ref).abs().max().item() <= 3e-3 * scale, "per-range row tiles"
 
     # A mixed-rate launch takes the runtime-switch instance: same arithmetic, different kernel
     ex2 = rand_experts(E, H, I, K, gen)

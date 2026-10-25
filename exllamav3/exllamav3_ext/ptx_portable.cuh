@@ -63,3 +63,22 @@ __device__ __forceinline__ int exl3_dp4a_us(uint32_t a, uint32_t b, int c)
         d += static_cast<int>((a >> (8 * i)) & 0xffu) * static_cast<int>(static_cast<int8_t>(b >> (8 * i)));
     return d;
 }
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700)
+__device__ __forceinline__ void __nanosleep(unsigned int ns)
+{
+    if (ns == 0) return;
+    long long start = clock64();
+    while ((clock64() - start) < (ns >> 1)) {}
+}
+#endif
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 610)
+__device__ __forceinline__ unsigned int __dp4a(unsigned int a, unsigned int b, unsigned int c)
+{
+    #pragma unroll
+    for (int i = 0; i < 4; ++i)
+        c += ((a >> (8 * i)) & 0xffu) * ((b >> (8 * i)) & 0xffu);
+    return c;
+}
+#endif

@@ -19,9 +19,18 @@
 //
 // ldmatrix, __nanosleep, __dp4a and tanh.approx.f32 are all sm_75-capable and need no gate.
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700)
+    #define EXL3_SM60 1
+    #define EXL3_SM75 1
+    #ifdef __grid_constant__
+        #undef __grid_constant__
+    #endif
+    #define __grid_constant__
+#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
+    #define EXL3_SM60 0
     #define EXL3_SM75 1
 #else
+    #define EXL3_SM60 0
     #define EXL3_SM75 0
 #endif
 

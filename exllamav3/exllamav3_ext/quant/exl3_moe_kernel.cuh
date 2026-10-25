@@ -269,6 +269,8 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                 in_addr += tm * size_k;
                 out_addr += tm * size_n;
                 size_m -= tm;
+                if (size_m > 0)
+                    group_barrier(group_idx, group_size, barrier_counters_sense);
             }
         };
 
@@ -331,7 +333,10 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
         };
 
         if (gated)
+        {
             gemm_up(temp_state_g, temp_intermediate_g, exp_gate_trellis, K_gate);
+            group_barrier(group_idx, group_size, barrier_counters_sense);
+        }
         gemm_up(temp_state_u, temp_intermediate_u, exp_up_trellis, K_up);
         group_barrier(group_idx, group_size, barrier_counters_sense);
         had_guad();

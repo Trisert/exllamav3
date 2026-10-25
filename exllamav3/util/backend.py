@@ -105,8 +105,12 @@ def _sm75_switch(name: str, device) -> bool:
 
 
 def sdpa_prefill(device) -> bool:
-    """Prefill chunks attend over a dense fp16 window with SDPA / fa75 (sm_75 default; EXL3_SDPA_PREFILL)"""
-    return _sm75_switch("EXL3_SDPA_PREFILL", device)
+    """Prefill chunks attend over a dense fp16 window with SDPA / fa75 (sm_75 and sm_60 default; EXL3_SDPA_PREFILL)"""
+    env = os.environ.get("EXL3_SDPA_PREFILL")
+    if env is not None:
+        return env.strip().lower() not in ("0", "", "false", "off", "no")
+    cc = compute_capability(device)
+    return cc == (7, 5) or cc == (6, 0)
 
 
 def fa75_prefill(device) -> bool:

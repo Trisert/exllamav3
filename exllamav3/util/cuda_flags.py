@@ -240,6 +240,7 @@ def cuda_cflags(cuda_home: str | None = None, debug: bool = False, hip: bool = F
         flags += ["-lineinfo"]
     flags += [
         "-O3", "--use_fast_math",
+        "-Wno-deprecated-gpu-targets",
         "-Xcudafe", "--diag_suppress=177",
         "-Xcudafe", "--diag_suppress=20012",
     ]

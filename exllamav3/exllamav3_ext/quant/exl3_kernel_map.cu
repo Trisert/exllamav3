@@ -115,6 +115,10 @@ int select_gemm_shape(int cc, int size_m, int size_k, int size_n, int K, bool mu
 
     switch(cc)
     {
+        case CC_PASCAL:
+            if (size_k % 32 != 0) return 1;
+            return 2;
+
         case CC_OLD:
         case CC_AMPERE:
             if (mod_256 && K <= 4)
@@ -181,6 +185,10 @@ int exl3_gemm_shape_smem(int shape_idx, int K, bool half_k)
 
 bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, int K, bool half_k)
 {
+    int device;
+    cudaGetDevice(&device);
+    if (DevCtx::instance().get_cc(device) == CC_PASCAL && shape_idx >= 3) return false;
+
     int tilesize_m = exl3_gemm_tilesize_m[shape_idx];
     int tilesize_k = exl3_gemm_tilesize_k[shape_idx];
     int tilesize_n = exl3_gemm_tilesize_n[shape_idx];
@@ -188,11 +196,6 @@ bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, i
     // A wider row tile only pays once it replaces at least two 16-row passes
     if (tilesize_m > 16 && size_m <= tilesize_m / 2) return false;
 
-    // Device-dependent: callers with tensors on a non-current device must set a device guard
-    // first (every in-tree caller runs under OptionalCUDAGuard). Only matters on a mixed-arch
-    // host, where a 90 KB-capable device would otherwise vouch for a 64 KB one.
-    int device;
-    cudaGetDevice(&device);
     return exl3_gemm_shape_smem(shape_idx, K, half_k) <= DevCtx::instance().get_smem_request(device);
 }
 

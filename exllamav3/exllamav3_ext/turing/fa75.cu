@@ -33,6 +33,7 @@ static __device__ __forceinline__ uint32_t qh_off(int r, int c) { return (uint32
 // Q dims 0..127 staged in the lower 16 KB with the same half-row layout, then pulled into registers
 static __device__ __forceinline__ uint32_t ql_off(int r, int c) { return (uint32_t)((r * 16 + (c ^ (r & 7))) * 16); }
 
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 750
 static __device__ __forceinline__ void mma1688(float* c, uint32_t a0, uint32_t a1, uint32_t b)
 {
     asm volatile(
@@ -61,6 +62,12 @@ static __device__ __forceinline__ void ldsm_x4_t(uint32_t* r, uint32_t saddr)
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
         : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(saddr));
 }
+#else
+static __device__ __forceinline__ void mma1688(float* c, uint32_t a0, uint32_t a1, uint32_t b) { (void)c; (void)a0; (void)a1; (void)b; }
+static __device__ __forceinline__ void mma1688h(uint32_t* c, uint32_t a0, uint32_t a1, uint32_t b) { (void)c; (void)a0; (void)a1; (void)b; }
+static __device__ __forceinline__ void ldsm_x4(uint32_t* r, uint32_t saddr) { (void)r; (void)saddr; }
+static __device__ __forceinline__ void ldsm_x4_t(uint32_t* r, uint32_t saddr) { (void)r; (void)saddr; }
+#endif
 
 static __device__ __forceinline__ uint32_t pack_h2(float a, float b)
 {

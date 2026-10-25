@@ -37,7 +37,7 @@ namespace exl3_gemv_ns {
 // extra rounding at the k=8 boundary. See the longer note in ptx.cuh.
 __device__ __forceinline__ void mma_ab_h(const FragB& a01, const FragB& a23, const FragB& b, FragC_h& c)
 {
-#if defined(USE_ROCM)
+#if defined(USE_ROCM) || EXL3_SM60
     FragA a;
     a.elems[0] = a01.elems[0];
     a.elems[1] = a01.elems[1];
