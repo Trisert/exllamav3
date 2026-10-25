@@ -94,23 +94,24 @@ def _paged_kv_update_rows_kernel(
 def _paged_kv_update(k, v, k_cache, v_cache, block_table, cache_seqlens, num_pages_per_seq, bsz, kv_append_len,
                      n_kv_heads, page_size, head_dim):
     """Append kv_append_len new tokens per sequence to the paged cache (eager paths)"""
-    if all(t.is_contiguous() for t in (k, v, k_cache, v_cache, block_table)):
-        row = n_kv_heads * head_dim
-        # Tokens per program and warps: gfx1100 prefers smaller token tiles over more warps
-        block_t, warps = (4, 8) if gfx_arch(k.device) == "gfx1100" else (_KV_UPDATE_BLOCK_T, _KV_UPDATE_WARPS)
-        t_blocks = triton.cdiv(kv_append_len, block_t)
-        _paged_kv_update_rows_kernel[(bsz * t_blocks,)](
-            k, v, k_cache, v_cache, block_table, cache_seqlens, num_pages_per_seq, kv_append_len, t_blocks,
-            row, page_size, block_t, min(1024, triton.next_power_of_2(row)),
-            num_warps=warps,
-        )
-    else:
-        update_block_d = triton.next_power_of_2(head_dim)
-        _paged_kv_update_kernel[(bsz * kv_append_len, n_kv_heads, triton.cdiv(head_dim, update_block_d))](
-            k, v, k_cache, v_cache, block_table, cache_seqlens,
-            num_pages_per_seq, kv_append_len, n_kv_heads, page_size, head_dim, update_block_d,
-            num_warps=2, num_stages=3,
-        )
+    with torch.cuda.device(k.device):
+        if all(t.is_contiguous() for t in (k, v, k_cache, v_cache, block_table)):
+            row = n_kv_heads * head_dim
+            # Tokens per program and warps: gfx1100 prefers smaller token tiles over more warps
+            block_t, warps = (4, 8) if gfx_arch(k.device) == "gfx1100" else (_KV_UPDATE_BLOCK_T, _KV_UPDATE_WARPS)
+            t_blocks = triton.cdiv(kv_append_len, block_t)
+            _paged_kv_update_rows_kernel[(bsz * t_blocks,)](
+                k, v, k_cache, v_cache, block_table, cache_seqlens, num_pages_per_seq, kv_append_len, t_blocks,
+                row, page_size, block_t, min(1024, triton.next_power_of_2(row)),
+                num_warps=warps,
+            )
+        else:
+            update_block_d = triton.next_power_of_2(head_dim)
+            _paged_kv_update_kernel[(bsz * kv_append_len, n_kv_heads, triton.cdiv(head_dim, update_block_d))](
+                k, v, k_cache, v_cache, block_table, cache_seqlens,
+                num_pages_per_seq, kv_append_len, n_kv_heads, page_size, head_dim, update_block_d,
+                num_warps=2, num_stages=3,
+            )
 
 _KV_UPDATE_BLOCK_T = 8
 _KV_UPDATE_WARPS = 4

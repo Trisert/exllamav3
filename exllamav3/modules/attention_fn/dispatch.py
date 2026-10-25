@@ -167,20 +167,21 @@ def attn_dispatch(
 
     # Retry the backend that matched last time for this caller before scanning the full list.
     # Candidate functions return None on incompatible arguments, so a stale hint self-corrects
-    fn = dispatch_cache.get(hint_key) if dispatch_cache is not None else None
-    o = fn(args) if fn is not None else None
+    with torch.cuda.device(args.q.device):
+        fn = dispatch_cache.get(hint_key) if dispatch_cache is not None else None
+        o = fn(args) if fn is not None else None
 
-    if o is None:
-        args.sanity_check()
-        for fn in candidates:
-            o = fn(args)
-            if o is not None:
-                break
-        else:
-            _print_no_attn_match_report(args)
-            raise ValueError("No matching attention function")
-        if dispatch_cache is not None:
-            dispatch_cache[hint_key] = fn
+        if o is None:
+            args.sanity_check()
+            for fn in candidates:
+                o = fn(args)
+                if o is not None:
+                    break
+            else:
+                _print_no_attn_match_report(args)
+                raise ValueError("No matching attention function")
+            if dispatch_cache is not None:
+                dispatch_cache[hint_key] = fn
 
     # Update cache (quant-direct mode already wrote the new K/V before the attention call)
     if cache is not None and q_cache is None:
