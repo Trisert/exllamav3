@@ -66,27 +66,51 @@ __device__ __forceinline__ float exl3_dot16_f32(const half2 (&a)[8], const half2
     return s;
 }
 
-// FP16 @ FP16 + FP32 -> FP32
+// FP16 @ FP16 + FP32 -> FP32 (interleaved 4-way accumulation to hide FMA latency)
 __device__ __forceinline__ void exl3_mma_m16n8k16_f32(const FragA& frag_a, const FragB& frag_b, FragC& frag_c)
 {
     half2 a_rows[2][8], b_cols[2][8];
     exl3_mma_gather(frag_a, frag_b, a_rows, b_cols);
-    frag_c.elems[0] += exl3_dot16_f32(a_rows[0], b_cols[0]);
-    frag_c.elems[1] += exl3_dot16_f32(a_rows[0], b_cols[1]);
-    frag_c.elems[2] += exl3_dot16_f32(a_rows[1], b_cols[0]);
-    frag_c.elems[3] += exl3_dot16_f32(a_rows[1], b_cols[1]);
+
+    float d00 = 0.0f, d01 = 0.0f, d10 = 0.0f, d11 = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i)
+    {
+        float2 a0 = __half22float2(a_rows[0][i]);
+        float2 a1 = __half22float2(a_rows[1][i]);
+        float2 b0 = __half22float2(b_cols[0][i]);
+        float2 b1 = __half22float2(b_cols[1][i]);
+
+        d00 = fmaf(a0.x, b0.x, fmaf(a0.y, b0.y, d00));
+        d01 = fmaf(a0.x, b1.x, fmaf(a0.y, b1.y, d01));
+        d10 = fmaf(a1.x, b0.x, fmaf(a1.y, b0.y, d10));
+        d11 = fmaf(a1.x, b1.x, fmaf(a1.y, b1.y, d11));
+    }
+    frag_c.elems[0] += d00;
+    frag_c.elems[1] += d01;
+    frag_c.elems[2] += d10;
+    frag_c.elems[3] += d11;
 }
 
-// FP16 @ FP16 + FP16 -> FP16 (Pascal P100 __hfma2 fast path)
+// FP16 @ FP16 + FP16 -> FP16 (Pascal P100 __hfma2 fast path with 4-way interleaved accumulators)
 __device__ __forceinline__ void exl3_mma_m16n8k16_f16(const FragA& frag_a, const FragB& frag_b, FragC_h& frag_c)
 {
     half2 a_rows[2][8], b_cols[2][8];
     exl3_mma_gather(frag_a, frag_b, a_rows, b_cols);
 
-    half2 d00 = exl3_dot16_hfma2(a_rows[0], b_cols[0]);
-    half2 d01 = exl3_dot16_hfma2(a_rows[0], b_cols[1]);
-    half2 d10 = exl3_dot16_hfma2(a_rows[1], b_cols[0]);
-    half2 d11 = exl3_dot16_hfma2(a_rows[1], b_cols[1]);
+    half2 d00 = __float2half2_rn(0.0f);
+    half2 d01 = __float2half2_rn(0.0f);
+    half2 d10 = __float2half2_rn(0.0f);
+    half2 d11 = __float2half2_rn(0.0f);
+
+    #pragma unroll
+    for (int i = 0; i < 8; ++i)
+    {
+        d00 = __hfma2(a_rows[0][i], b_cols[0][i], d00);
+        d01 = __hfma2(a_rows[0][i], b_cols[1][i], d01);
+        d10 = __hfma2(a_rows[1][i], b_cols[0][i], d10);
+        d11 = __hfma2(a_rows[1][i], b_cols[1][i], d11);
+    }
 
     half s00 = __hadd(__low2half(d00), __high2half(d00));
     half s01 = __hadd(__low2half(d01), __high2half(d01));
@@ -97,18 +121,19 @@ __device__ __forceinline__ void exl3_mma_m16n8k16_f16(const FragA& frag_a, const
     frag_c.elems[1] = __hadd2(frag_c.elems[1], __halves2half2(s10, s11));
 }
 
-// ldmatrix.sync.aligned.m8n8.x4.b16 emulation via __shfl_sync
+// ldmatrix.sync.aligned.m8n8.x4.b16 emulation via 32-bit shared memory __shfl_sync
 __device__ __forceinline__ void exl3_ldsm4(FragA& frag_a, const void* smem_ptr)
 {
     int lane = threadIdx.x & 31;
-    unsigned long long base = (unsigned long long) (uintptr_t) smem_ptr;
+    uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
     int row = lane >> 2;
     int col_bytes = (lane & 3) * 4;
     uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
     #pragma unroll
     for (int i = 0; i < 4; ++i)
     {
-        unsigned long long row_ptr = __shfl_sync(0xffffffffu, base, 8 * i + row);
-        a[i] = *reinterpret_cast<const uint32_t*>((uintptr_t) row_ptr + col_bytes);
+        uint32_t row_smem = __shfl_sync(0xffffffffu, smem, 8 * i + row);
+        const char* ptr = static_cast<const char*>(__cvta_shared_to_generic(row_smem)) + col_bytes;
+        a[i] = *reinterpret_cast<const uint32_t*>(ptr);
     }
 }

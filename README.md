@@ -172,26 +172,42 @@ This fork introduces full native support for **NVIDIA Pascal GP100** architectur
 
 ### Architectural Highlights
 - **Native FP16x2 (`__hfma2`) Tensor Core Emulation**:
-  Pascal GP100 does not have hardware Tensor Cores (`mma.m16n8k16`). We implemented an emulated matrix-multiply accumulate kernel in PTX using GP100's native 2-way FP16 execution units (`__hfma2` / `hfma2.f32`) and cross-lane warp shuffles (`__shfl_sync` / `exl3_mma_gather`). This reaches full compute utilization on Pascal FP16 ALUs without requiring Volta+ tensor cores.
+  Pascal GP100 does not have hardware Tensor Cores (`mma.m16n8k16`). We implemented an emulated matrix-multiply accumulate kernel in PTX using GP100's native 2-way FP16 execution units (`__hfma2` / `hfma2.f32`) and cross-lane warp shuffles (`__shfl_sync` / `exl3_mma_gather`).
+- **Interleaved 4-Way FMA Pipeline Scheduling**:
+  Pascal GP100 instructions have a 6-cycle read-after-write (RAW) latency. In `exl3_mma_m16n8k16_f16`, the dot-product accumulation is fully interleaved across four independent `half2` accumulators (`d00`, `d01`, `d10`, `d11`), eliminating pipeline stalls and maximizing dual-issue throughput.
+- **Vectorized 32-bit Shared Memory LDSM**:
+  Replaced 64-bit generic pointer shuffles in `exl3_ldsm4` with 32-bit shared-memory conversions (`__cvta_generic_to_shared` / `__cvta_shared_to_generic`), eliminating half the warp shuffle instructions per tile.
+- **Native Vector Half-Accumulator (`EXL3_GEMM_H_ACC`) for SM 6.0 & SM 7.5**:
+  Enabled native FP16 MMA accumulation in the inner GEMM loops for Pascal (SM 6.0) and Turing (SM 7.5), folding into FP32 accumulators once per k-slice and bypassing intermediate scalar FP32 conversions.
+- **Turing SM 7.5 Accumulator Chaining Fix**:
+  Fixed an upstream chaining bug in `ptx.cuh` where the second half of `mma.sync.aligned.m16n8k8.f16.f16.f16.f16` overwrote rather than accumulated into the first sub-tile.
 - **Inter-SM Texture Cache Coherency Bypass (`.cg`)**:
   On Pascal GPUs, `const __restrict__` pointers are loaded by default through the read-only Texture Cache (`LDG.E.CI`), which is not coherent between different SMs. In multi-block GEMM reductions, Hadamard transforms, and MoE scheduling, inter-SM updates caused stale reads and NaN corruptions. We implemented inline PTX coherent global loads (`ld.global.cg`) that bypass the texture cache and read coherently through L2.
 - **MoE Routing & Fast Decode**:
-  Fixed barrier lock stride allocations in `exl3_moe_kernel.cuh` to prevent overlapping lock spaces between thread groups, and added robust atomic fences and ticket resets for SM 6.0. Prefill for MoE models on compute capability < 7.0 is automatically routed through the batched reconstruction path, while decode (`bsz <= 8`) runs through optimized GEMV kernels.
+  Fixed barrier lock stride allocations in `exl3_moe_kernel.cuh` to prevent overlapping lock spaces between thread groups, and added robust atomic fences and ticket resets for SM 6.0.
 - **Heterogeneous Multi-GPU Execution**:
   Enables split-model inference across mismatched architectures (e.g., RTX 2060 6GB + Tesla P100 16GB).
 
 ### Verified Performance Benchmarks
 
-Tested on a hybrid dual-GPU setup (**RTX 2060 6GB + Tesla P100 16GB PCIe**):
-- **Model**: [turboderp/Qwen3.5-35B-A3B-exl3](https://huggingface.co/turboderp/Qwen3.5-35B-A3B-exl3) (3.09 bpw)
-- **Context Length**: Tested and verified up to **128k context** (`-cs 131072`) with 0 NaNs and complete text coherence.
-- **Throughput**:
-  - **Prefill**: ~70 – 75 tokens/s
-  - **Generation (Decode)**: ~20.1 – 20.4 tokens/s
+Tested on a hybrid dual-GPU setup (**RTX 2060 6GB + Tesla P100 16GB PCIe 3.0**):
+
+| Model | Quant | Config | Generation (Decode) | Prefill (Context) | MTP Draft Acceptance |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Qwen 3.6 35B-A3B** | 3.00 bpw | Baseline (No MTP, fp16 cache) | **21.34 t/s** | 63.55 t/s | N/A |
+| **Qwen 3.6 35B-A3B** | 3.00 bpw | Native MTP (`-mtp -ndt 1 -dds -cq 4`) | **31.48 t/s** | 62.81 t/s | **85.19%** (69/81) |
+| **Qwen 3.5 35B-A3B** | 3.09 bpw | Native MTP (`-mtp -ndt 2 -dds`) | **22.65 t/s** | 63.92 t/s | **65.38%** (85/130) |
 
 ```sh
-# Example: Dual GPU (RTX 2060 + Tesla P100) with 64k or 128k context
-python examples/chat.py -m models/Qwen3.5-35B-A3B-exl3-3.09bpw -gs 4.5,15.0 -cs 65536
+# Optimal command for Qwen 3.6 35B-A3B on Dual-GPU (RTX 2060 + Tesla P100):
+python examples/chat.py \
+  -m models/Qwen3.6-35B-A3B-exl3-3.00bpw \
+  -mode qwen35 \
+  -gs 4.0,15.0 \
+  -cs 32768 \
+  -cq 4 \
+  -mtp -ndt 1 -dds \
+  -tps
 ```
 
 ## Examples

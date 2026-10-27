@@ -158,7 +158,7 @@ __device__ inline void ptx_mma_m16n8k16
         : "=r"(c[0]), "=r"(c[1])
         :  "r"(a[2]), "r"(a[3]),
            "r"(b[1]),
-           "r"(d[0]), "r"(d[1])
+           "r"(c[0]), "r"(c[1])
     );
 #else
     asm
