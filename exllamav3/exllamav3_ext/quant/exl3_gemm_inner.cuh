@@ -17,6 +17,28 @@
     #define EXL3_GEMM_H_ACC 0
 #endif
 
+__device__ __forceinline__ float load_float_cg(const float* ptr)
+{
+#if EXL3_SM60 || EXL3_SM75
+    float val;
+    asm volatile("ld.global.cg.f32 %0, [%1];\n" : "=f"(val) : "l"(ptr));
+    return val;
+#else
+    return *ptr;
+#endif
+}
+
+__device__ __forceinline__ half2 load_half2_cg(const half2* ptr)
+{
+#if EXL3_SM60 || EXL3_SM75
+    uint32_t val;
+    asm volatile("ld.global.cg.b32 %0, [%1];\n" : "=r"(val) : "l"(ptr));
+    return *reinterpret_cast<const half2*>(&val);
+#else
+    return *ptr;
+#endif
+}
+
 // TILESIZE_M == 16 is the dense / decode shape: one m16 row fragment, A fragments double-buffered
 // across the fragment stages (codegen unchanged by the multi-row support below). TILESIZE_M > 16
 // is the fused-MoE prefill shape (32 / 64 rows per tile): TILEBLOCKS_M row fragments share each
@@ -642,13 +664,13 @@ void exl3_gemm_kernel_inner
                     if constexpr (c_fp32)
                     {
                         float* c_ptr = gl_c_ptr_32 + r0 * size_n_stride + (n0 + n) * 8 + c;
-                        frag_c[0][n][0] += *c_ptr++;
-                        frag_c[0][n][1] += *c_ptr++;
+                        frag_c[0][n][0] += load_float_cg(c_ptr);
+                        frag_c[0][n][1] += load_float_cg(c_ptr + 1);
                     }
                     else
                     {
                         half2* c_ptr = (half2*) (gl_c_ptr_16 + r0 * size_n_stride + (n0 + n) * 8 + c);
-                        float2 interm = __half22float2(*c_ptr);
+                        float2 interm = __half22float2(load_half2_cg(c_ptr));
                         frag_c[0][n][0] += interm.x;
                         frag_c[0][n][1] += interm.y;
                     }
@@ -658,13 +680,13 @@ void exl3_gemm_kernel_inner
                     if constexpr (c_fp32)
                     {
                         float* c_ptr = gl_c_ptr_32 + r1 * size_n_stride + (n0 + n) * 8 + c;
-                        frag_c[0][n][2] += *c_ptr++;
-                        frag_c[0][n][3] += *c_ptr++;
+                        frag_c[0][n][2] += load_float_cg(c_ptr);
+                        frag_c[0][n][3] += load_float_cg(c_ptr + 1);
                     }
                     else
                     {
                         half2* c_ptr = (half2*) (gl_c_ptr_16 + r1 * size_n_stride + (n0 + n) * 8 + c);
-                        float2 interm = __half22float2(*c_ptr);
+                        float2 interm = __half22float2(load_half2_cg(c_ptr));
                         frag_c[0][n][2] += interm.x;
                         frag_c[0][n][3] += interm.y;
                     }
@@ -686,13 +708,13 @@ void exl3_gemm_kernel_inner
                         if constexpr (c_fp32)
                         {
                             float* c_ptr = gl_c_ptr_32 + r0 * size_n_stride + (n0 + n) * 8 + c;
-                            frag_c[m][n][0] += *c_ptr++;
-                            frag_c[m][n][1] += *c_ptr++;
+                            frag_c[m][n][0] += load_float_cg(c_ptr);
+                            frag_c[m][n][1] += load_float_cg(c_ptr + 1);
                         }
                         else
                         {
                             half2* c_ptr = (half2*) (gl_c_ptr_16 + r0 * size_n_stride + (n0 + n) * 8 + c);
-                            float2 interm = __half22float2(*c_ptr);
+                            float2 interm = __half22float2(load_half2_cg(c_ptr));
                             frag_c[m][n][0] += interm.x;
                             frag_c[m][n][1] += interm.y;
                         }
@@ -702,13 +724,13 @@ void exl3_gemm_kernel_inner
                         if constexpr (c_fp32)
                         {
                             float* c_ptr = gl_c_ptr_32 + r1 * size_n_stride + (n0 + n) * 8 + c;
-                            frag_c[m][n][2] += *c_ptr++;
-                            frag_c[m][n][3] += *c_ptr++;
+                            frag_c[m][n][2] += load_float_cg(c_ptr);
+                            frag_c[m][n][3] += load_float_cg(c_ptr + 1);
                         }
                         else
                         {
                             half2* c_ptr = (half2*) (gl_c_ptr_16 + r1 * size_n_stride + (n0 + n) * 8 + c);
-                            float2 interm = __half22float2(*c_ptr);
+                            float2 interm = __half22float2(load_half2_cg(c_ptr));
                             frag_c[m][n][2] += interm.x;
                             frag_c[m][n][3] += interm.y;
                         }

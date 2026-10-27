@@ -88,6 +88,17 @@ __device__ inline half2 shuffle_had_h2x32(half2 v, int lane_id)
     return v;
 }
 
+__device__ __forceinline__ half4 load_half4_cg(const half4* ptr)
+{
+#if EXL3_SM60 || EXL3_SM75
+    uint2 v;
+    asm volatile("ld.global.cg.v2.u32 {%0, %1}, [%2];\n" : "=r"(v.x), "=r"(v.y) : "l"(ptr));
+    return *reinterpret_cast<const half4*>(&v);
+#else
+    return *ptr;
+#endif
+}
+
 // Half vector, half scales
 
 template <bool pre_scale, bool post_scale>
@@ -103,7 +114,7 @@ void had_hf_r_128_inner
     int t = threadIdx.x & 31;
 
     // Load
-    half4 v = ((half4*) input_ptr)[t];
+    half4 v = load_half4_cg(((const half4*) input_ptr) + t);
 
     // Pre scale
     if constexpr (pre_scale)
@@ -343,7 +354,7 @@ void had_hf_r_128_guad_inner
     // Load. In non-gated mode the g buffer holds no data (its GEMM is skipped); the gate lane
     // is synthesized from u in the activation switch below
     half4 vg = {};
-    half4 vu = ((half4*) input_ptr_u)[t];
+    half4 vu = load_half4_cg(((const half4*) input_ptr_u) + t);
 
     // Hadamard
     vu = had(vu);
@@ -356,7 +367,7 @@ void had_hf_r_128_guad_inner
 
     if (act_function != ACT_RELU2_NOGATE)
     {
-        vg = ((half4*) input_ptr_g)[t];
+        vg = load_half4_cg(((const half4*) input_ptr_g) + t);
         vg = had(vg);
         half4 scales_g = ((half4*) post_scale_g)[i];
         vg.x = __hmul2(vg.x, scales_g.x);
@@ -427,7 +438,7 @@ void had_hf_r_128_d_inner
     int t = threadIdx.x & 31;
 
     // Load
-    half4 v = ((half4*) input_ptr)[t];
+    half4 v = load_half4_cg(((const half4*) input_ptr) + t);
 
     // 4 element had
     float v0 = __half2float(__low2half(v.x));

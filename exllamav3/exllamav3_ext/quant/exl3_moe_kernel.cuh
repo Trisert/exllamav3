@@ -165,10 +165,10 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
     int* barrier_counters_sense = locks + BARRIER_LOCKS_OFFSET;
 
     // Expert scheduler state, self-resetting: [0] next ticket, [1] retired groups, [2 + g] ticket for group g
-    int* sched = locks + MOE_SCHED_OFFSET;
+    volatile int* sched = reinterpret_cast<volatile int*>(locks + MOE_SCHED_OFFSET);
 
     // Individual GEMM barriers per group
-    locks += group_idx * MAX(hidden_dim, intermediate_dim) / 128;
+    locks += group_idx * (MAX(hidden_dim, intermediate_dim) / 16);
 
     // Dynamic expert assignment: active experts are numbered in scan order, and each group processes the active
     // expert matching its current ticket. Initial tickets are the group indices; after finishing an expert, a group
@@ -393,7 +393,13 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
         // Draw the next ticket and publish it to the group through the end-of-expert barrier, which also protects
         // the temp buffers for reuse. Grabbed tickets continue from num_groups since 0..num_groups-1 are implicit
         if (block_idx == 0 && threadIdx.x == 0)
-            sched[2 + group_idx] = num_groups + atomicAdd(&sched[0], 1);
+        {
+            int next = num_groups + atomicAdd(const_cast<int*>(&sched[0]), 1);
+            sched[2 + group_idx] = next;
+        }
+#if EXL3_SM60
+        __threadfence();
+#endif
         group_barrier(group_idx, group_size, barrier_counters_sense);
         ticket = sched[2 + group_idx];
     }
@@ -403,13 +409,24 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
     // straggler's in-flight grab could land after the reset and leak into the next launch)
     if (block_idx == 0 && threadIdx.x == 0)
     {
-        cuda::atomic_ref<int, cuda::thread_scope_device> next_ticket(sched[0]);
-        cuda::atomic_ref<int, cuda::thread_scope_device> retired_groups(sched[1]);
+#if EXL3_SM60
+        __threadfence();
+        int retired = atomicAdd(const_cast<int*>(&sched[1]), 1);
+        if (retired == num_groups - 1)
+        {
+            atomicExch(const_cast<int*>(&sched[0]), 0);
+            atomicExch(const_cast<int*>(&sched[1]), 0);
+            __threadfence();
+        }
+#else
+        cuda::atomic_ref<int, cuda::thread_scope_device> next_ticket(const_cast<int&>(sched[0]));
+        cuda::atomic_ref<int, cuda::thread_scope_device> retired_groups(const_cast<int&>(sched[1]));
         int retired = retired_groups.fetch_add(1, cuda::memory_order_acq_rel);
         if (retired == num_groups - 1)
         {
             next_ticket.store(0, cuda::memory_order_relaxed);
             retired_groups.store(0, cuda::memory_order_relaxed);
         }
+#endif
     }
 }

@@ -559,9 +559,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 self.multi_up.q_cb(),
                 self.multi_down.q_cb(),
             )
+            dev_idx = torch.device(self.device).index or 0
+            cc = torch.cuda.get_device_capability(dev_idx) if not torch.version.hip else (0, 0)
             self.support_fused = (
                 cbs[0] == cbs[1] == cbs[2] and cbs[0] in ((True, False), (False, True)) and
-                self.support_quant_paths
+                self.support_quant_paths and cc >= (7, 0)
             )
 
         # Temp buffers for graph, dq and fused-bsz1 paths
@@ -741,7 +743,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             # N = 256 instance for the <= 16-row launch only (it is the faster 16-row tiling)
             if self.support_fused:
                 dev_idx = torch.device(device).index or 0
-                cc = torch.cuda.get_device_capability(dev_idx) if not ROCM else (0, 0)
+                cc = torch.cuda.get_device_capability(dev_idx) if not torch.version.hip else (0, 0)
                 self.mtile_ok = MTILE and bool(self.multi_up.mul1) and cc >= (7, 0)
                 self.fused_rows = FUSED_ROWS_WIDE if self.mtile_ok else TEMP_ROWS_FUSED
                 R = self.fused_rows
@@ -1038,7 +1040,6 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # inside the kernel (out-of-range picks contribute exact zeros). Shared experts run
         # through BC_GatedMLP's own multi-row graph ahead of the kernel (see mlp.py)
         bszn_eligible = self.bc is not None and bsz <= MAX_BSZN
-
         # Routing
         if self.router_pre_norm:
             z = self.router_pre_norm.forward(y, params, out_dtype = torch.half)
@@ -1225,7 +1226,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                                 base[e] = n_slots + b * cmax; kind[e] = 2
                             n_slots += len(grp) * cmax
                         tables = host_to_device(torch.from_numpy(np.stack([base, starts_np, kind])), y.device)
-                    scratch = torch.empty((max(n_slots, 1), y.shape[1]), dtype = torch.float, device = y.device)
+                    scratch = torch.zeros((max(n_slots, 1), y.shape[1]), dtype = torch.float, device = y.device)
 
                 def run_fused(num_active, count_lo = 1, count_hi = self.fused_rows, m_tile = 16):
                     # Gateless: the up module stands in for the gate pointer tables (the kernel
@@ -1374,7 +1375,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
                         current_state = mlp(expert_idx, current_state)
 
-                    current_state.mul_(w)
+                    current_state = current_state * w
                     final_hidden_states.index_add_(0, top_x, current_state)
                     start = end
 

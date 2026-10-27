@@ -584,12 +584,14 @@ def main(args):
             print(f"\n{col_error} !! Loop detected, generation stopped.{col_default}")
 
         if show_tps and r:
-            prompt_tokens = r["prompt_tokens"]
-            cached_tokens = r["cached_tokens"]
+            prompt_tokens = r.get("prompt_tokens", len(last_input_ids) if last_input_ids is not None else 0)
+            cached_tokens = r.get("cached_tokens", 0)
             new_ctx_tokens = prompt_tokens - cached_tokens
-            prompt_tps = new_ctx_tokens / r["time_prefill"]
-            new_tokens = r["new_tokens"]
-            tps = new_tokens / r["time_generate"]
+            time_prefill = r.get("time_prefill", 1e-6) or 1e-6
+            prompt_tps = new_ctx_tokens / time_prefill
+            new_tokens = r.get("new_tokens", len(ids[0]) if ids is not None else 0)
+            time_generate = r.get("time_generate", 1e-6) or 1e-6
+            tps = new_tokens / time_generate
             rstr = f"\nContext: {col_info}{new_ctx_tokens:,}{col_default} new tokens at {col_info}{prompt_tps:.2f}{col_default} t/s"
             rstr += f" - {col_info}{cached_tokens:,}{col_default} tokens cached"
             rstr += f" - Generate: {col_info}{new_tokens:,}{col_default} tokens at {col_info}{tps:.2f}{col_default} t/s"

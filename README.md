@@ -3,10 +3,11 @@
   <img src="doc/logo.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">
 </p>
 
-[Installation](#installation) · [Supported models](#architecture-support) · [Examples](#examples) · [Quantization](#exl3-quantization) · [Community](#community)
+[Installation](#installation) · [Pascal / P100 Support](#pascal-sm-60--tesla-p100-support) · [Supported models](#architecture-support) · [Examples](#examples) · [Quantization](#exl3-quantization) · [Community](#community)
 
 ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs, with flexible quantization and parallel inference.
 
+- **Pascal / Tesla P100 (SM 6.0) Support** - Native emulation of Tensor Core operations via GP100 FP16x2 (`__hfma2`), L2 cache-coherent loads, and MoE support for 16 GB Tesla P100 cards.
 - **Quantization** - [EXL3](#exl3-quantization), based on QTIP, plus 2–8 bit cache quantization.
 - **Parallel inference** - Flexible tensor-parallel and expert-parallel inference for consumer hardware setups.
 - **CPU offloading** - Allows large MoE models to run with limited GPU resources. AVX2 and AVX512 support.  
@@ -164,6 +165,34 @@ compilation. Set this to a reasonable value like 4 in that case.
 - `EXLLAMA_NOCOMPILE`: set to install the library without compiling the C++/CUDA extension. Torch
 will build/load it at runtime instead.
 - `EXLLAMA_EXT_LINEINFO`, `EXLLAMA_EXT_COMPRESS`: see [doc/env_vars.md](doc/env_vars.md).
+
+## Pascal (SM 6.0 / Tesla P100) Support
+
+This fork introduces full native support for **NVIDIA Pascal GP100** architectures (**SM 6.0**, specifically **Tesla P100 16GB PCIe/SXM2** and Quadro GP100), enabling high-throughput inference for EXL3 quantized models on budget 16 GB enterprise accelerators with high memory bandwidth (HBM2 ~732 GB/s).
+
+### Architectural Highlights
+- **Native FP16x2 (`__hfma2`) Tensor Core Emulation**:
+  Pascal GP100 does not have hardware Tensor Cores (`mma.m16n8k16`). We implemented an emulated matrix-multiply accumulate kernel in PTX using GP100's native 2-way FP16 execution units (`__hfma2` / `hfma2.f32`) and cross-lane warp shuffles (`__shfl_sync` / `exl3_mma_gather`). This reaches full compute utilization on Pascal FP16 ALUs without requiring Volta+ tensor cores.
+- **Inter-SM Texture Cache Coherency Bypass (`.cg`)**:
+  On Pascal GPUs, `const __restrict__` pointers are loaded by default through the read-only Texture Cache (`LDG.E.CI`), which is not coherent between different SMs. In multi-block GEMM reductions, Hadamard transforms, and MoE scheduling, inter-SM updates caused stale reads and NaN corruptions. We implemented inline PTX coherent global loads (`ld.global.cg`) that bypass the texture cache and read coherently through L2.
+- **MoE Routing & Fast Decode**:
+  Fixed barrier lock stride allocations in `exl3_moe_kernel.cuh` to prevent overlapping lock spaces between thread groups, and added robust atomic fences and ticket resets for SM 6.0. Prefill for MoE models on compute capability < 7.0 is automatically routed through the batched reconstruction path, while decode (`bsz <= 8`) runs through optimized GEMV kernels.
+- **Heterogeneous Multi-GPU Execution**:
+  Enables split-model inference across mismatched architectures (e.g., RTX 2060 6GB + Tesla P100 16GB).
+
+### Verified Performance Benchmarks
+
+Tested on a hybrid dual-GPU setup (**RTX 2060 6GB + Tesla P100 16GB PCIe**):
+- **Model**: [turboderp/Qwen3.5-35B-A3B-exl3](https://huggingface.co/turboderp/Qwen3.5-35B-A3B-exl3) (3.09 bpw)
+- **Context Length**: Tested and verified up to **128k context** (`-cs 131072`) with 0 NaNs and complete text coherence.
+- **Throughput**:
+  - **Prefill**: ~70 – 75 tokens/s
+  - **Generation (Decode)**: ~20.1 – 20.4 tokens/s
+
+```sh
+# Example: Dual GPU (RTX 2060 + Tesla P100) with 64k or 128k context
+python examples/chat.py -m models/Qwen3.5-35B-A3B-exl3-3.09bpw -gs 4.5,15.0 -cs 65536
+```
 
 ## Examples
 
