@@ -205,6 +205,9 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
     constexpr int THREADS = WK * 32;
     constexpr int ROWS = MMODE == 0 ? 1 : EXL3_GEMV_MAX_M;
     constexpr int COLS = WNT * 16;
+    // sm_60 has no tensor cores and the shuffle-emulated MMA wastes 15 of 16 A rows at m = 1: take the dot product
+    // directly instead (see the A fragment loads and the quad reduction below)
+    constexpr bool DIRECT = (EXL3_SM60 != 0) && MMODE == 0;
 
     constexpr int TWORDS = HALF ? 4 * (2 * bits + 1) : 8 * bits;              // uint32 per 16x16 tile
     constexpr bool TWO_PER_LOAD = HALF ? bits == 1 : bits == 2;               // two tiles per warp load
@@ -348,16 +351,26 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
             // A fragment: lane covers row lane/4, k pairs (2(lane%4), +1) and (+8, +9)
             const size_t a_col = (size_t) (ks0 + i) * 8 + (lane & 3);
-            FragB a01, a23;
-            a01[0] = r0_ok ? A2[a_row0 + a_col] : hzero;
-            a23[0] = r0_ok ? A2[a_row0 + a_col + 4] : hzero;
-            a01[1] = hzero;
-            a23[1] = hzero;
-
+            [[maybe_unused]] half2 x01, x23;
+            [[maybe_unused]] FragB a01, a23;
+            [[maybe_unused]] half2 a_rows[2][8];
+            if constexpr (DIRECT)
+            {
+                // Lane (g, t) holds B column g at k = 2t, 2t + 1 and 2t + 8, 2t + 9, so it pairs with the same k of
+                // the single A row directly: no gather, every lane loads row 0 (four distinct addresses per warp)
+                x01 = A2[a_col];
+                x23 = A2[a_col + 4];
+            }
+            else
+            {
+                a01[0] = r0_ok ? A2[a_row0 + a_col] : hzero;
+                a23[0] = r0_ok ? A2[a_row0 + a_col + 4] : hzero;
+                a01[1] = hzero;
+                a23[1] = hzero;
 #if EXL3_SM60
-            half2 a_rows[2][8];
-            exl3_gather_a_row0(a01, a23, a_rows);
+                exl3_gather_a_row0(a01, a23, a_rows);
 #endif
+            }
 
             #pragma unroll
             for (int t = 0; t < WNT; ++t)
@@ -407,13 +420,22 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                     exl3_gemv_ns::dq8_regs_3bits<cb>(awv, bwv, x_s2, f0, f1);
                 }
 
+                if constexpr (DIRECT)
+                {
+                    // Even / odd k partial sums of column g stay in the low / high half until the final quad reduction
+                    ch[t][0][0] = __hfma2(x23, f0[1], __hfma2(x01, f0[0], ch[t][0][0]));
+                    ch[t][1][0] = __hfma2(x23, f1[1], __hfma2(x01, f1[0], ch[t][1][0]));
+                }
+                else
+                {
 #if EXL3_SM60
-                exl3_mma_m16n8k16_f16_with_a(a_rows, f0, ch[t][0]);
-                exl3_mma_m16n8k16_f16_with_a(a_rows, f1, ch[t][1]);
+                    exl3_mma_m16n8k16_f16_with_a(a_rows, f0, ch[t][0]);
+                    exl3_mma_m16n8k16_f16_with_a(a_rows, f1, ch[t][1]);
 #else
-                exl3_gemv_ns::mma_ab_h(a01, a23, f0, ch[t][0]);
-                exl3_gemv_ns::mma_ab_h(a01, a23, f1, ch[t][1]);
+                    exl3_gemv_ns::mma_ab_h(a01, a23, f0, ch[t][0]);
+                    exl3_gemv_ns::mma_ab_h(a01, a23, f1, ch[t][1]);
 #endif
+                }
             }
 
             if ((d + 1) % FOLD == 0 || i + 1 == myn)
@@ -433,6 +455,22 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
         // Cross-warp reduction over the k splits. Lane l holds row l/4, cols
         // tile*16 + frag*8 + 2*(l%4) (+1)
+        if constexpr (DIRECT)
+        {
+            // Every lane of a quad holds partial sums of the same column g: reduce over t, one lane stores
+            #pragma unroll
+            for (int t = 0; t < WNT; ++t)
+                #pragma unroll
+                for (int f = 0; f < 2; ++f)
+                {
+                    float s = acc0[t][f].x + acc0[t][f].y;
+                    s += __shfl_xor_sync(0xffffffffu, s, 1);
+                    s += __shfl_xor_sync(0xffffffffu, s, 2);
+                    if ((lane & 3) == 0)
+                        sh_red[warp][0][t * 16 + f * 8 + (lane >> 2)] = s;
+                }
+        }
+        else
         {
             const int c0 = 2 * (lane & 3);
             const bool store0 = MMODE == 0 ? lane < 4 : r0 < ROWS;
