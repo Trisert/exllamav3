@@ -117,6 +117,9 @@ int select_gemm_shape(int cc, int size_m, int size_k, int size_n, int K, bool mu
     {
         case CC_PASCAL:
             if (size_k % 32 != 0) return 1;
+            if (size_m >= 48 && exl3_gemm_shape_compat(6, size_m, size_k, size_n, K)) return 6;
+            if (size_m >= 32 && exl3_gemm_shape_compat(5, size_m, size_k, size_n, K)) return 5;
+            if (mod_256 && exl3_gemm_shape_compat(3, size_m, size_k, size_n, K)) return 3;
             return 2;
 
         case CC_OLD:
@@ -187,7 +190,6 @@ bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, i
 {
     int device;
     cudaGetDevice(&device);
-    if (DevCtx::instance().get_cc(device) == CC_PASCAL && shape_idx >= 3) return false;
 
     int tilesize_m = exl3_gemm_tilesize_m[shape_idx];
     int tilesize_k = exl3_gemm_tilesize_k[shape_idx];
