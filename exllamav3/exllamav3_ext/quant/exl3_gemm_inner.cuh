@@ -914,6 +914,45 @@ void exl3_gemm_kernel_inner
     // Perform tensor core matmul on current tile
     auto matmul = [&] (int buf)
     {
+#if EXL3_SM60
+        if constexpr (TILEBLOCKS_M == 1)
+        {
+            half2 a_rows[2][8];
+            exl3_gather_a_rows(frag_a[buf], a_rows);
+            #pragma unroll
+            for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+            {
+                #if EXL3_GEMM_H_ACC
+                    exl3_mma_m16n8k16_f16_with_a(a_rows, frag_b[buf][n], frag_c_h[0][n]);
+                #else
+                    exl3_mma_m16n8k16_f32_with_a(a_rows, frag_b[buf][n], frag_c[0][n]);
+                #endif
+            }
+        }
+        else
+        {
+            half2 a_rows[TILEBLOCKS_M][2][8];
+            #pragma unroll
+            for (int m = 0; m < TILEBLOCKS_M; ++m)
+                exl3_gather_a_rows(frag_a[m], a_rows[m]);
+
+            #pragma unroll
+            for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+            {
+                half2 b_cols[2][8];
+                exl3_gather_b_cols(frag_b[buf][n], b_cols);
+                #pragma unroll
+                for (int m = 0; m < TILEBLOCKS_M; ++m)
+                {
+                    #if EXL3_GEMM_H_ACC
+                        exl3_mma_m16n8k16_f16_pregathered(a_rows[m], b_cols, frag_c_h[m][n]);
+                    #else
+                        exl3_mma_m16n8k16_f32_pregathered(a_rows[m], b_cols, frag_c[m][n]);
+                    #endif
+                }
+            }
+        }
+#else
         if constexpr (TILEBLOCKS_M == 1)
         {
             #pragma unroll
@@ -940,6 +979,7 @@ void exl3_gemm_kernel_inner
                     #endif
                 }
         }
+#endif
     };
 
     // Start global to shared pipeline

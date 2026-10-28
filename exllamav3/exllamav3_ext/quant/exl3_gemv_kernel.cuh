@@ -354,6 +354,11 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             a01[1] = hzero;
             a23[1] = hzero;
 
+#if EXL3_SM60
+            half2 a_rows[2][8];
+            exl3_gather_a_row0(a01, a23, a_rows);
+#endif
+
             #pragma unroll
             for (int t = 0; t < WNT; ++t)
             {
@@ -402,8 +407,13 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                     exl3_gemv_ns::dq8_regs_3bits<cb>(awv, bwv, x_s2, f0, f1);
                 }
 
+#if EXL3_SM60
+                exl3_mma_m16n8k16_f16_with_a(a_rows, f0, ch[t][0]);
+                exl3_mma_m16n8k16_f16_with_a(a_rows, f1, ch[t][1]);
+#else
                 exl3_gemv_ns::mma_ab_h(a01, a23, f0, ch[t][0]);
                 exl3_gemv_ns::mma_ab_h(a01, a23, f1, ch[t][1]);
+#endif
             }
 
             if ((d + 1) % FOLD == 0 || i + 1 == myn)

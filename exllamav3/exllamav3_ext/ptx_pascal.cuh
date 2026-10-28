@@ -12,6 +12,62 @@ __device__ __forceinline__ half2 exl3_shfl_h2(half2 v, int src)
     return *reinterpret_cast<const half2*>(&u);
 }
 
+__device__ __forceinline__ void exl3_gather_a_rows
+(
+    const FragA& frag_a,
+    half2 (&a_rows)[2][8]
+)
+{
+    int lane = threadIdx.x & 31;
+    int g = lane >> 2;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i)
+    {
+        a_rows[0][i]     = exl3_shfl_h2(frag_a.elems[0], 4 * g + i);
+        a_rows[0][4 + i] = exl3_shfl_h2(frag_a.elems[2], 4 * g + i);
+        a_rows[1][i]     = exl3_shfl_h2(frag_a.elems[1], 4 * g + i);
+        a_rows[1][4 + i] = exl3_shfl_h2(frag_a.elems[3], 4 * g + i);
+    }
+}
+
+// Optimized row 0 gather for GEMV / MoE single-row path (cuts shuffles by 50% vs gathering full FragA)
+__device__ __forceinline__ void exl3_gather_a_row0
+(
+    const FragB& a01,
+    const FragB& a23,
+    half2 (&a_rows)[2][8]
+)
+{
+    int lane = threadIdx.x & 31;
+    int g = lane >> 2;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i)
+    {
+        a_rows[0][i]     = exl3_shfl_h2(a01.elems[0], 4 * g + i);
+        a_rows[0][4 + i] = exl3_shfl_h2(a23.elems[0], 4 * g + i);
+        a_rows[1][i]     = __float2half2_rn(0.0f);
+        a_rows[1][4 + i] = __float2half2_rn(0.0f);
+    }
+}
+
+__device__ __forceinline__ void exl3_gather_b_cols
+(
+    const FragB& frag_b,
+    half2 (&b_cols)[2][8]
+)
+{
+    int lane = threadIdx.x & 31;
+    int t = lane & 3;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i)
+    {
+        b_cols[0][i]     = exl3_shfl_h2(frag_b.elems[0], 8 * t + i);
+        b_cols[0][4 + i] = exl3_shfl_h2(frag_b.elems[1], 8 * t + i);
+        b_cols[1][i]     = exl3_shfl_h2(frag_b.elems[0], 8 * t + 4 + i);
+        b_cols[1][4 + i] = exl3_shfl_h2(frag_b.elems[1], 8 * t + 4 + i);
+    }
+}
+
 // Gather the two rows of A (g, g + 8) and the two columns of B (2t, 2t + 1) this lane's outputs need, as
 // eight k-pairs each. Row m of A lives in lanes 4 * (m % 8) .. + 3 (lane 4g + i holds k = 2i, 2i + 1 in a[0] /
 // a[1] and k = 2i + 8, 2i + 9 in a[2] / a[3]); column n of B lives in lanes 4n .. 4n + 3 likewise.
@@ -23,21 +79,8 @@ __device__ __forceinline__ void exl3_mma_gather
     half2 (&b_cols)[2][8]
 )
 {
-    int lane = threadIdx.x & 31;
-    int g = lane >> 2;
-    int t = lane & 3;
-    #pragma unroll
-    for (int i = 0; i < 4; ++i)
-    {
-        a_rows[0][i]     = exl3_shfl_h2(frag_a.elems[0], 4 * g + i);
-        a_rows[0][4 + i] = exl3_shfl_h2(frag_a.elems[2], 4 * g + i);
-        a_rows[1][i]     = exl3_shfl_h2(frag_a.elems[1], 4 * g + i);
-        a_rows[1][4 + i] = exl3_shfl_h2(frag_a.elems[3], 4 * g + i);
-        b_cols[0][i]     = exl3_shfl_h2(frag_b.elems[0], 8 * t + i);
-        b_cols[0][4 + i] = exl3_shfl_h2(frag_b.elems[1], 8 * t + i);
-        b_cols[1][i]     = exl3_shfl_h2(frag_b.elems[0], 8 * t + 4 + i);
-        b_cols[1][4 + i] = exl3_shfl_h2(frag_b.elems[1], 8 * t + 4 + i);
-    }
+    exl3_gather_a_rows(frag_a, a_rows);
+    exl3_gather_b_cols(frag_b, b_cols);
 }
 
 // 16-element dot product using native __hfma2 (8 pairs of half2)
@@ -66,12 +109,14 @@ __device__ __forceinline__ float exl3_dot16_f32(const half2 (&a)[8], const half2
     return s;
 }
 
-// FP16 @ FP16 + FP32 -> FP32 (interleaved 4-way accumulation to hide FMA latency)
-__device__ __forceinline__ void exl3_mma_m16n8k16_f32(const FragA& frag_a, const FragB& frag_b, FragC& frag_c)
+// FP16 @ FP16 + FP32 -> FP32 (pregathered A and B)
+__device__ __forceinline__ void exl3_mma_m16n8k16_f32_pregathered
+(
+    const half2 (&a_rows)[2][8],
+    const half2 (&b_cols)[2][8],
+    FragC& frag_c
+)
 {
-    half2 a_rows[2][8], b_cols[2][8];
-    exl3_mma_gather(frag_a, frag_b, a_rows, b_cols);
-
     float d00 = 0.0f, d01 = 0.0f, d10 = 0.0f, d11 = 0.0f;
     #pragma unroll
     for (int i = 0; i < 8; ++i)
@@ -92,12 +137,35 @@ __device__ __forceinline__ void exl3_mma_m16n8k16_f32(const FragA& frag_a, const
     frag_c.elems[3] += d11;
 }
 
-// FP16 @ FP16 + FP16 -> FP16 (Pascal P100 __hfma2 fast path with 4-way interleaved accumulators)
-__device__ __forceinline__ void exl3_mma_m16n8k16_f16(const FragA& frag_a, const FragB& frag_b, FragC_h& frag_c)
+// FP16 @ FP16 + FP32 -> FP32 (with pregathered A, gathering B)
+__device__ __forceinline__ void exl3_mma_m16n8k16_f32_with_a
+(
+    const half2 (&a_rows)[2][8],
+    const FragB& frag_b,
+    FragC& frag_c
+)
 {
-    half2 a_rows[2][8], b_cols[2][8];
-    exl3_mma_gather(frag_a, frag_b, a_rows, b_cols);
+    half2 b_cols[2][8];
+    exl3_gather_b_cols(frag_b, b_cols);
+    exl3_mma_m16n8k16_f32_pregathered(a_rows, b_cols, frag_c);
+}
 
+// FP16 @ FP16 + FP32 -> FP32 (interleaved 4-way accumulation to hide FMA latency)
+__device__ __forceinline__ void exl3_mma_m16n8k16_f32(const FragA& frag_a, const FragB& frag_b, FragC& frag_c)
+{
+    half2 a_rows[2][8];
+    exl3_gather_a_rows(frag_a, a_rows);
+    exl3_mma_m16n8k16_f32_with_a(a_rows, frag_b, frag_c);
+}
+
+// FP16 @ FP16 + FP16 -> FP16 (pregathered A and B)
+__device__ __forceinline__ void exl3_mma_m16n8k16_f16_pregathered
+(
+    const half2 (&a_rows)[2][8],
+    const half2 (&b_cols)[2][8],
+    FragC_h& frag_c
+)
+{
     half2 d00 = __float2half2_rn(0.0f);
     half2 d01 = __float2half2_rn(0.0f);
     half2 d10 = __float2half2_rn(0.0f);
@@ -119,6 +187,27 @@ __device__ __forceinline__ void exl3_mma_m16n8k16_f16(const FragA& frag_a, const
 
     frag_c.elems[0] = __hadd2(frag_c.elems[0], __halves2half2(s00, s01));
     frag_c.elems[1] = __hadd2(frag_c.elems[1], __halves2half2(s10, s11));
+}
+
+// FP16 @ FP16 + FP16 -> FP16 (with pregathered A, gathering B)
+__device__ __forceinline__ void exl3_mma_m16n8k16_f16_with_a
+(
+    const half2 (&a_rows)[2][8],
+    const FragB& frag_b,
+    FragC_h& frag_c
+)
+{
+    half2 b_cols[2][8];
+    exl3_gather_b_cols(frag_b, b_cols);
+    exl3_mma_m16n8k16_f16_pregathered(a_rows, b_cols, frag_c);
+}
+
+// FP16 @ FP16 + FP16 -> FP16 (Pascal P100 __hfma2 fast path with 4-way interleaved accumulators)
+__device__ __forceinline__ void exl3_mma_m16n8k16_f16(const FragA& frag_a, const FragB& frag_b, FragC_h& frag_c)
+{
+    half2 a_rows[2][8];
+    exl3_gather_a_rows(frag_a, a_rows);
+    exl3_mma_m16n8k16_f16_with_a(a_rows, frag_b, frag_c);
 }
 
 // ldmatrix.sync.aligned.m8n8.x4.b16 emulation via 32-bit shared memory __shfl_sync
