@@ -381,6 +381,9 @@ __device__ __forceinline__ void gemv_tile
     const bool r0_ok = r0 < nrows;
     const size_t a_row0 = r0_ok ? (size_t) rows[r0] * a_stride2 : 0;
     const half2 hzero = __half2half2(__ushort_as_half(0));
+    // sm_60, single row (decode): direct dot product instead of the shuffle-emulated MMA. Block-uniform
+    const bool direct = EXL3_SM60 && nrows == 1;
+    const size_t a_row_direct = direct ? (size_t) rows[0] * a_stride2 : 0;
 
     [[maybe_unused]] int x_src_a = 0, x_src_b = 0, x_s2 = 0;
     if constexpr (bits == 2)
@@ -457,16 +460,26 @@ __device__ __forceinline__ void gemv_tile
 
             // A fragment: lane covers row lane/4, k pairs (2(lane%4), +1) and (+8, +9)
             const size_t a_col = (size_t) (ks0 + i) * 8 + (lane & 3);
+            [[maybe_unused]] half2 x01, x23;
             FragB a01, a23;
-            a01[0] = r0_ok ? A2[a_row0 + a_col] : hzero;
-            a23[0] = r0_ok ? A2[a_row0 + a_col + 4] : hzero;
-            a01[1] = hzero;
-            a23[1] = hzero;
-
+            [[maybe_unused]] half2 a_rows[2][8];
+            if (direct)
+            {
+                // Single row on sm_60: lane (g, t) holds B column g at the k pairs it loads from A here, so the
+                // dot product needs no gather (see exl3_gemv_kernel.cuh)
+                x01 = A2[a_row_direct + a_col];
+                x23 = A2[a_row_direct + a_col + 4];
+            }
+            else
+            {
+                a01[0] = r0_ok ? A2[a_row0 + a_col] : hzero;
+                a23[0] = r0_ok ? A2[a_row0 + a_col + 4] : hzero;
+                a01[1] = hzero;
+                a23[1] = hzero;
 #if EXL3_SM60
-            half2 a_rows[2][8];
-            exl3_gather_a_row0(a01, a23, a_rows);
+                exl3_gather_a_row0(a01, a23, a_rows);
 #endif
+            }
 
             #pragma unroll
             for (int t = 0; t < WNT; ++t)
@@ -496,13 +509,21 @@ __device__ __forceinline__ void gemv_tile
                     exl3_gemv_ns::dq8_regs_3bits<cb>(awv, bwv, x_s2, f0, f1);
                 }
 
+                if (direct)
+                {
+                    ch[t][0][0] = __hfma2(x23, f0[1], __hfma2(x01, f0[0], ch[t][0][0]));
+                    ch[t][1][0] = __hfma2(x23, f1[1], __hfma2(x01, f1[0], ch[t][1][0]));
+                }
+                else
+                {
 #if EXL3_SM60
-                exl3_mma_m16n8k16_f16_with_a(a_rows, f0, ch[t][0]);
-                exl3_mma_m16n8k16_f16_with_a(a_rows, f1, ch[t][1]);
+                    exl3_mma_m16n8k16_f16_with_a(a_rows, f0, ch[t][0]);
+                    exl3_mma_m16n8k16_f16_with_a(a_rows, f1, ch[t][1]);
 #else
-                exl3_gemv_ns::mma_ab_h(a01, a23, f0, ch[t][0]);
-                exl3_gemv_ns::mma_ab_h(a01, a23, f1, ch[t][1]);
+                    exl3_gemv_ns::mma_ab_h(a01, a23, f0, ch[t][0]);
+                    exl3_gemv_ns::mma_ab_h(a01, a23, f1, ch[t][1]);
 #endif
+                }
             }
 
             if ((d + 1) % FOLD == 0 || i + 1 == myn)
@@ -522,7 +543,23 @@ __device__ __forceinline__ void gemv_tile
 
     // Cross-warp reduction over the k splits. Lane l holds row l/4, cols
     // tile*16 + frag*8 + 2*(l%4) (+1)
-    if (r0_ok)
+    if (direct)
+    {
+        // Each quad holds partial sums of column g (even / odd k in x / y): reduce over t, one lane stores
+        float* red = sh_red + (wk * ROWS) * TCOLS + wn * COLS;
+        #pragma unroll
+        for (int t = 0; t < WNT; ++t)
+            #pragma unroll
+            for (int f = 0; f < 2; ++f)
+            {
+                float s = acc0[t][f].x + acc0[t][f].y;
+                s += __shfl_xor_sync(0xffffffffu, s, 1);
+                s += __shfl_xor_sync(0xffffffffu, s, 2);
+                if ((lane & 3) == 0)
+                    red[t * 16 + f * 8 + (lane >> 2)] = s;
+            }
+    }
+    else if (r0_ok)
     {
         const int c0 = 2 * (lane & 3);
         float* red = sh_red + (wk * ROWS + r0) * TCOLS + wn * COLS;
