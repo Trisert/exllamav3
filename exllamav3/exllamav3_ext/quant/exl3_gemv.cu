@@ -55,6 +55,11 @@ static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int 
     if (mode == 3) return 0;   // testing: force narrow config
     if (mode == 4) return 1;   // testing: force wide config
 
+    // Pascal has no tensor cores and no cp.async: the block-pipelined tile kernel is 10-50x off the memory roofline
+    // there at m <= 8 (a 5120 x 17408 K=3 projection takes ~4.8 ms against ~0.3 ms through this kernel), so every
+    // eligible shape takes the GEMV
+    if (cc == CC_PASCAL) return size_n <= 8192 ? 0 : 1;
+
     // The narrow config wins (up to ~30%) whenever its grid fits in a single co-resident wave;
     // in the 1..2-wave zone the trailing partial wave costs more than the kernel gains unless
     // per-group work is small (small k). The wide config covers a band of large-n shapes with
