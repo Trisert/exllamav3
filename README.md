@@ -185,6 +185,10 @@ This fork introduces full native support for **NVIDIA Pascal GP100** architectur
   On Pascal GPUs, `const __restrict__` pointers are loaded by default through the read-only Texture Cache (`LDG.E.CI`), which is not coherent between different SMs. In multi-block GEMM reductions, Hadamard transforms, and MoE scheduling, inter-SM updates caused stale reads and NaN corruptions. We implemented inline PTX coherent global loads (`ld.global.cg`) that bypass the texture cache and read coherently through L2.
 - **MoE Routing & Fast Decode**:
   Fixed barrier lock stride allocations in `exl3_moe_kernel.cuh` to prevent overlapping lock spaces between thread groups, and added robust atomic fences and ticket resets for SM 6.0.
+- **Direct dot-product GEMV (m = 1)**:
+  At m = 1 the shuffle-emulated `m16n8k16` wastes 15 of 16 A rows. The GEMV and the single-row MoE coop GEMV tile now take the dot product directly with `__hfma2` and a quad shuffle reduction (-33..43% GEMV kernel time, -9% decode GPU time on the 35B MoE).
+- **GEMV everywhere on Pascal, including 5 bpw**:
+  The block-pipelined tile GEMM is 10-50x off the memory roofline on Pascal at small m, so every eligible shape (m <= 8) uses the GEMV. 5 bpw tensors (lm_head, sensitive layers) got a GEMV through staged shared-memory tile words (lm_head 5.7 -> 2.1 ms), and fused multi-matrix projections (K <= 5) are unfused on pre-Volta so each projection takes the GEMV.
 - **Heterogeneous Multi-GPU Execution**:
   Enables split-model inference across mismatched architectures (e.g., RTX 2060 6GB + Tesla P100 16GB).
 
@@ -197,6 +201,19 @@ Tested on a hybrid dual-GPU setup (**RTX 2060 6GB + Tesla P100 16GB PCIe 3.0**):
 | **Qwen 3.6 35B-A3B** | 3.00 bpw | Baseline (No MTP, fp16 cache) | **21.34 t/s** | 63.55 t/s | N/A |
 | **Qwen 3.6 35B-A3B** | 3.00 bpw | Native MTP (`-mtp -ndt 1 -dds -cq 4`) | **31.48 t/s** | 62.81 t/s | **85.19%** (69/81) |
 | **Qwen 3.5 35B-A3B** | 3.09 bpw | Native MTP (`-mtp -ndt 2 -dds`) | **22.65 t/s** | 63.92 t/s | **65.38%** (85/130) |
+
+
+**Thermals matter more than any kernel.** The P100 is passively cooled and, without a fan, throttles under sustained load (SM clock drops from 1328 MHz to 700-1190 MHz at ~78 C; `nvidia-smi -lgc` is not supported on this card). The same build measured 21.3 t/s cold and 7.5 t/s hot in `chat.py`. Compare builds interleaved, against unchanged control kernels (torch profiler per-kernel device times), or with the SM clock sampled alongside.
+
+Measured with the optimizations above on the same setup (35B-A3B 3.00 bpw, `-gs 4.0,15.0`):
+
+| Measurement | Before | After |
+| :--- | :--- | :--- |
+| P100 GPU busy time per decode token (torch profiler, cool card) | 60.4 ms | 22.7 ms |
+| `model.forward` per decode token (wall) | 43 ms (23 t/s) | 29 ms (35 t/s) |
+| `chat.py` generation, both builds hot (card at ~79 C) | 7.5 t/s | 12.5 t/s |
+
+Prefill (2048-token chunks) is dominated by cuBLAS fp32-accumulate sgemm (~50% of P100 time), the GatedDeltaNet Triton `h` kernel (~17%) and the weight reconstruct. An opt-in fp16-accumulate cuBLAS path (`COMPUTE_16F`, 1.7x faster GEMM kernels) cut total prefill GPU time by only ~4.5% while raising the mean KL divergence to 3e-4..3e-3 versus the fp32-accumulate result, so it was not kept. Qwen3.8-27B (SC quants) was tried and is not usable on this setup. Draft-token MTP did not beat plain decoding on the hot card in these tests.
 
 ```sh
 # Optimal command for Qwen 3.6 35B-A3B on Dual-GPU (RTX 2060 + Tesla P100):

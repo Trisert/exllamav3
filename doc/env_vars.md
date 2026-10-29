@@ -267,7 +267,10 @@ attention sinks); this switch exists for A/B comparison.
 
 QTIP-style small-m fp16 GEMV path, dispatched from the main GEMM entry point when the shape
 heuristic applies. `0` disables, `1` uses the measured heuristic envelope (default), `2` forces
-the path wherever its hard constraints allow (testing).
+the path wherever its hard constraints allow (testing). Covers 2, 3, 4 bpw (and 1.5/2.5/3.5 with
+mul1) everywhere, and 5 bpw on Pascal only (always through staged tile words). On Pascal every
+eligible shape (m <= 8, k and n multiples of 128) takes the GEMV, since the tile kernel is far
+off the memory roofline there.
 
 ### `EXL3_GEMV_SMEM` (default: `-1`)
 
