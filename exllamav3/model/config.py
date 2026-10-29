@@ -77,8 +77,8 @@ class InferParams:
     def use_mgemm(self, K: int, out_features: int, mul1: bool = False, device = None) -> bool:
         # Pre-Volta CUDA parts (Pascal) have no multi-matrix GEMV: the fused MGEMM runs the block-pipelined tile
         # kernel, which is far below the memory roofline there, while separate calls take the GEMV path
-        # (the GEMV covers K <= 4; wider tensors keep the fused kernel)
-        if device is not None and K <= 4:
+        # (the GEMV covers K <= 5; wider tensors keep the fused kernel)
+        if device is not None and K <= 5:
             import torch
             device = torch.device(device)
             if device.type == "cuda" and device.index is not None and not torch.version.hip and \

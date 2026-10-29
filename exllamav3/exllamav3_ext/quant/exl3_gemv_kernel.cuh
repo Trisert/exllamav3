@@ -196,8 +196,9 @@ template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bo
 __global__ __launch_bounds__(CFG == 0 ? 512 : 256, HALF && CFG == 0 ? 2 : 1)
 void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 {
-    static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2) : (bits == 2 || bits == 3 || bits == 4),
-                  "exl3_gemv_kernel supports 2, 3 and 4 bpw, and 1.5, 2.5 and 3.5 bpw with mul1");
+    static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2) : (bits == 2 || bits == 3 || bits == 4 || bits == 5),
+                  "exl3_gemv_kernel supports 2, 3, 4 and 5 bpw, and 1.5, 2.5 and 3.5 bpw with mul1");
+    static_assert(bits != 5 || (SMEM_STAGE && !HALF), "5 bpw runs through the staged tile words only");
     constexpr int WK   = CFG == 0 ? 16 : 8;     // k-split (warps per block)
     constexpr int WNT  = CFG == 0 ? 2 : 4;      // adjacent n-tiles per warp
     constexpr int PF   = CFG == 0 ? 4 : 2;      // prefetch ring depth
@@ -211,8 +212,10 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
     constexpr int TWORDS = HALF ? 4 * (2 * bits + 1) : 8 * bits;              // uint32 per 16x16 tile
     constexpr bool TWO_PER_LOAD = HALF ? bits == 1 : bits == 2;               // two tiles per warp load
-    constexpr int LOADS = TWO_PER_LOAD ? WNT / 2 : WNT;                       // warp loads per k-slice
-    constexpr int LSTRIDE = TWO_PER_LOAD ? 2 * TWORDS : (TWORDS < 32 ? TWORDS : 32);   // uint32 per load (lanes < LSTRIDE load)
+    // 5 bpw: a tile is 40 words, more than a warp load. The WNT tiles of a k-slice are contiguous, so the slice is
+    // loaded as CEIL(WNT * 40 / 32) full-width warp loads (the last one partial) and staged in shared memory
+    constexpr int LOADS = bits == 5 ? CEIL_DIVIDE(WNT * TWORDS, 32) : (TWO_PER_LOAD ? WNT / 2 : WNT);   // warp loads per k-slice
+    constexpr int LSTRIDE = TWO_PER_LOAD ? 2 * TWORDS : (TWORDS < 32 || bits == 5 ? (bits == 5 ? 32 : TWORDS) : 32);   // uint32 per load (lanes < LSTRIDE load)
     static_assert(!TWO_PER_LOAD || WNT % 2 == 0, "two tiles per warp load needs an even tile count per warp");
 
     auto grid = cooperative_groups::this_grid();
@@ -302,7 +305,9 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
         // Prefetch ring (indices must be compile-time or pf lands in local memory)
         auto ld_b = [&] (int i, int l) -> uint32_t
         {
-            if constexpr (LSTRIDE < 32)
+            if constexpr (bits == 5)
+                return l * 32 + lane < WNT * TWORDS ? __ldcs(bp + (size_t) i * slice_stride + l * 32) : 0;
+            else if constexpr (LSTRIDE < 32)
                 return lane < LSTRIDE ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
             else
                 return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
@@ -381,6 +386,8 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                     const uint32_t* tp = &sh_stage[warp][t * TWORDS];
                     if constexpr (HALF)
                         exl3_gemv_ns::dq8_regs_half<bits, cb>(tp[XP(0)], tp[XP(1)], XP(2), tp[XP(3)], tp[XP(4)], XP(5), f0, f1);
+                    else if constexpr (bits == 5)
+                        dq_dispatch<5, cb>(tp, lane << 3, f0, f1);
                     else if constexpr (bits == 4)
                         exl3_gemv_ns::dq8_regs_4bits<cb>(tp[(lane + 31) & 31], tp[lane], f0, f1);
                     else if constexpr (bits == 2)

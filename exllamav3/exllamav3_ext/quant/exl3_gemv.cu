@@ -46,7 +46,7 @@ static int exl3_gemv_env_smem()
 static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int cb, int mode, int narrow_coresident)
 {
     if (mode == 0) return -1;
-    if (K < 2 || K > 4) return -1;
+    if (K < 2 || K > 5) return -1;
     if (K != 4 && cb == 0) return -1;
     if (size_m > EXL3_GEMV_MAX_M) return -1;
     if (size_k % 128 || size_n % 128) return -1;
@@ -54,6 +54,7 @@ static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int 
     if (mode == 2) return size_n <= 8192 ? 0 : 1;
     if (mode == 3) return 0;   // testing: force narrow config
     if (mode == 4) return 1;   // testing: force wide config
+    if (K == 5 && cc != CC_PASCAL) return -1;   // staged 5 bpw GEMV is only measured on Pascal
 
     // Pascal has no tensor cores and no cp.async: the block-pipelined tile kernel is 10-50x off the memory roofline
     // there at m <= 8 (a 5120 x 17408 K=3 projection takes ~4.8 ms against ~0.3 ms through this kernel), so every
@@ -89,6 +90,7 @@ static void* exl3_gemv_select_kernel(int bits, int cb, bool c_fp32, int mmode, i
     SEL_GRID(4, 0, false) SEL_GRID(4, 1, false) SEL_GRID(4, 2, false)
     SEL_GRID(2, 1, false) SEL_GRID(2, 2, false) SEL_GRID(2, 1, true) SEL_GRID(2, 2, true)
     SEL_GRID(3, 1, false) SEL_GRID(3, 2, false) SEL_GRID(3, 1, true) SEL_GRID(3, 2, true)
+    SEL_GRID(5, 1, true) SEL_GRID(5, 2, true)
     #undef SEL_GRID
     #undef SEL
     return nullptr;
@@ -120,7 +122,7 @@ bool exl3_gemv_try_launch
     }
     else
     {
-        if (K < 2 || K > 4) return false;
+        if (K < 2 || K > 5) return false;
         if (K != 4 && cb == 0) return false;
     }
     if (size_m > EXL3_GEMV_MAX_M) return false;
@@ -148,7 +150,7 @@ bool exl3_gemv_try_launch
     };
 
     // Extraction style: shuffle by default, smem staging selectable per call for evaluation
-    bool smem = exl3_gemv_env_smem() == 1;
+    bool smem = exl3_gemv_env_smem() == 1 || (!half_k && K == 5);   // 5 bpw tiles only exist in the staged form
 
     auto select = [&] (int cfg_) -> void*
     {
