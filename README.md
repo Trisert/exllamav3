@@ -205,13 +205,9 @@ Tested on a hybrid dual-GPU setup (**RTX 2060 6GB + Tesla P100 16GB PCIe 3.0**):
 
 **Thermals matter more than any kernel.** The P100 is passively cooled and, without a fan, throttles under sustained load (SM clock drops from 1328 MHz to 700-1190 MHz at ~78 C; `nvidia-smi -lgc` is not supported on this card). The same build measured 21.3 t/s cold and 7.5 t/s hot in `chat.py`. Compare builds interleaved, against unchanged control kernels (torch profiler per-kernel device times), or with the SM clock sampled alongside.
 
-Measured with the optimizations above on the same setup (35B-A3B 3.00 bpw, `-gs 4.0,15.0`):
+Decode (35B-A3B 3.00 bpw, `-gs 4.0,15.0`), measured as interleaved base/worktree runs with the torch profiler on the P100, normalising EXL3 kernel time by the time of the non-EXL3 kernels in the same step (those are identical in both builds, so the ratio does not depend on clock or temperature): EXL3 kernel time relative to the control falls from 11.2-11.8 (base branch, 3 runs) to 6.3-7.6 (this branch, 3 runs), about 1.8x less EXL3 GPU time per token. Absolute GPU time per token moves with the SM clock (about 33 ms at 1075 MHz, 52 ms at 560 MHz for the whole `chat.py` iteration), so compare builds only this way. Microbenchmarks (GPU time): the 5 bpw lm_head GEMV takes 2.1 ms against 5.7 ms for the best tile-GEMM shape; the m = 1 direct dot-product path makes the GEMV 33-43% faster. A single cool-card `chat.py` run showed no difference between the branches (21.6 vs 21.9 t/s); that comparison was not repeated interleaved.
 
-| Measurement | Before | After |
-| :--- | :--- | :--- |
-| P100 GPU busy time per decode token (torch profiler, cool card) | 60.4 ms | 22.7 ms |
-| `model.forward` per decode token (wall) | 43 ms (23 t/s) | 29 ms (35 t/s) |
-| `chat.py` generation, both builds hot (card at ~79 C) | 7.5 t/s | 12.5 t/s |
+Known Pascal limitation: the Triton MLA absorb kernel (`_mla_absorb_kernel`, used by MLA models such as DeepSeek-style and Ling) needs 64 KB of shared memory at `num_stages=2` and fails on sm_60's 48 KB.
 
 Prefill (2048-token chunks) is dominated by cuBLAS fp32-accumulate sgemm (~50% of P100 time), the GatedDeltaNet Triton `h` kernel (~17%) and the weight reconstruct. An opt-in fp16-accumulate cuBLAS path (`COMPUTE_16F`, 1.7x faster GEMM kernels) cut total prefill GPU time by only ~4.5% while raising the mean KL divergence to 3e-4..3e-3 versus the fp32-accumulate result, so it was not kept. Qwen3.8-27B (SC quants) was tried and is not usable on this setup. Draft-token MTP did not beat plain decoding on the hot card in these tests.
 
