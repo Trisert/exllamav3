@@ -570,6 +570,26 @@ unsupported strides/alignment) use cuBLAS regardless. Compute capability 12.x us
 128x128 or 128x64 tiles selected by shape, and a native mixed-precision add when folding
 each 32-term FP16 partial into FP32.
 
+### `EXL3_HGEMM_HFMA2` (default: on for sm_60)
+
+Pascal sm_60 (Tesla P100) counterpart of `EXL3_HGEMM_F16ACC`: no tensor cores, but HFMA2 runs at
+twice the fp32 FMA rate, which cuBLAS only uses with an fp16 compute type. The reconstruct GEMMs
+(the same paths as above) run through an HFMA2 kernel (`hgemm_f16acc.cu`, namespace `hfma2`)
+that keeps 32-term fp16 partials and adds them into fp32 registers, 1.2-2.1x cuBLAS for grids of
+at least 96 64-row blocks; smaller grids keep cuBLAS. `0` keeps cuBLAS everywhere.
+
+### `EXL3_RECON_THRESHOLD_SM60` (default: `64`)
+
+Row count up to which EXL3 linears on sm_60 use the tile GEMM instead of reconstruct + GEMM (the
+other devices keep 144). With the HFMA2 GEMM behind the reconstruct path the emulated-MMA tile
+GEMM loses from about 64 rows on the P100.
+
+### `EXL3_MOE_FUSED_SM60` (default: `1`)
+
+Run MoE prefill on sm_60 through the fused `exl3_moe` kernel (16-row tiles, emulated MMA, experts
+up to `EXL3_MOE_FUSED_ROWS` rows; larger experts take the batched reconstruct tier) instead of
+the per-expert loop. `0` restores the per-expert loop and batched reconstruct tier.
+
 ### `EXL3_MOE_COOP_KSPLIT` (default: unset)
 
 Split-k factor of the fused decode MoE kernels: `n` runs every column chunk as `n` blocks over
