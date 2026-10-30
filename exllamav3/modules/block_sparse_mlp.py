@@ -9,7 +9,7 @@ from ..util.tensor import to2
 from . import Module, Linear
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
-from ..util.backend import MOE_FUSED_ROWS, MOE_BATCH_RECON, MOE_MTILE
+from ..util.backend import MOE_FUSED_ROWS, MOE_BATCH_RECON, MOE_MTILE, moe_fused_cc_ok
 from dataclasses import dataclass
 from .mlp import MLP, GatedMLP, capture_out_sensitivity
 from .rmsnorm import RMSNorm
@@ -563,7 +563,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             cc = torch.cuda.get_device_capability(dev_idx) if not torch.version.hip else (0, 0)
             self.support_fused = (
                 cbs[0] == cbs[1] == cbs[2] and cbs[0] in ((True, False), (False, True)) and
-                self.support_quant_paths and cc >= (7, 0)
+                self.support_quant_paths and moe_fused_cc_ok(cc)
             )
 
         # Temp buffers for graph, dq and fused-bsz1 paths

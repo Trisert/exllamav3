@@ -50,6 +50,17 @@ MOE_FUSED_ROWS = int(_env("EXL3_MOE_FUSED_ROWS", 128, 512))
 MOE_BATCH_RECON = _env("EXL3_MOE_BATCH_RECON", 1, 0) != "0"
 MOE_MTILE = _env("EXL3_MOE_MTILE", 1, 0) != "0"
 
+# Fused MoE prefill kernel on Pascal sm_60 (emulated MMA, 16-row tiles): one launch per layer instead of the
+# per-expert graph loop (<= 32 rows per expert) and the batched reconstruct tier up to EXL3_MOE_FUSED_ROWS rows.
+# Other pre-Volta parts keep the reconstruct paths
+MOE_FUSED_SM60 = os.environ.get("EXL3_MOE_FUSED_SM60", "1") != "0"
+
+
+def moe_fused_cc_ok(cc: tuple[int, int]) -> bool:
+    """Compute capability check for the fused MoE prefill kernel: Volta and newer, plus sm_60 unless
+    EXL3_MOE_FUSED_SM60=0. The caller passes (0, 0) on ROCm, which this leaves as it was (not allowed)"""
+    return cc >= (7, 0) or (cc == (6, 0) and MOE_FUSED_SM60)
+
 # mHC launch-count folds at decode row counts (hc_mix_fused, hc_fuse.cuh): apply_ deferred into the next
 # site's mix, the following RMSNorm run inside its finalize. Bit-identical to the unfused launches; on by
 # default where the per-launch cost dominates these small kernels (RDNA)
