@@ -215,6 +215,8 @@ Cheaper mul1 decode on sm_60 (`vabsdiff4` byte sum instead of the emulated `dp4a
 
 `examples/bench_chat.py` reproduces a `chat.py` session non-interactively (same arguments, prompt format and per-turn statistics, greedy sampling so two bit-identical builds generate the same tokens and the draft acceptance matches) and prints the P100 temperature and SM clock; `examples/bench_chat_ab.sh <dirA> <dirB> [rounds] [bench args]` alternates two builds. Quicksort-in-Go/Rust prompts, 600 new tokens, `-mtp -ndt 1 -dds`, 95.1% draft acceptance in every run: previous build 50.5 / 46.0 t/s, this branch 58.9 / 53.5 t/s in two interleaved rounds (+17% and +16%) while the P100 warmed from 61 to 79 C.
 
+Against the unmodified `pascal-p100` branch (commit `549b7eff`), same benchmark, 3 interleaved rounds, P100 warming from 54 to 79 C: 35.3 / 34.0 / 32.8 t/s on `pascal-p100` against 60.0 / 59.6 / 52.9 t/s on this branch (x1.70, x1.75, x1.62), and prompt processing of the 645-token turn 191 / 187 / 181 t/s against 253 / 249 / 232 t/s. Draft acceptance is 97.0% on `pascal-p100` and 95.1% here: the dot-product paths accumulate in a different order than the shuffle-emulated MMA, so the generated tokens are not identical between the two (they are identical between this branch before and after the vabsdiff4 change).
+
 Hardware and instruction-set notes for the P100 (FP16 rates, what sm_60 lacks, limits) are collected in [doc/pascal_p100.md](doc/pascal_p100.md).
 
 Known Pascal limitation: the Triton MLA absorb kernel (`_mla_absorb_kernel`, used by MLA models such as DeepSeek-style and Ling) needs 64 KB of shared memory at `num_stages=2` and fails on sm_60's 48 KB.
