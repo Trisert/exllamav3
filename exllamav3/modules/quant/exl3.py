@@ -8,6 +8,10 @@ import os
 from ...util import profile_opt
 
 AUTO_RECONSTRUCT_THRESHOLD = 144
+# Pascal sm_60: the reconstruct path's GEMM runs on HFMA2 there (hgemm_f16acc.cu, hfma2) and the tile GEMM on
+# emulated MMA, so reconstruct + GEMM wins from far fewer rows (e.g. the 132-row tail chunk of a 645-token
+# prompt: +5% prompt t/s with 64). EXL3_RECON_THRESHOLD_SM60 overrides
+AUTO_RECONSTRUCT_THRESHOLD_SM60 = int(os.environ.get("EXL3_RECON_THRESHOLD_SM60", 64))
 MAX_RECONSTRUCT_SLICE_N = 32768
 RECONSTRUCT_SLICE_GRANULARITY_N = 128
 
@@ -81,6 +85,7 @@ class LinearEXL3:
         assert self.frac is None or self.mul1, f"{key}: half-integer bitrate {self.K} requires the mul1 codebook"
 
         self._fused_reconstruct = None
+        self._recon_threshold = None
         self.bsz1_xh_args = (self.trellis.device, (1, self.in_features), self.out_dtype)
         # K is the bitrate (int, or float for the half-integer rates); the C++ side decomposes it
         self.bc = ext.BC_LinearEXL3(
@@ -137,7 +142,11 @@ class LinearEXL3:
         reconstruct = params.get("reconstruct")
         if not reconstruct:
             rows = x.numel() // x.shape[-1]
-            if rows <= AUTO_RECONSTRUCT_THRESHOLD or self.config.infer_params.no_reconstruct:
+            if self._recon_threshold is None:
+                cc = torch.cuda.get_device_capability(self.trellis.device) \
+                    if self.trellis.is_cuda and not torch.version.hip else (0, 0)
+                self._recon_threshold = AUTO_RECONSTRUCT_THRESHOLD_SM60 if cc == (6, 0) else AUTO_RECONSTRUCT_THRESHOLD
+            if rows <= self._recon_threshold or self.config.infer_params.no_reconstruct:
                 dtype = out_dtype or self.default_out_dtype
                 return self.bc.run_alloc(x, self.out_features, dtype == torch.float)
 
