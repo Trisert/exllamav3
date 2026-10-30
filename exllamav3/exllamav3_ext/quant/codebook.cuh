@@ -37,6 +37,18 @@ uint32_t mul_const_u32(uint32_t x)
 // x1 = idx1 * 0x83DCD12D
 __device__ inline half2 decode_mul1_product_2(uint32_t x0, uint32_t x1)
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610 && !defined(USE_ROCM)
+    // No dp4a before sm_61: the portable __dp4a fallback costs ~6 instructions per entry (two of them half-rate
+    // BFEs). vabsdiff4 with a zero second operand is the same byte sum plus accumulator (bit-identical, see the
+    // note below) and is a single native VABSDIFF4 on sm_60. One PRMT packs the two 16-bit results
+    uint32_t sum0, sum1;
+    asm ("vabsdiff4.u32.u32.u32.add %0, %1, %2, %3;" : "=r"(sum0) : "r"(x0), "r"(0), "r"(0x6400u));
+    asm ("vabsdiff4.u32.u32.u32.add %0, %1, %2, %3;" : "=r"(sum1) : "r"(x1), "r"(0), "r"(0x6400u));
+    half2_uint32 h(__byte_perm(sum0, sum1, 0x5410));
+    half2 k_inv_h2 = __half2half2(__ushort_as_half(0x1eee));
+    half2 k_bias_h2 = __half2half2(__ushort_as_half(0xc931));
+    return __hfma2(h.as_half2, k_inv_h2, k_bias_h2);
+#else
     const uint32_t acc = 0x6400u;  // 0x6400 -> 1024.0 ..  0x67FF -> 2047.0
     // uint32_t sum0;
     // uint32_t sum1;
@@ -49,6 +61,7 @@ __device__ inline half2 decode_mul1_product_2(uint32_t x0, uint32_t x1)
     half_uint16 h0((uint16_t) sum0);
     half_uint16 h1((uint16_t) sum1);
     return __hfma2(__halves2half2(h0.as_half, h1.as_half), k_inv_h2, k_bias_h2);
+#endif
 }
 
 // Ditto mcg (cb 1)

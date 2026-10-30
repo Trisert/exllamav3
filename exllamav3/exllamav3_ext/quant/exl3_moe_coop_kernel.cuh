@@ -407,15 +407,19 @@ __device__ __forceinline__ void gemv_tile
     const uint32_t* bp = B32 + (size_t) ks0 * slice_stride + (group * WN + wn) * GWORDS + lane;
     [[maybe_unused]] uint32_t* stage = sh_stage + warp * STAGE_WORDS;
 
-    auto ld_b = [&] (int i, int l) -> uint32_t
+    // off: uint32 offset of the k-slice from bp
+    auto ld_b_off = [&] (size_t off, int l) -> uint32_t
     {
         if constexpr (REG && bits == 3)
-            return lane < 24 ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
+            return lane < 24 ? __ldcs(bp + off + l * LSTRIDE) : 0;
         else if constexpr (!REG)
-            return (l * 32 + lane < GWORDS) ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
+            return (l * 32 + lane < GWORDS) ? __ldcs(bp + off + l * LSTRIDE) : 0;
         else
-            return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
+            return __ldcs(bp + off + l * LSTRIDE);
     };
+    auto ld_b = [&] (int i, int l) -> uint32_t { return ld_b_off((size_t) i * slice_stride, l); };
+    // sm_60: running offset of the next prefetch slice (see exl3_gemv_kernel)
+    [[maybe_unused]] size_t pf_off = (size_t) PF * slice_stride;
 
     uint32_t pf[PF][LOADS];
     #pragma unroll
@@ -445,8 +449,9 @@ __device__ __forceinline__ void gemv_tile
             {
                 #pragma unroll
                 for (int l = 0; l < LOADS; ++l)
-                    pf[d][l] = ld_b(i + PF, l);
+                    pf[d][l] = EXL3_SM60 ? ld_b_off(pf_off, l) : ld_b(i + PF, l);
             }
+            if constexpr (EXL3_SM60) pf_off += slice_stride;
 
             if constexpr (!REG)
             {

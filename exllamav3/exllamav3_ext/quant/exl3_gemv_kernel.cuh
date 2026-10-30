@@ -82,6 +82,9 @@ __device__ __forceinline__ void mma_ab_h(const FragB& a01, const FragB& a23, con
 // mul1 codebook pair decode via dp4a byte sum (bit-identical to the vabsdiff4 form)
 __device__ __forceinline__ half2 decode_pair_cb2_dp4a_(uint32_t x0, uint32_t x1)
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610 && !defined(USE_ROCM)
+    return decode_3inst_2<2>(x0, x1);   // no dp4a: vabsdiff4 byte sum (codebook.cuh), same result
+#else
     x0 *= 0x83DCD12Du;
     x1 *= 0x83DCD12Du;
     uint32_t sum0 = __dp4a(x0, 0x01010101u, 0x6400u);
@@ -91,6 +94,7 @@ __device__ __forceinline__ half2 decode_pair_cb2_dp4a_(uint32_t x0, uint32_t x1)
     half_uint16 h0((uint16_t) sum0);
     half_uint16 h1((uint16_t) sum1);
     return __hfma2(__halves2half2(h0.as_half, h1.as_half), k_inv_h2, k_bias_h2);
+#endif
 }
 
 template <int cb>
@@ -306,15 +310,20 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
         const uint32_t* bp = B32 + (size_t) ks0 * slice_stride + group * WNT * TWORDS + lane;
 
         // Prefetch ring (indices must be compile-time or pf lands in local memory)
-        auto ld_b = [&] (int i, int l) -> uint32_t
+        // off: uint32 offset of the k-slice from bp
+        auto ld_b_off = [&] (size_t off, int l) -> uint32_t
         {
             if constexpr (bits == 5)
-                return l * 32 + lane < WNT * TWORDS ? __ldcs(bp + (size_t) i * slice_stride + l * 32) : 0;
+                return l * 32 + lane < WNT * TWORDS ? __ldcs(bp + off + l * 32) : 0;
             else if constexpr (LSTRIDE < 32)
-                return lane < LSTRIDE ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
+                return lane < LSTRIDE ? __ldcs(bp + off + l * LSTRIDE) : 0;
             else
-                return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
+                return __ldcs(bp + off + l * LSTRIDE);
         };
+        auto ld_b = [&] (int i, int l) -> uint32_t { return ld_b_off((size_t) i * slice_stride, l); };
+        // sm_60: offset of the next prefetch slice, advanced by one slice per step. Without it ptxas rebuilds the
+        // 64-bit (i + PF) * slice_stride product from XMADs at every step (no wide IMAD before Volta)
+        [[maybe_unused]] size_t pf_off = (size_t) PF * slice_stride;
 
         uint32_t pf[PF][LOADS];
         #pragma unroll
@@ -360,8 +369,9 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             {
                 #pragma unroll
                 for (int l = 0; l < LOADS; ++l)
-                    pf[d][l] = ld_b(i + PF, l);
+                    pf[d][l] = EXL3_SM60 ? ld_b_off(pf_off, l) : ld_b(i + PF, l);
             }
+            if constexpr (EXL3_SM60) pf_off += slice_stride;
 
             if constexpr (SMEM_STAGE)
             {
