@@ -226,6 +226,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 #if !defined(USE_ROCM)
     m.def("hgemm_f16acc", &hgemm_f16acc, "hgemm_f16acc");
     m.def("hgemm_f16acc_status", &hgemm_f16acc_status, "hgemm_f16acc_status");
+    m.def("hgemm_hfma2", &hgemm_hfma2, "hgemm_hfma2");
     m.def("fa75_fwd", &fa75_fwd, "fa75_fwd");
     m.def("fa75_fwd_slice", &fa75_fwd_slice, "fa75_fwd_slice");
 #endif
