@@ -204,11 +204,14 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
     constexpr int PF   = CFG == 0 ? 4 : 2;      // prefetch ring depth
     constexpr int FOLD = CFG == 0 ? 4 : 2;      // fp16->fp32 fold cadence (divides PF)
     constexpr int THREADS = WK * 32;
-    constexpr int ROWS = MMODE == 0 ? 1 : EXL3_GEMV_MAX_M;
+    // MMODE 0: m = 1, MMODE 1: 2 <= m <= 8 (MMA path), MMODE 2: m = 2 and MMODE 3: m = 3..4 on sm_60 (direct dot
+    // products, 2 / 4 rows)
+    constexpr int ROWS = MMODE == 0 ? 1 : (MMODE == 2 ? 2 : (MMODE == 3 ? 4 : EXL3_GEMV_MAX_M));
     constexpr int COLS = WNT * 16;
     // sm_60 has no tensor cores and the shuffle-emulated MMA wastes 15 of 16 A rows at m = 1: take the dot product
     // directly instead (see the A fragment loads and the quad reduction below)
-    constexpr bool DIRECT = (EXL3_SM60 != 0) && MMODE == 0;
+    constexpr bool DIRECT = (EXL3_SM60 != 0) && (MMODE == 0 || MMODE == 2 || MMODE == 3);
+    constexpr int NR = MMODE == 2 ? 2 : (MMODE == 3 ? 4 : 1);   // rows handled by the direct path
 
     constexpr int TWORDS = HALF ? 4 * (2 * bits + 1) : 8 * bits;              // uint32 per 16x16 tile
     constexpr bool TWO_PER_LOAD = HALF ? bits == 1 : bits == 2;               // two tiles per warp load
@@ -323,6 +326,22 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
         FragC_h ch[WNT][2] = {};
         float2 acc0[WNT][2] = {};
+        // Direct path: one half2 partial sum (even / odd k) per tile, fragment and row
+        [[maybe_unused]] half2 dh[WNT][2][NR];
+        [[maybe_unused]] float2 da[WNT][2][NR];
+        if constexpr (DIRECT)
+        {
+            #pragma unroll
+            for (int t = 0; t < WNT; ++t)
+                #pragma unroll
+                for (int f = 0; f < 2; ++f)
+                    #pragma unroll
+                    for (int r = 0; r < NR; ++r)
+                    {
+                        dh[t][f][r] = hzero;
+                        da[t][f][r] = make_float2(0.0f, 0.0f);
+                    }
+        }
 
         for (int ib = 0; ib < myn; ib += PF)
         {
@@ -356,15 +375,20 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
             // A fragment: lane covers row lane/4, k pairs (2(lane%4), +1) and (+8, +9)
             const size_t a_col = (size_t) (ks0 + i) * 8 + (lane & 3);
-            [[maybe_unused]] half2 x01, x23;
+            [[maybe_unused]] half2 x01[NR], x23[NR];
             [[maybe_unused]] FragB a01, a23;
             [[maybe_unused]] half2 a_rows[2][8];
             if constexpr (DIRECT)
             {
                 // Lane (g, t) holds B column g at k = 2t, 2t + 1 and 2t + 8, 2t + 9, so it pairs with the same k of
                 // the single A row directly: no gather, every lane loads row 0 (four distinct addresses per warp)
-                x01 = A2[a_col];
-                x23 = A2[a_col + 4];
+                #pragma unroll
+                for (int r = 0; r < NR; ++r)
+                {
+                    const bool ok = NR == 1 || r < size_m;
+                    x01[r] = ok ? A2[(size_t) r * (size_k / 2) + a_col] : hzero;
+                    x23[r] = ok ? A2[(size_t) r * (size_k / 2) + a_col + 4] : hzero;
+                }
             }
             else
             {
@@ -430,8 +454,12 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                 if constexpr (DIRECT)
                 {
                     // Even / odd k partial sums of column g stay in the low / high half until the final quad reduction
-                    ch[t][0][0] = __hfma2(x23, f0[1], __hfma2(x01, f0[0], ch[t][0][0]));
-                    ch[t][1][0] = __hfma2(x23, f1[1], __hfma2(x01, f1[0], ch[t][1][0]));
+                    #pragma unroll
+                    for (int r = 0; r < NR; ++r)
+                    {
+                        dh[t][0][r] = __hfma2(x23[r], f0[1], __hfma2(x01[r], f0[0], dh[t][0][r]));
+                        dh[t][1][r] = __hfma2(x23[r], f1[1], __hfma2(x01[r], f1[0], dh[t][1][r]));
+                    }
                 }
                 else
                 {
@@ -447,15 +475,32 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
             if ((d + 1) % FOLD == 0 || i + 1 == myn)
             {
-                #pragma unroll
-                for (int t = 0; t < WNT; ++t)
+                if constexpr (DIRECT)
+                {
                     #pragma unroll
-                    for (int f = 0; f < 2; ++f)
-                    {
-                        acc0[t][f].x += __low2float(ch[t][f][0]);
-                        acc0[t][f].y += __high2float(ch[t][f][0]);
-                        ch[t][f][0] = hzero;
-                    }
+                    for (int t = 0; t < WNT; ++t)
+                        #pragma unroll
+                        for (int f = 0; f < 2; ++f)
+                            #pragma unroll
+                            for (int r = 0; r < NR; ++r)
+                            {
+                                da[t][f][r].x += __low2float(dh[t][f][r]);
+                                da[t][f][r].y += __high2float(dh[t][f][r]);
+                                dh[t][f][r] = hzero;
+                            }
+                }
+                else
+                {
+                    #pragma unroll
+                    for (int t = 0; t < WNT; ++t)
+                        #pragma unroll
+                        for (int f = 0; f < 2; ++f)
+                        {
+                            acc0[t][f].x += __low2float(ch[t][f][0]);
+                            acc0[t][f].y += __high2float(ch[t][f][0]);
+                            ch[t][f][0] = hzero;
+                        }
+                }
             }
         }
         }
@@ -469,13 +514,15 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             for (int t = 0; t < WNT; ++t)
                 #pragma unroll
                 for (int f = 0; f < 2; ++f)
-                {
-                    float s = acc0[t][f].x + acc0[t][f].y;
-                    s += __shfl_xor_sync(0xffffffffu, s, 1);
-                    s += __shfl_xor_sync(0xffffffffu, s, 2);
-                    if ((lane & 3) == 0)
-                        sh_red[warp][0][t * 16 + f * 8 + (lane >> 2)] = s;
-                }
+                    #pragma unroll
+                    for (int r = 0; r < NR; ++r)
+                    {
+                        float s = da[t][f][r].x + da[t][f][r].y;
+                        s += __shfl_xor_sync(0xffffffffu, s, 1);
+                        s += __shfl_xor_sync(0xffffffffu, s, 2);
+                        if ((lane & 3) == 0)
+                            sh_red[warp][r][t * 16 + f * 8 + (lane >> 2)] = s;
+                    }
         }
         else
         {
