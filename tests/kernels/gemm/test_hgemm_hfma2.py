@@ -20,13 +20,14 @@ pytestmark = [
 ]
 
 
+@pytest.mark.parametrize("bm", [128, 64])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 @pytest.mark.parametrize("batch,M,N,K", [
     (1, 1, 128, 32), (1, 129, 256, 128), (1, 645, 1024, 2048), (2, 130, 512, 2048), (3, 200, 2048, 512),
     (1, 2048, 2048, 4096),
 ])
 @torch.inference_mode()
-def test_hfma2_matches_cublas(device, dtype, batch, M, N, K):
+def test_hfma2_matches_cublas(device, dtype, batch, M, N, K, bm):
     if not _sm60(device):
         pytest.skip("sm_60 kernel")
     torch.manual_seed(12345)
@@ -36,10 +37,10 @@ def test_hfma2_matches_cublas(device, dtype, batch, M, N, K):
     storage = torch.full((batch, M, ldc), 123, device = device, dtype = dtype)
     c = storage[:, :, :N]
     if batch == 1:
-        ext.hgemm_hfma2(a[0], b[0], c[0])
+        ext.hgemm_hfma2(a[0], b[0], c[0], bm)
     else:
         c = torch.empty((batch, M, N), device = device, dtype = dtype)
-        ext.hgemm_hfma2(a, b, c)
+        ext.hgemm_hfma2(a, b, c, bm)
         storage = None
     if storage is not None:
         assert bool((storage[:, :, N:] == 123).all()), "output padding written"
@@ -51,9 +52,9 @@ def test_hfma2_matches_cublas(device, dtype, batch, M, N, K):
 
     before = c.clone()
     if batch == 1:
-        ext.hgemm_hfma2(a[0], b[0], c[0])
+        ext.hgemm_hfma2(a[0], b[0], c[0], bm)
     else:
-        ext.hgemm_hfma2(a, b, c)
+        ext.hgemm_hfma2(a, b, c, bm)
     bits = torch.int32 if dtype == torch.float32 else torch.int16
     assert torch.equal(c.view(bits), before.view(bits)), "not bit-reproducible"
 
@@ -68,8 +69,10 @@ def test_hfma2_exact_row_selection(device):
     a[torch.arange(M, device = device), idx] = 1
     b = torch.randn(K, N, device = device, dtype = torch.half)
     c = torch.empty(M, N, device = device, dtype = torch.float)
-    ext.hgemm_hfma2(a, b, c)
-    assert torch.equal(c, b[idx].float())
+    for bm in (128, 64):
+        c.zero_()
+        ext.hgemm_hfma2(a, b, c, bm)
+        assert torch.equal(c, b[idx].float())
 
 
 @torch.inference_mode()

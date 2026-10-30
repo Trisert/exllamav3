@@ -21,7 +21,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
-#include <cmath>
 
 namespace f16acc
 {
@@ -449,7 +448,7 @@ static bool covered(const at::Tensor& a, const at::Tensor& b, const at::Tensor& 
     if (M > std::numeric_limits<int>::max() || N > std::numeric_limits<int>::max() ||
         K > std::numeric_limits<int>::max()) return false;
     // CUDA grid.y and grid.z are limited to 65535. Keep every narrowing conversion checked.
-    if ((M + BM - 1) / BM > 65535) return false;
+    if ((M + 63) / 64 > 65535) return false;
     if (a.stride(-1) != 1 || b.stride(-1) != 1 || c.stride(-1) != 1) return false;
     if (a.stride(-2) != K || b.stride(-2) != N) return false;
     if (c.stride(-2) < N || c.stride(-2) > std::numeric_limits<int>::max() ||
@@ -544,18 +543,23 @@ static void launch(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c
 // Pascal sm_60 (GP100) form of the same contract: no tensor cores, but HFMA2 runs at twice the fp32 FMA rate,
 // which cuBLAS only uses with an fp16 compute type (fp16 accumulation across all of K). This kernel keeps
 // fp16 partials over KSLICE = 32 elements of K and adds them into fp32 registers, like the f16acc kernel
-// above. 128 x 128 x 32 block tile, 256 threads, 8 x 8 outputs per thread (rows ty*4 + {0..3} and
-// 64 + ty*4 + {0..3}, columns tx*4 + {0..3} and 64 + tx*4 + {0..3}). A is staged transposed in shared memory
-// with each element duplicated into a half2 so one LDS.128 feeds four broadcast operands; B rows are staged
-// as loaded. Global loads for the next K tile are issued before the current tile's math (register double
-// buffering, two shared stages). Requires K % 32 == 0, N % 128 == 0, 16-byte aligned packed A / B rows.
+// above. BM x 128 x 32 block tile (BM = 64 or 128, 2 * BM threads), 8 x 8 outputs per thread (rows ty*4 + {0..3}
+// and BM/2 + ty*4 + {0..3}, columns tx*4 + {0..3} and 64 + tx*4 + {0..3}). A is staged transposed in shared
+// memory with each element duplicated into a half2 so one LDS.128 feeds four broadcast operands; B rows are
+// staged as loaded. Global loads for the next K tile are issued before the current tile's math (register double
+// buffering, two shared stages). Every output element sees the same arithmetic whatever BM is. Requires
+// K % 32 == 0, N % 128 == 0, 16-byte aligned packed A / B rows.
 namespace hfma2
 {
 
-constexpr int BM = 128, BN = 128, BK = 32, THREADS = 256;
+constexpr int BN = 128, BK = 32;
+// Smallest 64-row-tile grid the dispatching entry points take (see pick_tile)
+constexpr int64_t MIN_BLOCKS_64 = 96;
 
-template <bool OUT_F32>
-__global__ void __launch_bounds__(THREADS, 1)
+// BM = 128 (256 threads, one block per SM) or 64 (128 threads, two per SM) rows per block; the 64-row tile
+// halves the grid granularity for narrow outputs (N = 512 projections, small expert groups)
+template <bool OUT_F32, int BM>
+__global__ void __launch_bounds__(BM * 2, 128 / BM)
 gemm_kernel
 (
     const half* __restrict__ A,
@@ -577,12 +581,14 @@ gemm_kernel
     A += blockIdx.z * a_bstride;
     B += blockIdx.z * b_bstride;
 
+    constexpr int THREADS = BM * 2;
+    constexpr int LB = BK * BN / 8 / THREADS;      // 16-byte B loads per thread per K tile
     const int tid = threadIdx.x;
     const int tx = tid & 15, ty = tid >> 4;
     const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
 
     // Global load mapping, two 16-deep halves of the K tile: A row tid / 2, k (tid & 1) * 8 + {0, 16};
-    // B row tid / 16 + {0, 16}, columns (tid & 15) * 8
+    // B rows tid / 16 + l * THREADS / 16, columns (tid & 15) * 8
     const int a_row = tid >> 1, a_k = (tid & 1) * 8;
     const bool a_ok = m0 + a_row < M;
     const half* a_ptr = A + (size_t) (a_ok ? m0 + a_row : 0) * K + a_k;
@@ -598,15 +604,15 @@ gemm_kernel
         for (int j = 0; j < 8; ++j) accf[i][j] = 0.0f;
     }
 
-    uint4 ra[2], rb[2];
+    uint4 ra[2], rb[LB];
     auto gload = [&] (int kt)
     {
         #pragma unroll
         for (int l = 0; l < 2; ++l)
-        {
             ra[l] = a_ok ? *reinterpret_cast<const uint4*>(a_ptr + kt * BK + l * 16) : make_uint4(0, 0, 0, 0);
-            rb[l] = *reinterpret_cast<const uint4*>(b_ptr + (size_t) (kt * BK + l * 16) * N);
-        }
+        #pragma unroll
+        for (int l = 0; l < LB; ++l)
+            rb[l] = *reinterpret_cast<const uint4*>(b_ptr + (size_t) (kt * BK + l * (THREADS / 16)) * N);
     };
     auto sstore = [&] (int buf)
     {
@@ -616,8 +622,10 @@ gemm_kernel
             const half* ha = reinterpret_cast<const half*>(&ra[l]);
             #pragma unroll
             for (int i = 0; i < 8; ++i) As[buf][l * 16 + a_k + i][a_row] = __half2half2(ha[i]);
-            *reinterpret_cast<uint4*>(&Bs[buf][l * 16 + b_k][b_n]) = rb[l];
         }
+        #pragma unroll
+        for (int l = 0; l < LB; ++l)
+            *reinterpret_cast<uint4*>(&Bs[buf][l * (THREADS / 16) + b_k][b_n]) = rb[l];
     };
 
     const int KT = K / BK;
@@ -642,7 +650,7 @@ gemm_kernel
         for (int k = 0; k < BK; ++k)
         {
             const uint4 a0 = *reinterpret_cast<const uint4*>(&As[buf][k][ty * 4]);
-            const uint4 a1 = *reinterpret_cast<const uint4*>(&As[buf][k][64 + ty * 4]);
+            const uint4 a1 = *reinterpret_cast<const uint4*>(&As[buf][k][BM / 2 + ty * 4]);
             const uint2 b0 = *reinterpret_cast<const uint2*>(&Bs[buf][k][tx * 4]);
             const uint2 b1 = *reinterpret_cast<const uint2*>(&Bs[buf][k][64 + tx * 4]);
             const half2* av0 = reinterpret_cast<const half2*>(&a0);
@@ -682,7 +690,7 @@ gemm_kernel
     #pragma unroll
     for (int i = 0; i < 8; ++i)
     {
-        const int m = m0 + (i < 4 ? ty * 4 + i : 64 + ty * 4 + i - 4);
+        const int m = m0 + (i < 4 ? ty * 4 + i : BM / 2 + ty * 4 + i - 4);
         if (m >= M) continue;
         if constexpr (OUT_F32)
         {
@@ -745,7 +753,7 @@ static bool covered(const at::Tensor& a, const at::Tensor& b, const at::Tensor& 
     if (b.size(-2) != K || c.size(-1) != N) return false;
     if (M > std::numeric_limits<int>::max() || K > std::numeric_limits<int>::max() ||
         N > std::numeric_limits<int>::max()) return false;
-    if ((M + BM - 1) / BM > 65535) return false;
+    if ((M + 63) / 64 > 65535) return false;
     // Packed A rows (all leading dims flattened), packed B rows, contiguous C columns
     if (!batched && !a.is_contiguous()) return false;
     if (batched && (a.stride(2) != 1 || a.stride(1) != K)) return false;
@@ -775,40 +783,49 @@ static bool covered(const at::Tensor& a, const at::Tensor& b, const at::Tensor& 
     return true;
 }
 
-// One 256-thread block per SM (register bound), so the grid runs in ceil(blocks / SMs) waves. Against cuBLAS
-// the kernel is ~1.5x faster per full wave on the P100 (2048-row prefill shapes); a partly filled last wave
-// eats into that, and grids below one wave lose outright (160 x 2048 x 512: 0.3x, 2048 x 2048 x 512 with 64
-// blocks on 56 SMs: 1.0x). Take the kernel when the wave-quantised estimate still wins by 10%
-static bool worthwhile(const at::Tensor& a, const at::Tensor& b)
+static int64_t rows_of(const at::Tensor& a, bool batched)
 {
-    const bool batched = b.dim() == 3;
+    if (batched) return a.size(1);
     int64_t M = 1;
-    if (batched) M = a.size(1);
-    else for (int d = 0; d < a.dim() - 1; ++d) M *= a.size(d);
-    const int64_t blocks = ((M + BM - 1) / BM) * (b.size(-1) / BN) * (batched ? a.size(0) : 1);
-    const int sms = at::cuda::getDeviceProperties(a.device().index())->multiProcessorCount;
-    const double waves = (double) blocks / sms;
-    const double est = std::ceil(waves) / waves / 1.5;
-    return est < 0.9;
+    for (int d = 0; d < a.dim() - 1; ++d) M *= a.size(d);
+    return M;
 }
 
-static void launch(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, cudaStream_t stream)
+// Row tile for the dispatching entry points, 0 = keep cuBLAS. Measured on the P100 against cuBLAS (fp32
+// compute): the 64-row tile (two 128-thread blocks per SM) is 1.2-2.1x faster from about 96 blocks up
+// (2048 x 2048 x 512: 1.19x, 132 x 2048 x 8192: 1.28x, 645 x 4096 x 2048: 1.27x, 8 x [150 x 2048 x 512]: 2.1x)
+// and within 2% of the 128-row tile on the large shapes (2048 x 2048 x 8192: 1.41x vs 1.44x), while grids of
+// 32-48 blocks lose (512 x 2048 x 512: 0.64x, 132 x 4096 x 2048: 0.80x)
+static int pick_tile(const at::Tensor& a, const at::Tensor& b)
+{
+    const bool batched = b.dim() == 3;
+    const int64_t M = rows_of(a, batched);
+    const int64_t blocks = ((M + 63) / 64) * (b.size(-1) / BN) * (batched ? a.size(0) : 1);
+    return blocks >= MIN_BLOCKS_64 ? 64 : 0;
+}
+
+static void launch(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, cudaStream_t stream, int bm)
 {
     const bool batched = b.dim() == 3;
     const int batch = batched ? a.size(0) : 1;
     const int K = a.size(-1), N = b.size(-1);
-    int64_t M = 1;
-    if (batched) M = a.size(1);
-    else for (int d = 0; d < a.dim() - 1; ++d) M *= a.size(d);
-    dim3 grid(N / BN, (M + BM - 1) / BM, batch);
+    const int64_t M = rows_of(a, batched);
+    dim3 grid(N / BN, (M + bm - 1) / bm, batch);
     const int ldc = (int) c.stride(-2);
     const int64_t as = batched ? a.stride(0) : 0, bs = batched ? b.stride(0) : 0, cs = batched ? c.stride(0) : 0;
-    if (c.dtype() == at::kFloat)
-        gemm_kernel<true><<<grid, THREADS, 0, stream>>>((const half*) a.data_ptr(), (const half*) b.data_ptr(),
-            c.data_ptr(), (int) M, N, K, ldc, as, bs, cs);
+    const half* ap = (const half*) a.data_ptr();
+    const half* bp = (const half*) b.data_ptr();
+    const bool f32 = c.dtype() == at::kFloat;
+    if (bm == 64)
+    {
+        if (f32) gemm_kernel<true, 64><<<grid, 128, 0, stream>>>(ap, bp, c.data_ptr(), (int) M, N, K, ldc, as, bs, cs);
+        else gemm_kernel<false, 64><<<grid, 128, 0, stream>>>(ap, bp, c.data_ptr(), (int) M, N, K, ldc, as, bs, cs);
+    }
     else
-        gemm_kernel<false><<<grid, THREADS, 0, stream>>>((const half*) a.data_ptr(), (const half*) b.data_ptr(),
-            c.data_ptr(), (int) M, N, K, ldc, as, bs, cs);
+    {
+        if (f32) gemm_kernel<true, 128><<<grid, 256, 0, stream>>>(ap, bp, c.data_ptr(), (int) M, N, K, ldc, as, bs, cs);
+        else gemm_kernel<false, 128><<<grid, 256, 0, stream>>>(ap, bp, c.data_ptr(), (int) M, N, K, ldc, as, bs, cs);
+    }
     cuda_check(cudaPeekAtLastError());
 }
 
@@ -818,23 +835,26 @@ static void launch(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c
 bool hgemm_hfma2_try(const at::Tensor& a, const at::Tensor& b, at::Tensor& c)
 {
     if (!a.is_cuda() || !hfma2::enabled(a.device().index())) return false;
-    if (!hfma2::covered(a, b, c) || !hfma2::worthwhile(a, b)) return false;
+    if (!hfma2::covered(a, b, c)) return false;
+    const int bm = hfma2::pick_tile(a, b);
+    if (!bm) return false;
     const at::cuda::OptionalCUDAGuard device_guard(a.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-    hfma2::launch(a, b, c, stream);
+    hfma2::launch(a, b, c, stream, bm);
     return true;
 }
 
-// Force the kernel (tests / benchmarks): errors on other devices or uncovered shapes
-void hgemm_hfma2(at::Tensor a, at::Tensor b, at::Tensor c)
+// Force the kernel (tests / benchmarks): errors on other devices or uncovered shapes. bm: row tile, 128 or 64
+void hgemm_hfma2(at::Tensor a, at::Tensor b, at::Tensor c, int64_t bm)
 {
+    TORCH_CHECK(bm == 128 || bm == 64, "hgemm_hfma2: row tile must be 128 or 64");
     TORCH_CHECK(a.is_cuda(), "hgemm_hfma2: CUDA tensors required");
     const auto* props = at::cuda::getDeviceProperties(a.device().index());
     TORCH_CHECK(props->major == 6 && props->minor == 0, "hgemm_hfma2: sm_60 only");
     TORCH_CHECK(hfma2::covered(a, b, c), "hgemm_hfma2: unsupported shape, strides or alignment (K % 32, N % 128, packed rows)");
     const at::cuda::OptionalCUDAGuard device_guard(a.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-    hfma2::launch(a, b, c, stream);
+    hfma2::launch(a, b, c, stream, (int) bm);
 }
 
 // Try the fp16-accumulator kernel; false = caller should use cuBLAS
