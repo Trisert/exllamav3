@@ -34,7 +34,11 @@ from .utils import autotune
         # sm_75 (Turing): num_warps=8 is ~4x faster than 2/4 for the sequential chunk
         # recurrence (measured 9.8 ms -> 2.5 ms per GDN layer at T=1792 on a 2080 Ti)
         triton.Config({'BV': 64}, num_warps=8, num_stages=1),
-    ] if not dev.shared_mem('ada') else []),
+    ] if not dev.shared_mem('ada') else []) + ([
+        # sm_60 (P100): 16-column V tiles at 4 / 8 warps, ~13x faster than the 32 / 64-column tiles for the
+        # chunk recurrence (Qwen3.6-35B-A3B shapes, T=2048: 1.6 ms vs 21 ms per call; same outputs bit for bit)
+        triton.Config({'BV': 16}, num_warps=num_warps, num_stages=1) for num_warps in (4, 8)
+    ] if dev.major == 6 else []),
     key=['H', 'HV', 'K', 'V', 'BT', 'STATE_V_FIRST'],
     **autotune_cache_kwargs,
 )
