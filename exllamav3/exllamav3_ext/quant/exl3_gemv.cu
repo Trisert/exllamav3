@@ -41,9 +41,25 @@ static int exl3_gemv_env_smem()
     return atoi(env);
 }
 
+// Turing sm_75 (RTX 2060): every eligible K <= 4 shape takes the GEMV unless EXL3_GEMV_SM75=0
+static bool exl3_gemv_sm75(int device)
+{
+    static int is_sm75[MAX_DEVICES] = {};   // 0: not queried, 1: no, 2: yes
+    if (!is_sm75[device])
+    {
+        int major = 0, minor = 0;
+        cuda_check(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
+        cuda_check(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device));
+        const char* env = std::getenv("EXL3_GEMV_SM75");
+        bool on = !env || atoi(env) != 0;
+        is_sm75[device] = (major == 7 && minor == 5 && on) ? 2 : 1;
+    }
+    return is_sm75[device] == 2;
+}
+
 // -1: not eligible, 0: narrow config, 1: wide config. narrow_coresident = number of narrow-config
 // blocks that fit on the device at once (its grid is one block per 32 output columns)
-static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int cb, int mode, int narrow_coresident)
+static int exl3_gemv_cfg(int cc, bool sm75, int size_m, int size_k, int size_n, int K, int cb, int mode, int narrow_coresident)
 {
     if (mode == 0) return -1;
     if (K < 2 || K > 6) return -1;
@@ -60,6 +76,10 @@ static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int 
     // there at m <= 8 (a 5120 x 17408 K=3 projection takes ~4.8 ms against ~0.3 ms through this kernel), so every
     // eligible shape takes the GEMV
     if (cc == CC_PASCAL) return size_n <= 8192 ? 0 : 1;
+
+    // Turing (measured on the RTX 2060, mul1, K = 2..4, m = 1..8, k / n from 512 to 17408): the GEMV beats the
+    // autotuned tile kernel at every measured shape, 1.04-1.70x (K = 4: 1.18-1.68x)
+    if (sm75 && K <= 4) return size_n <= 8192 ? 0 : 1;
 
     // The narrow config wins (up to ~30%) whenever its grid fits in a single co-resident wave;
     // in the 1..2-wave zone the trailing partial wave costs more than the kernel gains unless
@@ -168,7 +188,7 @@ bool exl3_gemv_try_launch
 
     // Shape heuristic: a half-integer rate K + 0.5 is handled like the integer rate above it (its tile is
     // between the two in bytes; unmeasured, so it inherits the K + 1 envelope)
-    int cfg = exl3_gemv_cfg(cc, size_m, size_k, size_n, half_k ? K + 1 : K, cb, mode, narrow_coresident);
+    int cfg = exl3_gemv_cfg(cc, cc == CC_OLD && exl3_gemv_sm75(device), size_m, size_k, size_n, half_k ? K + 1 : K, cb, mode, narrow_coresident);
     if (cfg < 0) return false;
 
     void* kernel = cfg == 0 ? narrow_kernel : select(cfg);

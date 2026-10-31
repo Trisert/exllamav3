@@ -77,13 +77,17 @@ class InferParams:
     def use_mgemm(self, K: int, out_features: int, mul1: bool = False, device = None) -> bool:
         # Pre-Volta CUDA parts (Pascal) have no multi-matrix GEMV: the fused MGEMM runs the block-pipelined tile
         # kernel, which is far below the memory roofline there, while separate calls take the GEMV path
-        # (the GEMV covers K <= 5; wider tensors keep the fused kernel)
+        # (the GEMV covers K <= 5; wider tensors keep the fused kernel). Same on Turing sm_75, where every K <= 4
+        # shape takes the GEMV (measured on the RTX 2060; EXL3_GEMV_SM75=0 keeps the tile kernel and the fused MGEMM)
         if device is not None and K <= 5:
             import torch
             device = torch.device(device)
-            if device.type == "cuda" and device.index is not None and not torch.version.hip and \
-                    torch.cuda.get_device_capability(device.index)[0] < 7:
-                return False
+            if device.type == "cuda" and device.index is not None and not torch.version.hip:
+                cap = torch.cuda.get_device_capability(device.index)
+                if cap[0] < 7:
+                    return False
+                if cap == (7, 5) and K <= 4 and os.environ.get("EXL3_GEMV_SM75", "1") != "0":
+                    return False
         # Unfusing only pays when the separate GEMV calls can actually take the int8 path, which
         # requires the mul1 codebook; other tensors always keep the fused MGEMM
         if not mul1:
