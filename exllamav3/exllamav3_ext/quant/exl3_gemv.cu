@@ -78,8 +78,8 @@ static int exl3_gemv_cfg(int cc, bool sm75, int size_m, int size_k, int size_n, 
     if (cc == CC_PASCAL) return size_n <= 8192 ? 0 : 1;
 
     // Turing (measured on the RTX 2060, mul1, K = 2..4, m = 1..8, k / n from 512 to 17408): the GEMV beats the
-    // autotuned tile kernel at every measured shape, 1.04-1.70x (K = 4: 1.18-1.68x)
-    if (sm75 && K <= 4) return size_n <= 8192 ? 0 : 1;
+    // autotuned tile kernel at every measured shape, 1.04-1.70x (K = 4: 1.18-1.68x). mcg / 3INST are unmeasured
+    if (sm75 && K <= 4 && cb == 2) return size_n <= 8192 ? 0 : 1;
 
     // The narrow config wins (up to ~30%) whenever its grid fits in a single co-resident wave;
     // in the 1..2-wave zone the trailing partial wave costs more than the kernel gains unless
