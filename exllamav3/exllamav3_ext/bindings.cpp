@@ -11,6 +11,7 @@
 #include "norm.cuh"
 #include "hgemm.cuh"
 #include "turing/fa75.cuh"
+#include "pascal/fa60.cuh"
 #include "rope.cuh"
 #include "activation.cuh"
 #include "softcap.cuh"
@@ -229,6 +230,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("hgemm_hfma2", &hgemm_hfma2, "hgemm_hfma2", py::arg("a"), py::arg("b"), py::arg("c"), py::arg("bm") = 128);
     m.def("fa75_fwd", &fa75_fwd, "fa75_fwd");
     m.def("fa75_fwd_slice", &fa75_fwd_slice, "fa75_fwd_slice");
+    m.def("fa60_fwd", &fa60_fwd, "fa60_fwd");
 #endif
     m.def("rope", &rope, "rope");
     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");

@@ -129,6 +129,14 @@ def fa75_prefill(device) -> bool:
     return _sm75_switch("EXL3_FA75", device)
 
 
+def fa60_prefill(device) -> bool:
+    """The fa60 HFMA2 kernel for head_dim 256 on that path (sm_60 default; EXL3_FA60)"""
+    env = os.environ.get("EXL3_FA60")
+    if env is not None:
+        return env.strip().lower() not in ("0", "", "false", "off", "no")
+    return compute_capability(device) == (6, 0)
+
+
 def qc_prefill_two_pass_min_q(device) -> int:
     """Query length from which quantized-cache prefill stages the window as fp16 (triton_paged.py):
     EXL3_QC_PF_TWO_PASS_MIN_Q, else 9 where the window path takes every prefill chunk, else 256"""

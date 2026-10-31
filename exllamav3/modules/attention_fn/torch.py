@@ -1,6 +1,6 @@
 import torch
 from .common import AttnArgs, AttnFn, get_non_causal_span_arglist
-from ...util.backend import sdpa_prefill, fa75_prefill
+from ...util.backend import sdpa_prefill, fa75_prefill, fa60_prefill
 import torch.nn.functional as F
 
 
@@ -156,20 +156,22 @@ def _window_buffers(k_cache, v_cache, phys_blocks, nheads_k, headdim):
 
 
 def _attend_window(q_b, k_buf, v_buf, total_len, causal, softmax_scale, chunk_size, fa75: bool, group_gqa: bool):
-    """Attention of one sequence's queries [seqlen_q, heads, dim] over its dense K/V window: the fa75
-    kernel where it applies (head_dim 256, fp16), else chunked SDPA"""
+    """Attention of one sequence's queries [seqlen_q, heads, dim] over its dense K/V window: the fa75 (sm_75)
+    or fa60 (sm_60) kernel where it applies (head_dim 256, fp16), else chunked SDPA"""
     seqlen_q, nheads, headdim = q_b.shape
     nheads_k = k_buf.shape[1]
     if (
         fa75 and headdim == 256 and q_b.dtype == torch.float16 and k_buf.dtype == torch.float16 and
-        total_len >= seqlen_q and fa75_prefill(q_b.device)
+        total_len >= seqlen_q
     ):
-        # One fa75 call covers every q chunk and the whole GQA group
-        from ...ext import exllamav3_ext as ext
-        o_b = torch.empty((seqlen_q, nheads, headdim), dtype = q_b.dtype, device = q_b.device)
-        scale = softmax_scale if softmax_scale is not None else headdim ** -0.5
-        ext.fa75_fwd(q_b, k_buf[:total_len], v_buf[:total_len], o_b, scale, bool(causal))
-        return o_b
+        # One fa75 / fa60 call covers every q chunk and the whole GQA group
+        kernel = "fa75_fwd" if fa75_prefill(q_b.device) else "fa60_fwd" if fa60_prefill(q_b.device) else None
+        if kernel is not None:
+            from ...ext import exllamav3_ext as ext
+            o_b = torch.empty((seqlen_q, nheads, headdim), dtype = q_b.dtype, device = q_b.device)
+            scale = softmax_scale if softmax_scale is not None else headdim ** -0.5
+            getattr(ext, kernel)(q_b, k_buf[:total_len], v_buf[:total_len], o_b, scale, bool(causal))
+            return o_b
     return _sdpa_chunks(q_b, k_buf, v_buf, total_len, seqlen_q, nheads, nheads_k, causal, softmax_scale,
                         chunk_size, group_gqa)
 
