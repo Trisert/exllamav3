@@ -9,11 +9,17 @@
 // Block = 64 query rows of one head, 256 threads, one block per SM. Q (64 x 256) stays in shared memory, K and V
 // tiles of 16 keys pass through one shared buffer (the next tile's global loads are in flight in registers).
 //  - S = Q K^T: each thread owns 2 rows x 2 keys; HFMA2 lanes hold two consecutive head dims, so Q and K are read
-//    in their natural row layout. fp16 partials over 64 dims (32 terms per lane) are summed into fp32.
+//    in their natural row layout. fp16 partials over DSLICE dims (DSLICE / 2 terms per lane) are summed into fp32.
 //  - online softmax in fp32 (log2 domain), P stored as fp16 to shared memory, transposed [key][row].
 //  - O += P V: each thread owns 4 rows x 16 columns; P broadcast from one half of a half2 (HFMA2 operand select),
 //    V columns paired in the HFMA2 lanes. The 16-key partial accumulates in fp16 (P <= 1, 16 terms), then
 //    O = O * alpha + partial in fp32.
+//
+// Precision (Qwen3.6-27B real activations, 13 layers at 6-8k keys, max abs error against an fp32 reference, outputs
+// up to |45|): SDPA 2.4e-3..2.1e-2; fa60 with 32 fp16 terms per S partial 2.6e-2..1.3e-1, with 8 terms (DSLICE 16,
+// the setting below) 1.4e-2..7.4e-2 at +7% time; an fp32-FFMA Q K^T (converted operands) gets 5e-3..3e-2 but costs
+// +55%. Model-level KL against SDPA (256 positions x 2 prompts, 8k and 16k tokens, -cq 4) is ~1e-3 for all three,
+// against 0.8e-3..5.4e-3 between the fp16 and the -cq 4 cache with SDPA, so the cheaper form is kept.
 #if !defined(USE_ROCM)
 
 #include <ATen/ATen.h>
@@ -31,10 +37,11 @@ constexpr int BN = 16;
 constexpr int NT = 256;
 constexpr int QS = HD + 8;           // row stride (halves) of Q and K/V tiles: 528 B, rows 4 banks apart
 constexpr int PS = BM + 8;           // row stride (halves) of the transposed P tile: 144 B
-constexpr int DSLICE = 64;           // head dims per fp16 partial of S (32 HFMA2 terms per lane)
 
 __device__ __forceinline__ half2 u2h(uint32_t u) { return *reinterpret_cast<half2*>(&u); }
 
+// DSLICE: head dims per fp16 partial of S (DSLICE / 2 HFMA2 terms per lane); PVK: keys per fp16 partial of P V
+template <int DSLICE, int PVK>
 __global__ void __launch_bounds__(NT, 1)
 fa60_kernel
 (
@@ -220,41 +227,57 @@ fa60_kernel
         if (more) gload(k, k_row, n0 + BN);                // K(kt+1) in flight during P V
         __syncthreads();
 
-        // O += P V, 4 rows x 16 columns per thread, 16-key fp16 partial
-        half2 part[4][8];
+        // O += P V, 4 rows x 16 columns per thread, fp16 partials over PVK keys added into fp32
+        float al[4];
         #pragma unroll
-        for (int r = 0; r < 4; ++r)
-            #pragma unroll
-            for (int c = 0; c < 8; ++c) part[r][c] = __float2half2_rn(0.0f);
+        for (int r = 0; r < 4; ++r) al[r] = alpha_s[4 * pr + r];
         #pragma unroll
-        for (int j = 0; j < BN; ++j)
+        for (int j0 = 0; j0 < BN; j0 += PVK)
         {
-            const uint2 pp = *reinterpret_cast<const uint2*>(Ps + j * PS + 4 * pr);
-            const uint4 v0 = *reinterpret_cast<const uint4*>(KVs + j * QS + pc * 8);
-            const uint4 v1 = *reinterpret_cast<const uint4*>(KVs + j * QS + 128 + pc * 8);
-            const half2 p01 = u2h(pp.x), p23 = u2h(pp.y);
-            half2 ph[4] = { __low2half2(p01), __high2half2(p01), __low2half2(p23), __high2half2(p23) };
-            const uint32_t* V0 = reinterpret_cast<const uint32_t*>(&v0);
-            const uint32_t* V1 = reinterpret_cast<const uint32_t*>(&v1);
+            half2 part[4][8];
             #pragma unroll
-            for (int c = 0; c < 4; ++c)
+            for (int r = 0; r < 4; ++r)
                 #pragma unroll
-                for (int r = 0; r < 4; ++r)
-                {
-                    part[r][c] = __hfma2(ph[r], u2h(V0[c]), part[r][c]);
-                    part[r][4 + c] = __hfma2(ph[r], u2h(V1[c]), part[r][4 + c]);
-                }
-        }
-        #pragma unroll
-        for (int r = 0; r < 4; ++r)
-        {
-            const float a = alpha_s[4 * pr + r];
+                for (int c = 0; c < 8; ++c) part[r][c] = __float2half2_rn(0.0f);
             #pragma unroll
-            for (int c = 0; c < 8; ++c)
+            for (int j = j0; j < j0 + PVK; ++j)
             {
-                const float2 f = __half22float2(part[r][c]);
-                oacc[r][2 * c] = fmaf(oacc[r][2 * c], a, f.x);
-                oacc[r][2 * c + 1] = fmaf(oacc[r][2 * c + 1], a, f.y);
+                const uint2 pp = *reinterpret_cast<const uint2*>(Ps + j * PS + 4 * pr);
+                const uint4 v0 = *reinterpret_cast<const uint4*>(KVs + j * QS + pc * 8);
+                const uint4 v1 = *reinterpret_cast<const uint4*>(KVs + j * QS + 128 + pc * 8);
+                const half2 p01 = u2h(pp.x), p23 = u2h(pp.y);
+                half2 ph[4] = { __low2half2(p01), __high2half2(p01), __low2half2(p23), __high2half2(p23) };
+                const uint32_t* V0 = reinterpret_cast<const uint32_t*>(&v0);
+                const uint32_t* V1 = reinterpret_cast<const uint32_t*>(&v1);
+                #pragma unroll
+                for (int c = 0; c < 4; ++c)
+                    #pragma unroll
+                    for (int r = 0; r < 4; ++r)
+                    {
+                        part[r][c] = __hfma2(ph[r], u2h(V0[c]), part[r][c]);
+                        part[r][4 + c] = __hfma2(ph[r], u2h(V1[c]), part[r][4 + c]);
+                    }
+            }
+            // First slice of the tile rescales the running O by alpha (one FFMA per element)
+            #pragma unroll
+            for (int r = 0; r < 4; ++r)
+            {
+                const float a = j0 == 0 ? al[r] : 1.0f;
+                #pragma unroll
+                for (int c = 0; c < 8; ++c)
+                {
+                    const float2 f = __half22float2(part[r][c]);
+                    if (j0 == 0)
+                    {
+                        oacc[r][2 * c] = fmaf(oacc[r][2 * c], a, f.x);
+                        oacc[r][2 * c + 1] = fmaf(oacc[r][2 * c + 1], a, f.y);
+                    }
+                    else
+                    {
+                        oacc[r][2 * c] += f.x;
+                        oacc[r][2 * c + 1] += f.y;
+                    }
+                }
             }
         }
         __syncthreads();                                   // V(kt), P, alpha no longer read
@@ -294,6 +317,8 @@ void fa60_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, double sca
 {
     const at::cuda::OptionalCUDAGuard guard(q.device());
     TORCH_CHECK(q.dtype() == at::kHalf && k.dtype() == at::kHalf && v.dtype() == at::kHalf && o.dtype() == at::kHalf, "fa60_fwd: fp16");
+    TORCH_CHECK(q.is_cuda() && k.device() == q.device() && v.device() == q.device() && o.device() == q.device(),
+                "fa60_fwd: q, k, v, o on one CUDA device");
     TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && v.dim() == 3 && o.dim() == 3, "fa60_fwd: 3-d tensors");
     TORCH_CHECK(q.size(2) == fa60::HD && k.size(2) == fa60::HD && v.size(2) == fa60::HD, "fa60_fwd: head_dim 256");
     TORCH_CHECK(q.stride(2) == 1 && k.stride(2) == 1 && v.stride(2) == 1 && o.is_contiguous(), "fa60_fwd: contiguous head dim");
@@ -306,7 +331,9 @@ void fa60_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, double sca
     TORCH_CHECK(!causal || Tkv >= Tq, "fa60_fwd: causal needs Tkv >= Tq");
     if (Tq == 0) return;
     dim3 grid((Tq + fa60::BM - 1) / fa60::BM, Hq);
-    fa60::fa60_kernel<<<grid, fa60::NT, 0, at::cuda::getCurrentCUDAStream()>>>(
+    // DSLICE 16 (8 fp16 terms per lane), PVK 16: see the measurements in the header comment
+    auto kern = fa60::fa60_kernel<16, 16>;
+    kern<<<grid, fa60::NT, 0, at::cuda::getCurrentCUDAStream()>>>(
         (const half*) q.data_ptr(), q.stride(0), q.stride(1),
         (const half*) k.data_ptr(), k.stride(0), k.stride(1),
         (const half*) v.data_ptr(), v.stride(0), v.stride(1),
