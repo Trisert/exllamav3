@@ -102,6 +102,13 @@ class gc_paused:
 # Free unused VRAM
 def free_mem():
     gc.collect()
+    # With expandable segments, empty_cache unmaps freed pages after synchronizing only the stream each
+    # segment was allocated on (cuMemUnmap does not wait for the device the way cudaFree does), so a kernel
+    # still running on another stream over a block freed from such a segment faults (Xid 31 FAULT_PDE,
+    # seen on the P100 during load/warmup). Drain every device first; free_mem only runs off the hot path
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        for i in range(torch.cuda.device_count()):
+            torch.cuda.synchronize(i)
     torch.cuda.empty_cache()
 
 
