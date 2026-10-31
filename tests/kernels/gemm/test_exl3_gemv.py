@@ -183,6 +183,8 @@ def test_int8_max_k_gates_int8_path(device):
     against the exact product, while every fp16 path stays at a few fp16 roundoffs (< 2.5e-3, see above)"""
     if is_rocm():
         pytest.skip("exl3_gemm takes the RDNA GEMVs for m <= 8, so the int8 GEMV is never reached on ROCm")
+    if torch.cuda.get_device_properties(torch.device(device)).shared_memory_per_block_optin < 80 * 1024:
+        pytest.skip("the int8 GEMV needs 80 KB of shared memory per block and declines on smaller devices")
     max_k = ext.exl3_gemv_int8_max_k(torch.device(device).index)
     k, n = 1024, 1024
     for K, expect_int8 in ((max_k, True), (max_k + 1, False)):

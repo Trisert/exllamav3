@@ -28,11 +28,17 @@ def _n():
     return ext.exl3_gemm_num_kernel_shapes()
 
 
-def _tiles(s):
-    """(tk, tn, m_min) of shape s as the predicate reports them: smallest k / n tile it accepts, smallest m"""
-    tk = next(k for k in range(16, 1024, 16) if ext.exl3_gemm_shape_compat(s, 128, k, 3072, 4))
-    tn = next(n for n in range(128, 4096, 128) if ext.exl3_gemm_shape_compat(s, 128, 3072, n, 4))
-    m_min = next(m for m in range(1, 1025) if ext.exl3_gemm_shape_compat(s, m, 3072, 3072, 4))
+def _fits(s, K, half = False):
+    """Whether shape s at K bpw fits the device's shared memory (the predicate is false for every problem if not)"""
+    return ext.exl3_gemm_shape_compat(s, 1024, 3072, 3072, int(K), half)
+
+
+def _tiles(s, K = 2):
+    """(tk, tn, m_min) of shape s as the predicate reports them: smallest k / n tile it accepts, smallest m.
+    K = 2 has the smallest shared memory footprint, so it is the rate that fits on the smallest devices"""
+    tk = next(k for k in range(16, 1024, 16) if ext.exl3_gemm_shape_compat(s, 128, k, 3072, K))
+    tn = next(n for n in range(128, 4096, 128) if ext.exl3_gemm_shape_compat(s, 128, 3072, n, K))
+    m_min = next(m for m in range(1, 1025) if ext.exl3_gemm_shape_compat(s, m, 3072, 3072, K))
     return tk, tn, m_min
 
 
@@ -71,6 +77,11 @@ def test_compat_structure(device):
                 for n in (tn, 2 * tn, tn + 128, 3 * tn - 128):
                     expect = k % tk == 0 and n % tn == 0 and m >= m_min
                     for K in (2, 4, 8):
+                        # Shapes whose instance does not fit the device's shared memory at this K (48 KB on
+                        # sm_60) are refused for every problem
+                        if not _fits(s, K):
+                            assert not ext.exl3_gemm_shape_compat(s, m, k, n, K), (s, m, k, n, K)
+                            continue
                         assert ext.exl3_gemm_shape_compat(s, m, k, n, K) == expect, (s, m, k, n, K)
 
 
@@ -93,6 +104,8 @@ def test_compatible_shapes_run(device, s, K, cb):
     suh, svh = rand_scale(k, g), rand_scale(n, g)
     tr = torch.from_numpy(p.copy()).to(device)
     W = tref.dequant(p, suh, svh, K, cb)
+    if not _fits(s, K, half):
+        pytest.skip("shape does not fit this device's shared memory at this rate")
     ran = 0
     # m >= 3 keeps mul1 calls off the int8 GEMV, which takes small-m mul1 calls ahead of any shape selection
     for m in (3, 17, 50, 100):
