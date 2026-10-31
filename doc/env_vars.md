@@ -208,7 +208,7 @@ this keep the direct path, which reads less global memory (relevant for short tr
 over long contexts at low cache bitrates). Where the staged window feeds SDPA (`EXL3_SDPA_PREFILL`
 below) every prefill chunk stages. Tuning/testing knob.
 
-### `EXL3_SDPA_PREFILL` (default: on for sm_75, off elsewhere)
+### `EXL3_SDPA_PREFILL` (default: on for sm_75 and sm_60, off elsewhere)
 
 Prefill chunks (more than 8 query rows, causal, no sliding window, softcap or sinks) attend over a
 dense fp16 copy of their window instead of running the Triton paged prefill kernel: the staged
@@ -218,13 +218,27 @@ cutlass kernel refuses `enable_gqa`). Triton emits no tensor-core instructions f
 Triton kernel runs on scalar FMA there and prefill time grows steeply with context; the SDPA
 kernel keeps Turing's HMMA units busy. Decode and draft verification stay on the Triton kernels.
 `1` forces the path on any CUDA device (it is exact, so this is a testing switch), `0` forces it
-off on Turing.
+off on Turing. On sm_60 it is on because the Triton prefill kernel hits an illegal memory access
+there; head_dim 256 then runs `fa60` (below), other head sizes SDPA.
 
 ### `EXL3_FA75` (default: on for sm_75, off elsewhere)
 
 On the path above, head_dim 256 attention runs the `fa75` kernel (`exllamav3_ext/turing/fa75.cu`,
 `mma.sync.m16n8k8`) instead of SDPA, whose cutlass kernel handles 256-wide heads at a fraction of
 its 128-wide rate. Plain PTX for sm_75 and later; `1` forces it on any CUDA device.
+
+### `EXL3_FA60` (default: on for sm_60, off elsewhere)
+
+On the path above, head_dim 256 attention runs the `fa60` kernel (`exllamav3_ext/pascal/fa60.cu`)
+instead of SDPA when `EXL3_FA75` does not apply. PyTorch's memory-efficient SDPA runs a SIMT fp32
+cutlass kernel on Pascal (`fmha_cutlassF_f16_aligned_32x128_gmem_sm50`, 3.3-3.5 TFLOPS on the P100
+at ~1190 MHz); fa60 is a flash-attention forward on HFMA2 (Q K^T from 8-term fp16 partials summed in
+fp32, fp32 online softmax, P V from 16-key fp16 partials into fp32 O) at 7.2-7.3 TFLOPS: 2.15-2.45x
+on a 2048-row chunk over 2048-30000 keys, both for 24/4 and 16/2 heads. Its output error on real
+Qwen3.6-27B activations is 3-12x SDPA's (max abs 1.4e-2..7.4e-2 on outputs up to |45|, SDPA 2e-3..2e-2);
+the model-level KL against SDPA is ~1e-3, below the 0.8e-3..5.4e-3 between the fp16 and the `-cq 4`
+cache. The switch is read per call. `1` forces it on any CUDA device (it is HFMA2 / fp32 SIMT code and
+runs from sm_60 up), `0` keeps SDPA.
 
 ### `EXL3_QC_PREFILL_NS` (default: `0` = measure)
 
