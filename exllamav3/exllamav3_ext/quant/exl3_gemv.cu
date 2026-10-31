@@ -75,7 +75,10 @@ static int exl3_gemv_cfg(int cc, bool sm75, int size_m, int size_k, int size_n, 
     // Pascal has no tensor cores and no cp.async: the block-pipelined tile kernel is 10-50x off the memory roofline
     // there at m <= 8 (a 5120 x 17408 K=3 projection takes ~4.8 ms against ~0.3 ms through this kernel), so every
     // eligible shape takes the GEMV
-    if (cc == CC_PASCAL) return size_n <= 8192 ? 0 : 1;
+    // Narrow vs wide on the P100 (4 bpw mul1, m = 1 and 2, Qwen3.6-27B shapes): the wide config wins whenever
+    // n > k (5120 x 6144: 86 -> 71 us, 5120 x 10240: 113 -> 104 us at m = 1), the narrow one for n <= k
+    // (17408 x 5120: 212 vs 273 us, 6144 x 5120, 5120 x 1024)
+    if (cc == CC_PASCAL) return size_n <= 8192 && size_n <= size_k ? 0 : 1;
 
     // Turing (measured on the RTX 2060, mul1, K = 2..4, m = 1..8, k / n from 512 to 17408): the GEMV beats the
     // autotuned tile kernel at every measured shape, 1.04-1.70x (K = 4: 1.18-1.68x). mcg / 3INST are unmeasured
