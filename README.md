@@ -232,6 +232,43 @@ End to end (`examples/bench_chat.py`, `-gs 4.0,15.0 -cs 32768 -cq 4 -mtp -ndt 1 
 
 Before these changes, prefill (2048-token chunks) was dominated by cuBLAS fp32-accumulate sgemm (~50% of P100 time), the GatedDeltaNet Triton `h` kernel (~17%) and the weight reconstruct. An opt-in fp16-accumulate cuBLAS path (`COMPUTE_16F`, 1.7x faster GEMM kernels) cut total prefill GPU time by only ~4.5% while raising the mean KL divergence to 3e-4..3e-3 versus the fp32-accumulate result, so it was not kept. Qwen3.8-27B (SC quants) was tried and is not usable on this setup. Draft-token MTP did not beat plain decoding on the hot card in these tests.
 
+**Dense Qwen3.5-architecture 27B (Qwen3.6-27B / Qwen3.8-27B, 4.00bpw).** Every linear layer of these checkpoints is mul1 K = 4 (the MTP layer too); the lm_head is mul1 K = 6 (953 MB). With `-gs 4.0,15.0` the RTX 2060 holds 16 layers and the MTP layer, the P100 48 layers and the lm_head, and the two GPUs run one after the other, so a decode step costs the sum of both GPUs' busy time (P100 68.1 + 2060 28.5 ms against 98.1 ms wall per token before these changes; the gaps are ~1.5 ms, so launch overhead is not the limit). Per-kernel profile of a plain decode step on the previous build (torch profiler around `Generator.iterate`, P100 at 70 C, 1037-1189 MHz):
+
+| GPU | item | ms / token |
+| :--- | :--- | ---: |
+| P100 | K = 4 GEMVs (48 layers, ~9.1 GB) | 46.0 |
+| P100 | lm_head, K = 6, **tile GEMM** (the GEMV covered K <= 5) | 16.6 |
+| P100 | attention, GatedDeltaNet recurrence, norms, conv, rest | ~5.5 |
+| 2060 | K = 4 **tile GEMM / MGEMM** (the sm_75 heuristic rejected the GEMV at these shapes) | 27.4 |
+
+With MTP (`-mtp -ndt 1 -dds`) the lm_head runs twice per iteration (m = 2 verify, m = 1 draft): 33.2 ms of a 126 ms iteration. Changes, each measured on its own:
+
+- 6 bpw GEMV through staged tile words on Pascal (the 5 bpw path generalised): lm_head 16.6 -> 3.3 ms (m = 1), 4.2 ms (m = 2). Plain decode 98.1 -> 82.6 ms per token, MTP 126 -> 101 ms per iteration.
+- Turing (RTX 2060): the GEMV for every eligible mul1 K <= 4 shape and same-input projections unfused (`EXL3_GEMV_SM75`); per shape the GEMV beat the autotuned tile kernel by 1.04-1.70x (K = 2..4, m = 1..8). 2060 busy time 26.8 -> 18.0 ms per token, plain decode 82.6 -> 74.1 ms.
+- Cheaper sm_60 mul1 decode, bit-identical (raw outputs of `exl3_gemm` at K = 2..6, 8, mcg / mul1, m = 1..100, and of reconstruct compared against the previous build): the two byte sums are packed by one full-rate XMAD.PSL instead of a half-rate PRMT, and the product reads its 16-bit index straight from a half register, so the 4 bpw windows come from the halves of three funnel shifts instead of six BFEs and two masks (`mul1_product_h16`, `codebook.cuh`). K = 4 GEMV at the model's decode shapes: 905-935 -> 860 us summed (m = 1).
+- Wide GEMV config whenever n > k on Pascal (measured per shape, m = 1 and 2): 879 -> 844 us summed (m = 1), 995 -> 974 us (m = 2).
+
+End to end, Qwen3.6-27B 4.00bpw, `-gs 4.0,15.0 -cs 32768 -cq 4`, both GPUs, P100 cooled to 62 C before every run, previous build (A, commit `5ded7bd3`) against this branch (B):
+
+| | A | B | |
+| :--- | ---: | ---: | :--- |
+| `chat.py` plain, user sampler, 600 tokens, 2 interleaved rounds | 10.21 / 10.24 t/s | 14.21 / 14.19 t/s | x1.39 |
+| `chat.py -mtp -ndt 1 -dds`, user sampler, 2 rounds | 14.35 / 14.48 t/s (84.6 / 86.3% accepted) | 21.55 / 21.71 t/s (84.6 / 86.3%) | x1.50 |
+| `bench_chat.py` plain (greedy, 2 turns x 500 tokens, second turn at 79 C / 582 MHz) | 9.45 t/s | 13.56 t/s | x1.43 |
+| `bench_chat.py -mtp -ndt 1 -dds` (greedy) | 14.74 t/s (91.3%) | 22.26 t/s (92.0%) | x1.51 |
+| prefill 512 / 2048 tokens, 2 interleaved rounds | 157 / 166, 156 / 165 t/s | 155 / 165, 155 / 166 t/s | 512: ~-1% |
+| prefill 8192 / 16384 / 30000, one run each (sustained, 79 C, 405-1100 MHz from 16384 on) | 158 / 93 / 76 t/s | 158 / 92 / 75 t/s | thermal limit |
+
+Qwen3.8-27B 4.00bpw (same layout, one run each, same conditions): `chat.py` plain 10.28 -> 14.26 t/s, MTP 14.29 -> 21.61 t/s (82.9 / 84.1% accepted), prefill 512 / 2048 tokens 160 / 171 -> 160 / 172 t/s. Qwen3.6-35B-A3B 3.00bpw (no-regression check, one run each): plain 44.45 vs 44.21 t/s, MTP 57.91 vs 58.46 t/s.
+
+The ~1% at 512 tokens is consistent over both rounds and probably the unfused 2060 projections (two smaller reconstruct + GEMM calls instead of one); `EXL3_GEMV_SM75=0` restores the fused form. Accuracy, teacher-forced decode (q_len = 1 forwards through the m = 1 GEMVs and the K = 6 lm_head GEMV, 768 positions): KL(A || B) mean 3.8e-5, max 5.2e-4, top-1 agreement 99.87%, perplexity 9.7667 (A) vs 9.7733 (B).
+
+Why decode is far from the 732 GB/s bandwidth bound: the m = 1 GEMV is issue-bound. Measured P100 issue rates (doc/pascal_p100.md): IADD / LOP3 / XMAD / HFMA2 full rate, VABSDIFF4 / BFE / SHF / PRMT half rate; the mul1 decode needs three XMADs for the 32-bit product, a half-rate VABSDIFF4 for the byte sum and two HFMA2 halves per weight, about 7 full-rate issue slots per weight before any loads. The loop now runs about 8.6 slots per weight (it was ~10.8), which at ~1.2 GHz caps the GEMV near 240 GB/s; measured 180-250 GB/s per shape. Raising occupancy does not help (min-blocks launch bounds for 2-3x the resident warps: within 1%), which confirms the issue bound. No PTX form gets ptxas to emit a two-XMAD product for a 16-bit index (it rebuilds the 32-bit multiply). The 2060's GEMV runs about 7.3 instructions per weight, mostly on its INT pipe, and reaches 160-240 GB/s of 336.
+
+Ruled out on this setup (measured): `-ndt 2` (m = 3 verify): 16.1 t/s through the MMA path and 17.6 t/s through the four-row direct products, against 21.3 t/s with `-ndt 1` (greedy profiler loop); the m = 3 direct GEMV costs 1.6x the m = 2 one. The sparse draft head (`-sdh 32768`) does not engage here (the draft keeps the full K = 6 head). The Triton prefill attention (`EXL3_SDPA_PREFILL=0`) hits an illegal memory access on sm_60, so prefill attention stays on SDPA.
+
+Prefill: 85% of the P100 time of a 2048-token chunk is the HFMA2 GEMM (8.69 of 10.2 s; reconstruct 5%, attention 3%, GatedDeltaNet ~4%). Under that kernel the P100 sits at its 125 W cap at 860-940 MHz, and the GEMM reaches 66-73% of the HFMA2 peak at that clock (its loop is ~78% HFMA2 instructions), so prefill is power-bound and not changed here. Attention (PyTorch's memory-efficient SDPA, a SIMT cutlass kernel for head_dim 256) grows to 8.6% of P100 time at 8192 tokens and 16% at 16384; an HFMA2 flash-attention kernel for sm_60 is the remaining prefill item. Long prompts are dominated by heat: a 400 s 30000-token prefill runs at 405-870 MHz once the card reaches 78-79 C.
+
 ```sh
 # Optimal command for Qwen 3.6 35B-A3B on Dual-GPU (RTX 2060 + Tesla P100):
 python examples/chat.py \
