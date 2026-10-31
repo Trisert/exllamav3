@@ -82,7 +82,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    model_init.add_args(parser, cache = True, add_draft_model_args = False)
+    model_init.add_args(parser, cache = True, add_draft_model_args = True)
     parser.add_argument("-lengths", "--lengths", type = int, nargs = "+", default = [512, 2048, 8192, 16384, 30000])
     parser.add_argument("-repeat", "--repeat", type = int, default = 2)
     parser.add_argument("-smi_index", "--smi_index", type = int, default = 0, help = "nvidia-smi index of the P100")
