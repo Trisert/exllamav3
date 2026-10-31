@@ -261,6 +261,18 @@ End to end, Qwen3.6-27B 4.00bpw, `-gs 4.0,15.0 -cs 32768 -cq 4`, both GPUs, P100
 
 Qwen3.8-27B 4.00bpw (same layout, one run each, same conditions): `chat.py` plain 10.28 -> 14.26 t/s, MTP 14.29 -> 21.61 t/s (82.9 / 84.1% accepted), prefill 512 / 2048 tokens 160 / 171 -> 160 / 172 t/s. Qwen3.6-35B-A3B 3.00bpw (no-regression check, one run each): plain 44.45 vs 44.21 t/s, MTP 57.91 vs 58.46 t/s.
 
+Prefill sweep by prompt length (`examples/bench_prefill.py`, `-gs 4.0,15.0 -cs 32768 -cq 4`, real text, 2 runs per length averaged, first model started at 57 C, the 27Bs at 72 C because loading and warm-up heat the card; from 8192 tokens on the 27B runs sit at 79 C and 400-1100 MHz, so they are heat-limited numbers):
+
+| prompt tokens | Qwen3.6-35B-A3B 3.00bpw | Qwen3.6-27B 4.00bpw | Qwen3.8-27B 4.00bpw |
+| ---: | ---: | ---: | ---: |
+| 512 | 440 t/s | 159 | 161 |
+| 2048 | 796 | 169 | 170 |
+| 8192 | 754 | 124 | 125 |
+| 16384 | 680 | 85 | 83 |
+| 30000 | 565 (53 s) | 75 (399 s) | 75 (402 s) |
+
+Independent re-check of the dense decode gain on the merged branch (Qwen3.6-27B, `-mtp -ndt 1 -dds`, greedy, 2 x 400 tokens, A = `5ded7bd3`-based build, interleaved): round 1 (P100 from 61 / 72 C) 15.26 -> 22.36 t/s (x1.47), round 2 (both builds at 79 C, 530-1050 MHz) 10.70 -> 14.00 t/s (x1.31); the gain holds hot, the absolute speed does not.
+
 The ~1% at 512 tokens is consistent over both rounds and probably the unfused 2060 projections (two smaller reconstruct + GEMM calls instead of one); `EXL3_GEMV_SM75=0` restores the fused form. Accuracy, teacher-forced decode (q_len = 1 forwards through the m = 1 GEMVs and the K = 6 lm_head GEMV, 768 positions): KL(A || B) mean 3.8e-5, max 5.2e-4, top-1 agreement 99.87%, perplexity 9.7667 (A) vs 9.7733 (B).
 
 Why decode is far from the 732 GB/s bandwidth bound: the m = 1 GEMV is issue-bound. Measured P100 issue rates (doc/pascal_p100.md): IADD / LOP3 / XMAD / HFMA2 full rate, VABSDIFF4 / BFE / SHF / PRMT half rate; the mul1 decode needs three XMADs for the 32-bit product, a half-rate VABSDIFF4 for the byte sum and two HFMA2 halves per weight, about 7 full-rate issue slots per weight before any loads. The loop now runs about 8.6 slots per weight (it was ~10.8), which at ~1.2 GHz caps the GEMV near 240 GB/s; measured 180-250 GB/s per shape. Raising occupancy does not help (min-blocks launch bounds for 2-3x the resident warps: within 1%), which confirms the issue bound. No PTX form gets ptxas to emit a two-XMAD product for a 16-bit index (it rebuilds the 32-bit multiply). The 2060's GEMV runs about 7.3 instructions per weight, mostly on its INT pipe, and reaches 160-240 GB/s of 336.
