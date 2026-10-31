@@ -45,7 +45,8 @@ def corpus():
 
 @torch.inference_mode()
 def main(args):
-    model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(args)
+    # init() returns the draft model, config and cache only when the draft arguments were added
+    model, config, cache, tokenizer = model_init.init(args)[:4]
     generator = Generator(model = model, cache = cache, tokenizer = tokenizer)
     ids_all = tokenizer.encode(corpus(), add_bos = False)[0]
     need = max(args.lengths) + 4096 * (len(args.lengths) * args.repeat + 1)
