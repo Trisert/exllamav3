@@ -41,12 +41,28 @@ static int exl3_gemv_env_smem()
     return atoi(env);
 }
 
+// Turing sm_75 (RTX 2060): every eligible K <= 4 shape takes the GEMV unless EXL3_GEMV_SM75=0
+static bool exl3_gemv_sm75(int device)
+{
+    static int is_sm75[MAX_DEVICES] = {};   // 0: not queried, 1: no, 2: yes
+    if (!is_sm75[device])
+    {
+        int major = 0, minor = 0;
+        cuda_check(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
+        cuda_check(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device));
+        const char* env = std::getenv("EXL3_GEMV_SM75");
+        bool on = !env || atoi(env) != 0;
+        is_sm75[device] = (major == 7 && minor == 5 && on) ? 2 : 1;
+    }
+    return is_sm75[device] == 2;
+}
+
 // -1: not eligible, 0: narrow config, 1: wide config. narrow_coresident = number of narrow-config
 // blocks that fit on the device at once (its grid is one block per 32 output columns)
-static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int cb, int mode, int narrow_coresident)
+static int exl3_gemv_cfg(int cc, bool sm75, int size_m, int size_k, int size_n, int K, int cb, int mode, int narrow_coresident)
 {
     if (mode == 0) return -1;
-    if (K < 2 || K > 5) return -1;
+    if (K < 2 || K > 6) return -1;
     if (K != 4 && cb == 0) return -1;
     if (size_m > EXL3_GEMV_MAX_M) return -1;
     if (size_k % 128 || size_n % 128) return -1;
@@ -54,12 +70,19 @@ static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int 
     if (mode == 2) return size_n <= 8192 ? 0 : 1;
     if (mode == 3) return 0;   // testing: force narrow config
     if (mode == 4) return 1;   // testing: force wide config
-    if (K == 5 && cc != CC_PASCAL) return -1;   // staged 5 bpw GEMV is only measured on Pascal
+    if (K >= 5 && cc != CC_PASCAL) return -1;   // staged 5 / 6 bpw GEMV is only measured on Pascal
 
     // Pascal has no tensor cores and no cp.async: the block-pipelined tile kernel is 10-50x off the memory roofline
     // there at m <= 8 (a 5120 x 17408 K=3 projection takes ~4.8 ms against ~0.3 ms through this kernel), so every
     // eligible shape takes the GEMV
-    if (cc == CC_PASCAL) return size_n <= 8192 ? 0 : 1;
+    // Narrow vs wide on the P100 (4 bpw mul1, m = 1 and 2, Qwen3.6-27B shapes): the wide config wins whenever
+    // n > k (5120 x 6144: 86 -> 71 us, 5120 x 10240: 113 -> 104 us at m = 1), the narrow one for n <= k
+    // (17408 x 5120: 212 vs 273 us, 6144 x 5120, 5120 x 1024)
+    if (cc == CC_PASCAL) return size_n <= 8192 && size_n <= size_k ? 0 : 1;
+
+    // Turing (measured on the RTX 2060, mul1, K = 2..4, m = 1..8, k / n from 512 to 17408): the GEMV beats the
+    // autotuned tile kernel at every measured shape, 1.04-1.70x (K = 4: 1.18-1.68x). mcg / 3INST are unmeasured
+    if (sm75 && K <= 4 && cb == 2) return size_n <= 8192 ? 0 : 1;
 
     // The narrow config wins (up to ~30%) whenever its grid fits in a single co-resident wave;
     // in the 1..2-wave zone the trailing partial wave costs more than the kernel gains unless
@@ -93,6 +116,7 @@ static void* exl3_gemv_select_kernel(int bits, int cb, bool c_fp32, int mmode, i
     SEL_GRID(2, 1, false) SEL_GRID(2, 2, false) SEL_GRID(2, 1, true) SEL_GRID(2, 2, true)
     SEL_GRID(3, 1, false) SEL_GRID(3, 2, false) SEL_GRID(3, 1, true) SEL_GRID(3, 2, true)
     SEL_GRID(5, 1, true) SEL_GRID(5, 2, true)
+    SEL_GRID(6, 1, true) SEL_GRID(6, 2, true)
     #undef SEL_GRID
     #undef SEL
     return nullptr;
@@ -124,7 +148,7 @@ bool exl3_gemv_try_launch
     }
     else
     {
-        if (K < 2 || K > 5) return false;
+        if (K < 2 || K > 6) return false;
         if (K != 4 && cb == 0) return false;
     }
     if (size_m > EXL3_GEMV_MAX_M) return false;
@@ -154,7 +178,7 @@ bool exl3_gemv_try_launch
     };
 
     // Extraction style: shuffle by default, smem staging selectable per call for evaluation
-    bool smem = exl3_gemv_env_smem() == 1 || (!half_k && K == 5);   // 5 bpw tiles only exist in the staged form
+    bool smem = exl3_gemv_env_smem() == 1 || (!half_k && K >= 5);   // 5 / 6 bpw tiles only exist in the staged form
 
     auto select = [&] (int cfg_) -> void*
     {
@@ -167,7 +191,7 @@ bool exl3_gemv_try_launch
 
     // Shape heuristic: a half-integer rate K + 0.5 is handled like the integer rate above it (its tile is
     // between the two in bytes; unmeasured, so it inherits the K + 1 envelope)
-    int cfg = exl3_gemv_cfg(cc, size_m, size_k, size_n, half_k ? K + 1 : K, cb, mode, narrow_coresident);
+    int cfg = exl3_gemv_cfg(cc, cc == CC_OLD && exl3_gemv_sm75(device), size_m, size_k, size_n, half_k ? K + 1 : K, cb, mode, narrow_coresident);
     if (cfg < 0) return false;
 
     void* kernel = cfg == 0 ? narrow_kernel : select(cfg);

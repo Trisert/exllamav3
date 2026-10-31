@@ -61,6 +61,17 @@ __device__ __forceinline__ void dq4(const uint32_t* ptr, int t_offset, FragB& fr
 
     uint32_t a = ptr[i0 % (bits * 256 / 32)];
     uint32_t b = ptr[i2 % (bits * 256 / 32)];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610 && !defined(USE_ROCM)
+    if constexpr (cb == 2)
+    {
+        // sm_60, mul1: the products read the index from the low half of the shifted word, no mask (bit-identical)
+        frag[0] = decode_mul1_product_2(mul1_product_h16<false>(fshift(b, a, s2 + bits * 3)),
+                                        mul1_product_h16<false>(fshift(b, a, s2 + bits * 2)));
+        frag[1] = decode_mul1_product_2(mul1_product_h16<false>(fshift(b, a, s2 + bits)),
+                                        mul1_product_h16<false>(fshift(b, a, s2)));
+        return;
+    }
+#endif
     uint32_t w3 = fshift(b, a, s2)            & 0xffff;
     uint32_t w2 = fshift(b, a, s2 + bits)     & 0xffff;
     uint32_t w1 = fshift(b, a, s2 + bits * 2) & 0xffff;

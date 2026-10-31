@@ -268,9 +268,21 @@ attention sinks); this switch exists for A/B comparison.
 QTIP-style small-m fp16 GEMV path, dispatched from the main GEMM entry point when the shape
 heuristic applies. `0` disables, `1` uses the measured heuristic envelope (default), `2` forces
 the path wherever its hard constraints allow (testing). Covers 2, 3, 4 bpw (and 1.5/2.5/3.5 with
-mul1) everywhere, and 5 bpw on Pascal only (always through staged tile words). On Pascal every
-eligible shape (m <= 8, k and n multiples of 128) takes the GEMV, since the tile kernel is far
-off the memory roofline there.
+mul1) everywhere, and 5 and 6 bpw on Pascal only (always through staged tile words; the 6 bpw
+lm_head of the dense Qwen3.5 27B quants went from 16.6 to 3.3 ms per decode step on the P100).
+On Pascal every eligible shape (m <= 8, k and n multiples of 128) takes the GEMV, since the tile
+kernel is far off the memory roofline there. On Turing sm_75 every eligible 2..4 bpw shape takes
+it as well, see `EXL3_GEMV_SM75`.
+
+### `EXL3_GEMV_SM75` (default: `1`)
+
+Turing (sm_75) shape envelope of the GEMV above. On the RTX 2060 the GEMV beat the autotuned tile
+kernel at every measured shape (mul1, K = 2..4, m = 1..8, k and n from 512 to 17408; 1.04-1.70x,
+1.18-1.68x at K = 4), so with `1` every eligible K <= 4 mul1 shape takes it, and same-input mul1
+projections (gate/up, q/k/v, the GatedDeltaNet input projections) are unfused so that each one does
+(mcg and 3INST are unmeasured there and keep the general heuristic). Qwen3.6-27B 4.00bpw decode, the
+2060's 16 layers: 26.8 -> 18.0 ms GPU time per token. `0` keeps the general heuristic (tile kernel
+for most of these shapes) and the fused MGEMM.
 
 ### `EXL3_GEMV_SMEM` (default: `-1`)
 

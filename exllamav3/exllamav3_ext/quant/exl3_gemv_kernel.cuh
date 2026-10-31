@@ -121,6 +121,22 @@ __device__ __forceinline__ void decode8(uint32_t w0, uint32_t w1, uint32_t w2, u
 template <int cb>
 __device__ __forceinline__ void dq8_regs_4bits(uint32_t a, uint32_t b, FragB& f0, FragB& f1)
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610 && !defined(USE_ROCM)
+    if constexpr (cb == 2)
+    {
+        // sm_60, mul1: the eight windows (bit offsets 0, 4, .., 28 of the 64-bit a:b) are the low and high halves of
+        // b and of the funnel shifts by 4, 8 and 12, and the products read their index from the half register
+        // (mul1_product_h16): three half-rate SHF instead of SHF + 6 BFE + 2 AND. Bit-identical to the form below
+        const uint32_t f4 = __funnelshift_r(b, a, 4);
+        const uint32_t f8 = __funnelshift_r(b, a, 8);
+        const uint32_t f12 = __funnelshift_r(b, a, 12);
+        f0[0] = decode_mul1_product_2(mul1_product_h16<true>(f12), mul1_product_h16<true>(f8));    // w0, w1
+        f0[1] = decode_mul1_product_2(mul1_product_h16<true>(f4), mul1_product_h16<true>(b));      // w2, w3
+        f1[0] = decode_mul1_product_2(mul1_product_h16<false>(f12), mul1_product_h16<false>(f8));  // w4, w5
+        f1[1] = decode_mul1_product_2(mul1_product_h16<false>(f4), mul1_product_h16<false>(b));    // w6, w7
+        return;
+    }
+#endif
     uint32_t s, w0, w1, w2, w3, w4, w5, w6, w7;
     FSHF_IMM(s, b, a, 20);
     w7 = b & 0xffff;
@@ -200,9 +216,9 @@ template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bo
 __global__ __launch_bounds__(CFG == 0 ? 512 : 256, HALF && CFG == 0 ? 2 : 1)
 void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 {
-    static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2) : (bits == 2 || bits == 3 || bits == 4 || bits == 5),
-                  "exl3_gemv_kernel supports 2, 3, 4 and 5 bpw, and 1.5, 2.5 and 3.5 bpw with mul1");
-    static_assert(bits != 5 || (SMEM_STAGE && !HALF), "5 bpw runs through the staged tile words only");
+    static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2) : (bits >= 2 && bits <= 6),
+                  "exl3_gemv_kernel supports 2..6 bpw, and 1.5, 2.5 and 3.5 bpw with mul1");
+    static_assert(bits < 5 || (SMEM_STAGE && !HALF), "5 and 6 bpw run through the staged tile words only");
     constexpr int WK   = CFG == 0 ? 16 : 8;     // k-split (warps per block)
     constexpr int WNT  = CFG == 0 ? 2 : 4;      // adjacent n-tiles per warp
     constexpr int PF   = CFG == 0 ? 4 : 2;      // prefetch ring depth
@@ -219,10 +235,11 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
     constexpr int TWORDS = HALF ? 4 * (2 * bits + 1) : 8 * bits;              // uint32 per 16x16 tile
     constexpr bool TWO_PER_LOAD = HALF ? bits == 1 : bits == 2;               // two tiles per warp load
-    // 5 bpw: a tile is 40 words, more than a warp load. The WNT tiles of a k-slice are contiguous, so the slice is
-    // loaded as CEIL(WNT * 40 / 32) full-width warp loads (the last one partial) and staged in shared memory
-    constexpr int LOADS = bits == 5 ? CEIL_DIVIDE(WNT * TWORDS, 32) : (TWO_PER_LOAD ? WNT / 2 : WNT);   // warp loads per k-slice
-    constexpr int LSTRIDE = TWO_PER_LOAD ? 2 * TWORDS : (TWORDS < 32 || bits == 5 ? (bits == 5 ? 32 : TWORDS) : 32);   // uint32 per load (lanes < LSTRIDE load)
+    // 5 / 6 bpw: a tile is 40 / 48 words, more than a warp load. The WNT tiles of a k-slice are contiguous, so the
+    // slice is loaded as CEIL(WNT * TWORDS / 32) full-width warp loads (the last one partial for 5 bpw at WNT = 2)
+    // and staged in shared memory
+    constexpr int LOADS = bits >= 5 ? CEIL_DIVIDE(WNT * TWORDS, 32) : (TWO_PER_LOAD ? WNT / 2 : WNT);   // warp loads per k-slice
+    constexpr int LSTRIDE = TWO_PER_LOAD ? 2 * TWORDS : (TWORDS < 32 || bits >= 5 ? (bits >= 5 ? 32 : TWORDS) : 32);   // uint32 per load (lanes < LSTRIDE load)
     static_assert(!TWO_PER_LOAD || WNT % 2 == 0, "two tiles per warp load needs an even tile count per warp");
 
     auto grid = cooperative_groups::this_grid();
@@ -313,7 +330,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
         // off: uint32 offset of the k-slice from bp
         auto ld_b_off = [&] (size_t off, int l) -> uint32_t
         {
-            if constexpr (bits == 5)
+            if constexpr (bits >= 5)
                 return l * 32 + lane < WNT * TWORDS ? __ldcs(bp + off + l * 32) : 0;
             else if constexpr (LSTRIDE < 32)
                 return lane < LSTRIDE ? __ldcs(bp + off + l * LSTRIDE) : 0;
@@ -420,8 +437,8 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                     const uint32_t* tp = &sh_stage[warp][t * TWORDS];
                     if constexpr (HALF)
                         exl3_gemv_ns::dq8_regs_half<bits, cb>(tp[XP(0)], tp[XP(1)], XP(2), tp[XP(3)], tp[XP(4)], XP(5), f0, f1);
-                    else if constexpr (bits == 5)
-                        dq_dispatch<5, cb>(tp, lane << 3, f0, f1);
+                    else if constexpr (bits >= 5)
+                        dq_dispatch<bits, cb>(tp, lane << 3, f0, f1);
                     else if constexpr (bits == 4)
                         exl3_gemv_ns::dq8_regs_4bits<cb>(tp[(lane + 31) & 31], tp[lane], f0, f1);
                     else if constexpr (bits == 2)

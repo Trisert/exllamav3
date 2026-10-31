@@ -2,7 +2,7 @@
 
 > Research notes gathered with a subagent from NVIDIA documentation and `nvidia-smi` on the reference machine. Items marked UNVERIFIED have no primary source behind them; treat them as hypotheses and measure.
 >
-> One inference not in the sources: the throughput table puts shifts, bitfield extracts and shuffles at half the FP32 FMA rate and 32-bit integer multiplies as several instructions, so the trellis decode (shift/BFE/multiply per weight) is a likely reason the EXL3 GEMV kernels are decode-bound rather than bandwidth-bound on this card. Unmeasured.
+> One inference not in the sources: the throughput table puts shifts, bitfield extracts and shuffles at half the FP32 FMA rate and 32-bit integer multiplies as several instructions, so the trellis decode (shift/BFE/multiply per weight) is a likely reason the EXL3 GEMV kernels are decode-bound rather than bandwidth-bound on this card. Since measured: the m = 1 GEMV is issue-bound (about 8.6 full-rate issue slots per 4 bpw mul1 weight after the sm_60 decode changes, against a floor of about 7 for this codebook: three XMADs for the product, a half-rate VABSDIFF4 byte sum and two HFMA2 halves per weight), which caps it near 240 GB/s at ~1.2 GHz instead of the 732 GB/s HBM2 peak. See the README, Pascal section.
 
 
 Scope: FP16 and kernel-design facts for the P100 (torch device 1, nvidia-smi index 0).
@@ -87,7 +87,14 @@ Throughput table (operations per clock per SM), [CG9] sec 5.4.1 "Arithmetic Inst
 | conversions to/from 64-bit | 16 | 0.25x |
 
 Source for all rows: [CG9] sec 5.4.1 table (cc 6.0 column). The table is per SM per clock.
-Not in the fetched table: funnel shift (SHF), PRMT, dp4a. Their cc 6.0 rates are UNVERIFIED. Treat as "use 32/clk as a conservative guess, measure it".
+Not in the fetched table: funnel shift (SHF), PRMT, dp4a. dp4a does not exist on cc 6.0 (see below).
+
+Measured on this P100 (throughput microbenchmark: 64 warps per SM, 8 independent chains per thread, inline PTX
+checked 1:1 against the SASS, rates relative to IADD): IADD, LOP3, XMAD (16 x 16 + 32) and HFMA2 issue at the full
+rate; VABSDIFF4, BFE, SHF and PRMT at half of it. A 32-bit integer multiply is three XMADs. (The IMUL, SHR and SHFL
+probes were constant-folded by the compiler and gave no number.) `mad.lo.u32 d, a, 65536, c` compiles to one
+full-rate XMAD.PSL, and products of 16-bit PTX operands read their operand straight from either half register
+(XMAD `.H0` / `.H1`), which the EXL3 mul1 decode uses to drop the BFE / PRMT steps (README, Pascal section).
 
 Half2 and FP16 instructions (PTX ISA, [PTX] section 9.7.4):
 - fma.rn.f16 / fma.rn.f16x2: requires sm_53 or higher (so available on sm_60).
