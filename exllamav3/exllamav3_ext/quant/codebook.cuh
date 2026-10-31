@@ -40,11 +40,13 @@ __device__ inline half2 decode_mul1_product_2(uint32_t x0, uint32_t x1)
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610 && !defined(USE_ROCM)
     // No dp4a before sm_61: the portable __dp4a fallback costs ~6 instructions per entry (two of them half-rate
     // BFEs). vabsdiff4 with a zero second operand is the same byte sum plus accumulator (bit-identical, see the
-    // note below) and is a single native VABSDIFF4 on sm_60. One PRMT packs the two 16-bit results
-    uint32_t sum0, sum1;
+    // note below) and is a single native VABSDIFF4 on sm_60. Both sums are below 2^16, so sum0 + sum1 * 65536 packs
+    // them: ptxas emits that as one full-rate XMAD.PSL, where the equivalent PRMT is half rate on sm_60
+    uint32_t sum0, sum1, packed;
     asm ("vabsdiff4.u32.u32.u32.add %0, %1, %2, %3;" : "=r"(sum0) : "r"(x0), "r"(0), "r"(0x6400u));
     asm ("vabsdiff4.u32.u32.u32.add %0, %1, %2, %3;" : "=r"(sum1) : "r"(x1), "r"(0), "r"(0x6400u));
-    half2_uint32 h(__byte_perm(sum0, sum1, 0x5410));
+    asm ("mad.lo.u32 %0, %1, 65536, %2;" : "=r"(packed) : "r"(sum1), "r"(sum0));
+    half2_uint32 h(packed);
     half2 k_inv_h2 = __half2half2(__ushort_as_half(0x1eee));
     half2 k_bias_h2 = __half2half2(__ushort_as_half(0xc931));
     return __hfma2(h.as_half2, k_inv_h2, k_bias_h2);
@@ -63,6 +65,33 @@ __device__ inline half2 decode_mul1_product_2(uint32_t x0, uint32_t x1)
     return __hfma2(__halves2half2(h0.as_half, h1.as_half), k_inv_h2, k_bias_h2);
 #endif
 }
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610 && !defined(USE_ROCM)
+// sm_60: mul1 product idx * 0x83DCD12D mod 2^32 of the 16-bit index held in the low (HI = false) or high (HI = true)
+// half of x; the other half is ignored. Written as idx * 0xD12D + (idx * 0x83DC mod 2^16) * 65536 on 16-bit operands,
+// ptxas reads the index straight from the half register (three XMADs, the same count as the 32-bit multiply), so the
+// caller needs no mask or bitfield extract (BFE is half rate on sm_60) to isolate a window. Bit-identical to x * C
+template <bool HI>
+__device__ __forceinline__ uint32_t mul1_product_h16(uint32_t x)
+{
+    uint32_t r;
+    if constexpr (HI)
+        asm ("{ .reg .u16 xl, xh, h16; .reg .u32 lo, hi;\n"
+             "  mov.b32 {xl, xh}, %1;\n"
+             "  mul.wide.u16 lo, xh, 0xD12D;\n"
+             "  mul.lo.u16 h16, xh, 0x83DC;\n"
+             "  cvt.u32.u16 hi, h16;\n"
+             "  mad.lo.u32 %0, hi, 65536, lo; }\n" : "=r"(r) : "r"(x));
+    else
+        asm ("{ .reg .u16 xl, xh, h16; .reg .u32 lo, hi;\n"
+             "  mov.b32 {xl, xh}, %1;\n"
+             "  mul.wide.u16 lo, xl, 0xD12D;\n"
+             "  mul.lo.u16 h16, xl, 0x83DC;\n"
+             "  cvt.u32.u16 hi, h16;\n"
+             "  mad.lo.u32 %0, hi, 65536, lo; }\n" : "=r"(r) : "r"(x));
+    return r;
+}
+#endif
 
 // Ditto mcg (cb 1)
 __device__ inline half2 decode_mcg_product_2(uint32_t x0, uint32_t x1)

@@ -121,6 +121,22 @@ __device__ __forceinline__ void decode8(uint32_t w0, uint32_t w1, uint32_t w2, u
 template <int cb>
 __device__ __forceinline__ void dq8_regs_4bits(uint32_t a, uint32_t b, FragB& f0, FragB& f1)
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610 && !defined(USE_ROCM)
+    if constexpr (cb == 2)
+    {
+        // sm_60, mul1: the eight windows (bit offsets 0, 4, .., 28 of the 64-bit a:b) are the low and high halves of
+        // b and of the funnel shifts by 4, 8 and 12, and the products read their index from the half register
+        // (mul1_product_h16): three half-rate SHF instead of SHF + 6 BFE + 2 AND. Bit-identical to the form below
+        const uint32_t f4 = __funnelshift_r(b, a, 4);
+        const uint32_t f8 = __funnelshift_r(b, a, 8);
+        const uint32_t f12 = __funnelshift_r(b, a, 12);
+        f0[0] = decode_mul1_product_2(mul1_product_h16<true>(f12), mul1_product_h16<true>(f8));    // w0, w1
+        f0[1] = decode_mul1_product_2(mul1_product_h16<true>(f4), mul1_product_h16<true>(b));      // w2, w3
+        f1[0] = decode_mul1_product_2(mul1_product_h16<false>(f12), mul1_product_h16<false>(f8));  // w4, w5
+        f1[1] = decode_mul1_product_2(mul1_product_h16<false>(f4), mul1_product_h16<false>(b));    // w6, w7
+        return;
+    }
+#endif
     uint32_t s, w0, w1, w2, w3, w4, w5, w6, w7;
     FSHF_IMM(s, b, a, 20);
     w7 = b & 0xffff;
