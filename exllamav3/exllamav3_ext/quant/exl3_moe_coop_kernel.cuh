@@ -734,9 +734,7 @@ struct ItemShared
 
 __device__ __forceinline__ int ld_volatile_s32(const int* ptr)
 {
-    int v;
-    asm volatile("ld.volatile.global.s32 %0, [%1];" : "=r"(v) : "l"(ptr));
-    return v;
+    return *((const volatile int*) ptr);
 }
 
 // ---------------------------------------------------------------------------------------------

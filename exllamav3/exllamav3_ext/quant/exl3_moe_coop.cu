@@ -6,6 +6,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <map>
+#include <tuple>
 #include <cmath>
 
 #include "../util.h"
@@ -130,11 +131,12 @@ static int moe_coop_fused_mode(int device)
     return (sm[device] == 60 || sm[device] == 75) ? 2 : 0;
 }
 
-// Resident blocks per SM of a kernel (once per kernel and shared memory size)
-static int moe_coop_occupancy(void* kernel, int smem)
+// Resident blocks per SM of a kernel (once per device, kernel and shared memory size: the host stub
+// is shared by every device, the register count is not)
+static int moe_coop_occupancy(void* kernel, int smem, int device)
 {
-    static std::map<std::pair<void*, int>, int> cache;
-    auto key = std::make_pair(kernel, smem);
+    static std::map<std::tuple<int, void*, int>, int> cache;
+    auto key = std::make_tuple(device, kernel, smem);
     auto it = cache.find(key);
     if (it != cache.end()) return it->second;
     int n = 0;
@@ -263,7 +265,7 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int 
     {
         kf = moe_coop_kernel_f(K_gu, cb, p.Hi);
         moe_coop_smem_optin(kf.kernel, kf.smem);
-        resident = moe_coop_occupancy(kf.kernel, kf.smem) * DevCtx::instance().get_num_sms(device);
+        resident = moe_coop_occupancy(kf.kernel, kf.smem, device) * DevCtx::instance().get_num_sms(device);
         fused = fmode == 1 || grid_a >= resident;
     }
 
@@ -324,7 +326,7 @@ void exl3_moe_coop_launch_pair
     if (dual)
     {
         moe_coop_smem_optin(kd.kernel, kd.smem);
-        resident = moe_coop_occupancy(kd.kernel, kd.smem) * DevCtx::instance().get_num_sms(device);
+        resident = moe_coop_occupancy(kd.kernel, kd.smem, device) * DevCtx::instance().get_num_sms(device);
         dual = fmode == 1 || pl.grid_a >= resident;
     }
     if (!dual)
