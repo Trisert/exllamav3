@@ -279,6 +279,46 @@ Why decode is far from the 732 GB/s bandwidth bound: the m = 1 GEMV is issue-bou
 
 Ruled out on this setup (measured): `-ndt 2` (m = 3 verify): 16.1 t/s through the MMA path and 17.6 t/s through the four-row direct products, against 21.3 t/s with `-ndt 1` (greedy profiler loop); the m = 3 direct GEMV costs 1.6x the m = 2 one. The sparse draft head (`-sdh 32768`) does not engage here (the draft keeps the full K = 6 head). The Triton prefill attention (`EXL3_SDPA_PREFILL=0`) hits an illegal memory access on sm_60, so prefill attention stays on SDPA.
 
+**Checkpoints with unquantized projections (Ornith-1.5-35B-A3B-EXL3-3bpw).** This community quant of the Qwen3.5-MoE architecture keeps only the routed experts in EXL3 (3 bpw, mcg codebook). GatedDeltaNet and attention projections, shared experts, router and lm_head are 16-bit (`LinearFP16`), about 3.9 GB of dense fp16 read per token against ~1.3 GB of EXL3 weights in Qwen3.6-35B-A3B 3.00bpw. These linears went through cuBLAS (gemv2N at m = 1, `maxwell_sgemm_fp16` at m = 2), which reaches only 110-330 GB/s on the P100. Per-kernel profile (torch profiler, 30 decode steps, `-gs 4.0,15.0 -cs 32768 -cq 4`, P100 at 1328 MHz and 49-67 C, both builds; the P100 holds 31 layers and the lm_head, the 2060 holds 9 layers):
+
+| ms per step | plain, before | plain, after | MTP verify + draft, before | MTP, after |
+| :--- | ---: | ---: | ---: | ---: |
+| P100 dense projections (~2.2 GB) | 13.5 (163 GB/s) | 5.6 (390 GB/s) | 13.9 (m = 2) | 6.7 |
+| P100 lm_head (1.02 GB) | 3.16 (322 GB/s) | 1.73 (588 GB/s) | 7.74 (m = 2) + 3.17 | 1.75 + 1.74 |
+| P100 routed experts, mcg MoE coop | 5.0 | 4.8 | 7.7 | 7.7 |
+| P100 rest (attention, GDN recurrence, norms, routing) | 3.4 | 3.2 | ~4 | ~4 |
+| P100 busy | 25.1 | 15.4 | 36.4 | 21.9 |
+| 2060 busy (dense: 3.1 -> 2.6 plain) | 5.1 | 4.5 | 7.3 | 6.5 |
+| wall per token (unprofiled) | 32.2 | 20.4 | 26.2 | 15.3 |
+
+A 1 GB fp16 read runs at 593 GB/s on this P100 at the 125 W cap (317 GB/s on the 2060), so the lm_head is at the practical limit and the projections at about two thirds of it. Changes:
+
+- `hgemv_f16.cu` (`EXL3_HGEMV`, default on for sm_60 and sm_75): a dense fp16 GEMV for 1..4 rows. Each lane owns 8 output columns and reads them with one 16-byte load per weight row, with 4 rows in flight per lane. It accumulates in fp32. Narrow outputs split K over blocks, and the last block per column tile adds the partials in a fixed order, so results are deterministic and graph-capturable. It is dispatched from `hgemm`, `BC_LinearFP16` and `LinearFP16.forward`. Microbenchmark, P100, m = 1 / m = 2 (cuBLAS in brackets): 2048 x 8192 493 / 464 GB/s (332 / 171), 4096 x 2048 446 / 399 (112 / 179), 2048 x 512 218 / 172 (91 / 86), lm_head 2048 x 248320 588 / 568 (322 / 119). RTX 2060: 280-300 GB/s on the large shapes (cuBLAS 200-270), so no tensor-core variant is needed there. Error against an fp32 product: 2.7e-7 relative with fp32 output; with fp16 output it equals cuBLAS's (the output rounding dominates).
+- `LinearFP16` prefill on sm_60 through the HFMA2 GEMM of the reconstruct path (`hgemm_recon`, `EXL3_FP16_LINEAR_HFMA2`). This is a new premise for that GEMM: before, it only served EXL3 reconstructs, and dense fp16 linears stayed on cuBLAS's fp32-rate GEMM. 2 interleaved rounds, cooled to 62 C: 512 tokens 405 / 411 -> 418 / 422 t/s, 2048 tokens 672 / 671 -> 735 / 726, 8192 tokens 680 / 682 -> 753 / 751.
+
+End to end (`examples/bench_chat.py`, greedy, 2 turns x 500 tokens, both GPUs, P100 cooled to 62 C before every run, ending at 68-71 C and 1189-1328 MHz, so none of these runs were heat-limited; A = `aec2e809`, B = this change, 2 interleaved rounds):
+
+| | A | B | |
+| :--- | ---: | ---: | :--- |
+| Ornith plain | 32.42 / 32.45 t/s | 48.37 / 48.40 t/s | x1.49 |
+| Ornith `-mtp -ndt 1 -dds` | 39.36 / 39.42 t/s (88.4% accepted) | 61.65 / 61.70 t/s (82.2%) | x1.57 |
+| Ornith prompt, 545-token second turn (before the prefill change) | 417-420 t/s | 415-416 t/s | |
+| Qwen3.6-35B-A3B 3.00bpw plain (no-regression, 1 round) | 44.33 t/s | 44.39 t/s | |
+| Qwen3.6-35B-A3B `-mtp -ndt 1 -dds` (1 round) | 61.10 t/s (96.5%) | 61.83 t/s (96.9%) | |
+
+Greedy outputs diverge after a rounding change, so the draft acceptance on the two default prompts differs between A and B (88.4 vs 82.2%). On three other prompts (hash map, short story, French revolution, 400 tokens each) it is 59.7% (A) against 60.3% (B), so the change does not lower it. The low acceptance comes from the checkpoint: on those same prompts Qwen3.6-35B-A3B accepts 83.5% (90.5 / 73.9 / 86.0%) and Ornith 60% (86.0 / 37.4 / 57.5%), with the gap largest on prose. Ornith is a fine-tune with a 4 bpw MTP layer, and nothing on our side makes it worse.
+
+Accuracy (teacher-forced, 512 positions of real text, both GPUs). Every rounding change lands near the same KL on this checkpoint: cuBLAS against an fp32 product for every `LinearFP16` (output still fp16) gives KL 1.37e-2 at q_len 1, and the GEMV gives 1.46e-2. Their run-to-run KL is 0 (both deterministic). Perplexity: fp32 6.7192, cuBLAS 6.7176, GEMV 6.7881 at q_len 1; at q_len 2: 6.7952, 6.7494, 6.7448. Prefill (512-row chunks, 1536 positions): KL against fp32 is 1.34e-2 for cuBLAS and 1.31e-2 for HFMA2, perplexity 5.0074 / 5.0478 / 5.0605.
+
+What the profile rules out for this checkpoint:
+- **mcg experts:** the mcg MoE coop kernels are not slower than mul1. They take 5.0 ms for 31 layers here, against 5.5 ms for 30 layers of mul1 on Qwen3.6, so no codebook work was done.
+- **Graphed decode paths:** the BC paths for GatedDeltaNet and attention require EXL3 projections, so Ornith runs those layers eagerly. Wall time is within 1 ms of the summed busy time of both GPUs per token (20.4 vs 19.9 ms plain, 29.5 vs 28.3 ms per MTP iteration), so graphing them would gain less than 3%.
+- **Same-input fusion:** the qkv + z and gate + up pairs would save about 0.2 ms per token. The GEMV already reaches the same bandwidth on 2048 x 12288 as on 2048 x 8192.
+
+What is left:
+- **m = 2 projections:** they run at about 330 GB/s against 390 GB/s at m = 1.
+- **MoE coop at m = 2:** it costs 1.6x the m = 1 call (7.7 vs 4.8 ms) and is now the largest MTP item. It is shared with every EXL3 MoE.
+
 **Prefill attention on the P100 (`fa60`).** Profile (torch profiler, P100 kernels only, Qwen3.6-27B 4.00bpw, `-gs 4.0,15.0 -cs 32768 -cq 4`, 2048-token chunks, one run per length from 62 C): attention is 0.31 s of 9.7 s of P100 kernel time at 2048 tokens (3.2%), 3.71 of 41.7 s at 8192 (8.9%), 13.99 of 92.7 s at 16384 (15.1%), 62.3 of 252.8 s at 30000 (24.7%). Over 99% of it is one kernel, PyTorch's memory-efficient SDPA (`fmha_cutlassF_f16_aligned_32x128_gmem_sm50`, SIMT fp32, 3.3-3.5 TFLOPS). Ruled out as costs: the `-cq 4` window dequant (0.12 s at 30000), copies / cat (< 0.02 s), the GQA repeat (expand views, no copy) and the mask (`causal_lower_right`, never materialised). `fa60` (`exllamav3_ext/pascal/fa60.cu`, `EXL3_FA60`, default on for sm_60) is an HFMA2 flash-attention forward for head_dim 256: 7.2-7.3 TFLOPS, 2.15-2.45x SDPA on a 2048-row chunk over 2048-30000 keys (24/4 and 16/2 heads). End to end (`examples`-style generator prefill, interleaved ABBA in one process, A = SDPA, B = fa60, P100 cooled to 62 C before every run):
 
 | prompt tokens | A (SDPA) | B (fa60) | B / A | P100 after the runs |

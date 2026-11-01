@@ -303,6 +303,24 @@ for most of these shapes) and the fused MGEMM.
 Weight-extraction strategy inside the fp16 GEMV kernel: `-1` picks per bitrate (default), `0`
 forces shuffle extraction, `1` forces shared-memory staging. Testing only.
 
+### `EXL3_HGEMV` (default: on for sm_60 and sm_75, off elsewhere)
+
+Dense fp16 GEMV (`hgemv_f16.cu`) for unquantized linears (`LinearFP16`: projections and lm_head of
+checkpoints that keep them in 16 bits) at 1..4 rows, dispatched from `hgemm`, `BC_LinearFP16` and
+`LinearFP16.forward`. fp32 accumulation, deterministic split-K, N % 8 == 0. cuBLAS ran these shapes
+at 110-330 GB/s on the P100 (gemv2N at m = 1, sgemm at m = 2: 119 GB/s on a 248320-wide lm_head);
+the GEMV reaches 440-490 GB/s on 2048 x 4096..8192 projections and 588 GB/s on the lm_head (a 1 GB
+fp16 read runs at 593 GB/s on this card), and 280-300 GB/s of 317 on the RTX 2060.
+`0` keeps cuBLAS, `1` forces it on any CUDA device.
+
+### `EXL3_FP16_LINEAR_HFMA2` (default: `1`, sm_60 only)
+
+On sm_60, `LinearFP16` calls with more than 4 rows (prefill) go through `hgemm_recon`, the HFMA2 GEMM of
+the reconstruct path (32-term fp16 partials added into fp32; shapes it does not cover or does not gain
+on fall back to cuBLAS), instead of `torch.matmul`, which runs fp16 GEMMs at the fp32 FMA rate on the P100.
+Ornith-1.5-35B-A3B (all projections 16-bit): prefill 512 / 2048 / 8192 tokens 408 / 672 / 681 -> 420 / 731
+/ 752 t/s, KL against an fp32 reference 1.34e-2 (cuBLAS) vs 1.31e-2. `0` keeps `torch.matmul`.
+
 ### `EXL3_INT8_GEMV` (default: `2`)
 
 Fused int8-activation GEMV for tensors quantized with the mul1 codebook: one cooperative launch
