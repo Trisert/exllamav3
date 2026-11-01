@@ -55,6 +55,13 @@ MTP settings (35B, two prompts, 160 W): `-ndt 1` is the safe choice (57.3 t/s); 
 
 ## Open ideas (not done)
 
+- **MoE megakernel for decode** (proposed Nov 1, under evaluation). The decode MoE already runs as one fused launch
+  (`exl3_moe_coop`, shared expert as a one-expert coop launch, block coordination through counters). Floors for the 35B at
+  m = 1 (8 routed experts + shared, ~28 M weights, ~10.6 MB at 3 bpw per layer): ~18 us at 593 GB/s, ~60 us from instruction
+  issue (~8.6 slots per weight, 56 SMs x 64 lanes), against 161 us measured per layer (mcg, Ornith). The gap (~2.7x over the
+  issue floor) is not weight traffic: candidates are grid syncs between the gate/up and down stages, tail imbalance across
+  8 small experts, router + top-k + norm + residual as separate launches. A cut to ~100 us per layer would save ~1.9 ms of
+  ~20 ms per token (~9%); at m = 2 (MTP verify) the layer costs 1.6x (7.7 vs 4.8 ms for 31 layers). Estimate, not measured.
 - **MoE coop kernel at m = 2** (MTP verify): 7.7 ms per MTP iteration against 4.8 ms at m = 1; shared by every EXL3 MoE.
 - **Keep small, read-every-token matrices in fp16 on the P100** (lm_head, GatedDeltaNet projections): the quantized
   GEMV is issue-bound (~7-8.6 full-rate instructions per weight, ~240 GB/s) while the fp16 GEMV reaches 390-590 GB/s, which
