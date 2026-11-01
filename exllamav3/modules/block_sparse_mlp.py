@@ -600,8 +600,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         # Completion counters + expert-run table of the fused decode kernels
         # (BC_BlockSparseMLP.run_bszN): the kernels reset each other's counters for the next
-        # call, so they only need zeroing once
-        coop_ctr = g_tensor_cache.get(device, (bszn_rows * (I // 128) + MAX_BSZN * (Ho // 128) + 2 * bszn_rows + 3,), torch.int, "moe1_coop_ctr")
+        # call, so they only need zeroing once. The tail (queue + per-slot ready counters,
+        # bszn_rows + 2) enables the persistent single-launch kernel (exl3_moe_coop_ctr_len_fused)
+        coop_ctr = g_tensor_cache.get(device, (bszn_rows * (I // 128) + MAX_BSZN * (Ho // 128) + 3 * bszn_rows + 5,), torch.int, "moe1_coop_ctr")
         coop_ctr.zero_()
         # Rotated up-projection input per slot for the fused kernels at bsz > 1 (yh holds the gate's)
         had_u = g_tensor_cache.get(device, (bszn_rows, Hi), torch.half, "moe1_temp_hidden_u")
