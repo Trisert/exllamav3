@@ -13,6 +13,7 @@ Reference machine: Tesla P100 16 GB (SM 6.0, passively cooled, power cap 125 W, 
 
 | Date | Commit | What | Measured result |
 | :--- | :--- | :--- | :--- |
+| Nov 1 | `8e23476e` | Decode MoE as one persistent launch per layer (`EXL3_MOE_COOP_FUSED`): the two-launch blocks as work items of an atomic queue, EXL3 shared expert folded in; bit-identical | MoE kernels per layer (P100, m = 1 / m = 2 call): Qwen3.6 289 -> 156 us / ~420 -> 268 us, Ornith 155 -> 116 / 243 -> 192 us. End to end: Qwen3.6 plain 44.35 -> 55.45 t/s (x1.25), MTP 61.84 -> 71.55 (x1.16); Ornith plain 48.65 -> 51.92 (x1.07), MTP 61.79 -> 65.32 (x1.06) |
 | Nov 1 | `f08a12ed` | fp16 GEMV (`hgemv_f16.cu`) for unquantized linears and `lm_head`, HFMA2 GEMM for their prefill (sm_60); shortcut limited to sm_60 / sm_75 | Ornith-1.5-35B-A3B 3bpw: plain 30.5 -> 48.65 t/s (x1.59), MTP 41.1 -> 61.7 t/s (x1.50); Qwen3.6-35B unchanged |
 | Nov 1 | (setting) | Power limit 125 -> 160 W | Prefill +7..11% (35B), +19..31% (27B at 512 / 2048 tokens); decode unchanged; heat is the limit beyond ~8000 tokens |
 | Oct 31 | `aec2e809` | `fa60`: HFMA2 flash attention for prefill, head_dim 256, sm_60; `free_mem` syncs all devices before `empty_cache` | Kernel 2.2-2.4x SDPA; end to end 27B +3.7% at 8192 / +7.1% at 16384 tokens; 35B +8% / +14%; load crash gone (0 of 15 loads) |
@@ -22,8 +23,8 @@ Reference machine: Tesla P100 16 GB (SM 6.0, passively cooled, power cap 125 W, 
 | Oct 30 | `08d8e160` | sm_60 mul1 decode: native `vabsdiff4` byte sum, running prefetch offset in GEMV and MoE coop loops | 35B decode with MTP 50.5 -> 58.9 t/s (cool), x1.12 plain / x1.17 MTP sustained |
 | Oct 30 | `dedf8a28` | Comparison against the unmodified `pascal-p100` branch (549b7eff) | Decode 35.3 / 34.0 / 32.8 -> 60.0 / 59.6 / 52.9 t/s (x1.6-1.75), prefill 191 / 187 / 181 -> 253 / 249 / 232 t/s |
 
-Models run on this machine: Qwen3.6-35B-A3B 3bpw (~60 t/s MTP, ~44 plain), Qwen3.6-27B and Qwen3.8-27B 4bpw (21.6 t/s MTP,
-14.2 plain), Ornith-1.5-35B-A3B 3bpw (61.7 MTP, 48.65 plain), Muse-Glimmer-30B SC 3bpw (11.6 t/s plain; its DFlash drafter
+Models run on this machine: Qwen3.6-35B-A3B 3bpw (~71.5 t/s MTP, ~55 plain), Qwen3.6-27B and Qwen3.8-27B 4bpw (21.6 t/s MTP,
+14.2 plain), Ornith-1.5-35B-A3B 3bpw (65.3 MTP, 51.9 plain), Muse-Glimmer-30B SC 3bpw (11.6 t/s plain; its DFlash drafter
 loads and runs but accepts ~20% of tokens and is slower, 10.3 t/s).
 
 Prefill by prompt length (125 W): 35B 440 / 796 / 754 / 680 / 565 t/s at 512 / 2048 / 8192 / 16384 / 30000 tokens;
@@ -37,6 +38,9 @@ MTP settings (35B, two prompts, 160 W): `-ndt 1` is the safe choice (57.3 t/s); 
 - Two-XMAD product for mul1 (ptxas rebuilds the 32-bit multiply from every PTX form tried), higher GEMV occupancy (the
   P100 GEMV is issue-bound, not memory-bound), cuBLAS `COMPUTE_16F`, fused-MoE row limits of 32 / 64, 32-row MoE tiles.
 - mcg codebook work: mcg MoE coop kernels are not slower than mul1 (5.0 ms for 31 layers vs 5.5 ms for 30).
+- Decode MoE knobs as a fix for the stage tails: `EXL3_MOE_COOP_KSPLIT=2/3/4` and `EXL3_MOE_COOP_WIDE=0` within +-10%
+  or worse on the P100 (the narrow and split blocks are latency-bound at one block per SM). The persistent kernel for the
+  lone 16 + 16 block shared-expert launch is slower (80 vs 71 us), so the single-expert launch keeps two launches.
 - Same-input projection fusion (~0.2 ms per token), a tensor-core GEMV on sm_75, graphed decode for projections that are
   not EXL3, an fp32 Q.K variant of `fa60` (+55% time, no KL gain), `-ndt 2` for the dense 27B.
 - Triton prefill attention on sm_60 (illegal memory access, predates the fork).
@@ -48,7 +52,7 @@ MTP settings (35B, two prompts, 160 W): `-ndt 1` is the safe choice (57.3 t/s); 
   load-time crash, the original cause is only a hypothesis (`empty_cache` racing a kernel on another device).
 - Checkpoints that quantize the Gated DeltaNet q/k/v separately (e.g. the Ling-3.0-tiny quant tried) cannot be loaded:
   the EXL3 path needs the fused `qkv_proj`. Ling models also use MLA, whose absorb kernel needs 64 KB of shared memory.
-- Tests: 521 -> 616 passed on the P100 (gemm + moe), 597 on the RTX 2060, 0 failed. `tests/kernels/attention` has
+- Tests: 521 -> 616 -> 672 passed on the P100 (gemm + moe), 597 -> 653 on the RTX 2060, 0 failed. `tests/kernels/attention` has
   31 failures and 3 errors on sm_60 that predate this work; `test_fa75.py` must be deselected on the P100.
 - Long prompts (>8000 tokens) on the dense 27B are heat-limited (79 C, 400-900 MHz): the measured numbers there are
   sustained, not kernel speed.
@@ -77,14 +81,18 @@ MTP settings (35B, two prompts, 160 W): `-ndt 1` is the safe choice (57.3 t/s); 
   arrive-only). The sm_60 running prefetch offset is in the coop loop. The existing knobs do not fix it
   (`EXL3_MOE_COOP_KSPLIT=2/3/4`, `EXL3_MOE_COOP_WIDE=0`: within +-10% or worse). Avoidable time: well over 15% of the
   layer (tails ~40 + ~15 us, shared expert serial on 16 SMs ~100 us), so the gate passed; see Done for what was built.
-- **MoE megakernel for decode** (proposed Nov 1). The decode MoE already runs as one fused launch
+  Left after it: the m > 1 input-rotation pre-kernel (2 x ~7 us per layer per MTP verify, could move into the queue),
+  router GEMV + top-k (~19 us per layer, a separate pair of launches), finer or split-k items for the remaining tail
+  (not bit-identical: the gate/up partials are fp16), lower register use for 2 blocks per SM (not tried).
+- **MoE megakernel for decode** (proposed Nov 1; done in its persistent-queue form, see above). The decode MoE ran as two launches
   (`exl3_moe_coop`, shared expert as a one-expert coop launch, block coordination through counters). Floors for the 35B at
   m = 1 (8 routed experts + shared, ~28 M weights, ~10.6 MB at 3 bpw per layer): ~18 us at 593 GB/s, ~60 us from instruction
   issue (~8.6 slots per weight, 56 SMs x 64 lanes), against 161 us measured per layer (mcg, Ornith). The gap (~2.7x over the
   issue floor) is not weight traffic: candidates are grid syncs between the gate/up and down stages, tail imbalance across
   8 small experts, router + top-k + norm + residual as separate launches. A cut to ~100 us per layer would save ~1.9 ms of
   ~20 ms per token (~9%); at m = 2 (MTP verify) the layer costs 1.6x (7.7 vs 4.8 ms for 31 layers). Estimate, not measured.
-- **MoE coop kernel at m = 2** (MTP verify): 7.7 ms per MTP iteration against 4.8 ms at m = 1; shared by every EXL3 MoE.
+- **MoE coop kernel at m = 2** (MTP verify): after the persistent kernel 268 us per layer (Qwen3.6) against 156 at m = 1,
+  about linear in the distinct experts read (16 vs 8), so the per-row cost is not the issue; the rotation pre-kernels remain.
 - **Keep small, read-every-token matrices in fp16 on the P100** (lm_head, GatedDeltaNet projections): the quantized
   GEMV is issue-bound (~7-8.6 full-rate instructions per weight, ~240 GB/s) while the fp16 GEMV reaches 390-590 GB/s, which
   is why Ornith (unquantized projections) overtook Qwen3.6 in plain decode. Costs 2-3 GB of VRAM. Not measured.
