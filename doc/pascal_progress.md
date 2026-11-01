@@ -55,7 +55,7 @@ MTP settings (35B, two prompts, 160 W): `-ndt 1` is the safe choice (57.3 t/s); 
 
 ## Open ideas (not done)
 
-- **MoE megakernel for decode** (proposed Nov 1, under evaluation). The decode MoE already runs as one fused launch
+- **MoE coop restructure / megakernel for decode** (proposed Nov 1, Opus ranks it first, phase 1 profile running). The decode MoE already runs as one fused launch
   (`exl3_moe_coop`, shared expert as a one-expert coop launch, block coordination through counters). Floors for the 35B at
   m = 1 (8 routed experts + shared, ~28 M weights, ~10.6 MB at 3 bpw per layer): ~18 us at 593 GB/s, ~60 us from instruction
   issue (~8.6 slots per weight, 56 SMs x 64 lanes), against 161 us measured per layer (mcg, Ornith). The gap (~2.7x over the
@@ -63,9 +63,13 @@ MTP settings (35B, two prompts, 160 W): `-ndt 1` is the safe choice (57.3 t/s); 
   8 small experts, router + top-k + norm + residual as separate launches. A cut to ~100 us per layer would save ~1.9 ms of
   ~20 ms per token (~9%); at m = 2 (MTP verify) the layer costs 1.6x (7.7 vs 4.8 ms for 31 layers). Estimate, not measured.
 - **MoE coop kernel at m = 2** (MTP verify): 7.7 ms per MTP iteration against 4.8 ms at m = 1; shared by every EXL3 MoE.
-- **Keep small, read-every-token matrices in fp16 on the P100** (lm_head, GatedDeltaNet projections): the quantized
-  GEMV is issue-bound (~7-8.6 full-rate instructions per weight, ~240 GB/s) while the fp16 GEMV reaches 390-590 GB/s, which
-  is why Ornith (unquantized projections) overtook Qwen3.6 in plain decode. Costs 2-3 GB of VRAM. Not measured.
+- **Keep small, read-every-token matrices in fp16 on the P100** (lm_head, GatedDeltaNet projections): Opus is sceptical
+  (Nov 1, from the code and logged profiles, not measured). Per weight the quantized GEMV (~8.6 issue slots, ~500 G weights/s)
+  is faster than the fp16 GEMV at 390-590 GB/s (~200-300 G weights/s); fp16 can only win on tiny shapes where launch or
+  occupancy dominates, and the 35B's 6 bpw lm_head GEMV (~1.3 ms) is already no slower than fp16 (1.73 ms). Expected 0-3%,
+  VRAM +2-3 GB. The earlier explanation that Ornith overtook Qwen3.6 in plain decode because fp16 reads are cheap is NOT
+  established: a more likely contributor is that the Qwen3.6 EXL3 shared expert runs as two serial launches of 16 blocks
+  (16 of 56 SMs) while Ornith's is fp16. Check before investing.
 - P100 GEMV: at most ~15% left towards the ~7-slot floor. RTX 2060 GEMV: 15-25% left. 6 bpw `lm_head`: 3.3 ms against
   ~1.3 ms at bandwidth. `fa60` sits at ~42% of the HFMA2 peak (48 KB shared memory, 16-key tiles).
 - Cooling the P100 (the real limit on long prompts); power cap above 160 W would only add heat.
@@ -76,3 +80,15 @@ MTP settings (35B, two prompts, 160 W): `-ndt 1` is the safe choice (57.3 t/s); 
 - Qwen3.8-Flash-Next (125B total, 512 experts): 30 GB of weights at 1.66 bpw plus a 20 GB n-gram table; needs CPU expert
   offload (`-mcs`, experimental) and ~50 GB of disk. Dropped for now.
 - Disk is nearly full (~12 GB free of 222 GB): the two 27B models and Ornith take ~50 GB.
+
+## Ranking of next steps (Opus, Nov 1, estimates from code reading, none measured)
+
+1. MoE coop work distribution (includes the m = 2 MTP case): stage a at m = 1 is 64 blocks of 512 threads on 56 SMs (8 SMs
+   get 2 blocks, so the busiest SMs carry ~1.75x the ideal work), stage b is 128 short blocks dominated by start-up and
+   prefetch latency, and the Qwen3.6 shared expert is a serial pair of launches with 16 blocks per stage. Fix: finer work
+   units, shared expert folded into the routed launch as a 9th slot, possibly a and b in one persistent launch. Expected
+   Qwen3.6 plain +5-9%, Ornith +4-7%, MTP similar; confidence medium, effort medium.
+2. CUDA graphs for Ornith's non-EXL3 layers: cap ~5% (measured 1 ms gap), realistically 2-4%; Ornith only; effort medium.
+3. P100 EXL3 GEMV, remaining ~15%: +3-5%; confidence low (several PTX forms exhausted); effort large.
+4. fp16 for small matrices: 0-3%, sceptical (see above).
+Not worth it: `fa60` tuning (prefill only, <2%), changing the `-gs` split (~0.5 ms per GPU, they run serially).
