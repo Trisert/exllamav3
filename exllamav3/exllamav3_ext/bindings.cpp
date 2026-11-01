@@ -10,6 +10,9 @@
 
 #include "norm.cuh"
 #include "hgemm.cuh"
+#if !defined(USE_ROCM)
+#include "hgemv_f16.cuh"
+#endif
 #include "turing/fa75.cuh"
 #include "pascal/fa60.cuh"
 #include "rope.cuh"
@@ -92,6 +95,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.attr("HAS_GR_MIX_TILED") = true;          // gr_mix_tiled, gr_mix_tiled_slices
     m.attr("HAS_DET_GEMM") = true;              // routing_gemm_det, det_quant_weight, det_math_test
     m.attr("HAS_HGEMM_F16ACC") = cuda_only;     // hgemm_f16acc, hgemm_f16acc_status
+    m.attr("HAS_HGEMV_F16") = cuda_only;        // hgemv_f16
     m.attr("HAS_DFLASH2") = true;               // dflash2_dynconv, dflash2_selector_walk, dflash2_topk
 
     m.def("stloader_read", &stloader_read, "stloader_read");
@@ -228,6 +232,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("hgemm_f16acc", &hgemm_f16acc, "hgemm_f16acc");
     m.def("hgemm_f16acc_status", &hgemm_f16acc_status, "hgemm_f16acc_status");
     m.def("hgemm_hfma2", &hgemm_hfma2, "hgemm_hfma2", py::arg("a"), py::arg("b"), py::arg("c"), py::arg("bm") = 128);
+    m.def("hgemv_f16", &hgemv_f16, "hgemv_f16", py::arg("a"), py::arg("b"), py::arg("c"), py::arg("ksplit") = 0);
     m.def("fa75_fwd", &fa75_fwd, "fa75_fwd");
     m.def("fa75_fwd_slice", &fa75_fwd_slice, "fa75_fwd_slice");
     m.def("fa60_fwd", &fa60_fwd, "fa60_fwd");

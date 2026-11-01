@@ -5,6 +5,9 @@ from ...ext import exllamav3_ext as ext
 from ...util.tensor import to2
 from ...util import first_not_none
 
+# Rows up to which LinearFP16 calls ext.hgemm instead of torch.matmul (hgemv_f16.cuh, HGEMV_MAX_M)
+_HGEMV_MAX_M = 4 if getattr(ext, "HAS_HGEMV_F16", False) else 0
+
 class LinearFP16:
 
     quant_type: str = "fp16"
@@ -90,7 +93,8 @@ class LinearFP16:
             from ...util.tensor import g_tensor_cache
             weight = g_tensor_cache.get_bucketed(x.device, pinned.numel(), pinned.dtype, "fp16_pin_stage").view(pinned.shape)
             weight.copy_(pinned, non_blocking = True)
-        if dtype == x.dtype:
+        # Decode-class row counts go through ext.hgemm, which takes the fp16 GEMV (hgemv_f16.cu) where it applies
+        if dtype == x.dtype and x.shape[0] > _HGEMV_MAX_M:
             torch.matmul(x, weight, out = y)
         else:
             ext.hgemm(x, weight, y)
