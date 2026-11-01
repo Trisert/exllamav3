@@ -5,8 +5,16 @@ from ...ext import exllamav3_ext as ext
 from ...util.tensor import to2
 from ...util import first_not_none
 
-# Rows up to which LinearFP16 calls ext.hgemm instead of torch.matmul (hgemv_f16.cuh, HGEMV_MAX_M)
-_HGEMV_MAX_M = 4 if getattr(ext, "HAS_HGEMV_F16", False) else 0
+# Rows up to which LinearFP16 calls ext.hgemm instead of torch.matmul (hgemv_f16.cuh, HGEMV_MAX_M), on the devices the
+# fp16 GEMV was measured on (sm_60, sm_75). Other CUDA architectures keep torch.matmul for every row count
+_HGEMV_MAX_M_ON = 4 if getattr(ext, "HAS_HGEMV_F16", False) else 0
+_hgemv_cache = {}
+def _hgemv_max_m(device: torch.device) -> int:
+    idx = device.index
+    if idx not in _hgemv_cache:
+        ok = device.type == "cuda" and torch.cuda.get_device_capability(idx) in ((6, 0), (7, 5))
+        _hgemv_cache[idx] = _HGEMV_MAX_M_ON if ok else 0
+    return _hgemv_cache[idx]
 
 # Pascal sm_60: larger row counts take the HFMA2 GEMM of the reconstruct path (hgemm_recon -> hgemm_hfma2, 32-term
 # fp16 partials added into fp32) instead of cuBLAS, which runs fp16 GEMMs at the fp32 FMA rate on that card.
@@ -106,9 +114,10 @@ class LinearFP16:
             weight = g_tensor_cache.get_bucketed(x.device, pinned.numel(), pinned.dtype, "fp16_pin_stage").view(pinned.shape)
             weight.copy_(pinned, non_blocking = True)
         # Decode-class row counts go through ext.hgemm, which takes the fp16 GEMV (hgemv_f16.cu) where it applies
-        if x.shape[0] > _HGEMV_MAX_M and _fp16_hfma2 and _is_sm60(x.device):
+        gemv_m = _hgemv_max_m(x.device)
+        if x.shape[0] > gemv_m and _fp16_hfma2 and _is_sm60(x.device):
             ext.hgemm_recon(x, weight, y)
-        elif dtype == x.dtype and x.shape[0] > _HGEMV_MAX_M:
+        elif dtype == x.dtype and x.shape[0] > gemv_m:
             torch.matmul(x, weight, out = y)
         else:
             ext.hgemm(x, weight, y)
