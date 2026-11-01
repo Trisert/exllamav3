@@ -92,3 +92,14 @@ MTP settings (35B, two prompts, 160 W): `-ndt 1` is the safe choice (57.3 t/s); 
 3. P100 EXL3 GEMV, remaining ~15%: +3-5%; confidence low (several PTX forms exhausted); effort large.
 4. fp16 for small matrices: 0-3%, sceptical (see above).
 Not worth it: `fa60` tuning (prefill only, <2%), changing the `-gs` split (~0.5 ms per GPU, they run serially).
+
+## MoE coop profile (Opus, Nov 1, in-model, P100 at 1328 MHz) - phase 1 gate passed
+
+The 182 us per layer quoted for Qwen3.6 was the routed pair only (coop a 110 + b 76 us). Per layer at m = 1 the kernels take
+about 290 us: routed 186 + the K5 shared expert as its own serial coop a + b (62 + 41 us) on only 16 of 56 SMs + router and
+top-k ~19 us; that is 8.7 ms of the 18.1 ms the P100 is busy per token. m = 2: ~420 us per layer. Ornith: routed 96 + 59 =
+155 us at m = 1, ~250 us at m = 2. Cause: on sm_60 the coop kernels use 107-114 registers per thread at 512 threads, so one
+block fits per SM; stage a has 64 blocks (after the first 56, 8 SMs run a second ~55 us block while 48 sit idle), stage b has
+128 short latency-bound blocks that run in 3 waves where the work would fill 2.3. Avoidable time > 40% of the layer. Next:
+a persistent single-launch coop kernel with an atomic work queue (same tiles, bit-identical outputs, down items start as
+soon as their slot's gate/up is done), then the shared expert folded into the same queue. Not built yet.
