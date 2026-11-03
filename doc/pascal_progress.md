@@ -113,7 +113,7 @@ MTP settings (35B, two prompts, 160 W): `-ndt 1` is the safe choice (57.3 t/s); 
 
 ## Ranking of next steps (Opus, Nov 1, estimates from code reading, none measured)
 
-1. MoE coop work distribution (includes the m = 2 MTP case): stage a at m = 1 is 64 blocks of 512 threads on 56 SMs (8 SMs
+1. **DONE (Nov 1, see Done):** MoE coop work distribution (includes the m = 2 MTP case): stage a at m = 1 is 64 blocks of 512 threads on 56 SMs (8 SMs
    get 2 blocks, so the busiest SMs carry ~1.75x the ideal work), stage b is 128 short blocks dominated by start-up and
    prefetch latency, and the Qwen3.6 shared expert is a serial pair of launches with 16 blocks per stage. Fix: finer work
    units, shared expert folded into the routed launch as a 9th slot, possibly a and b in one persistent launch. Expected
@@ -123,13 +123,20 @@ MTP settings (35B, two prompts, 160 W): `-ndt 1` is the safe choice (57.3 t/s); 
 4. fp16 for small matrices: 0-3%, sceptical (see above).
 Not worth it: `fa60` tuning (prefill only, <2%), changing the `-gs` split (~0.5 ms per GPU, they run serially).
 
-## MoE coop profile (Opus, Nov 1, in-model, P100 at 1328 MHz) - phase 1 gate passed
+## MoE coop profile
 
-The 182 us per layer quoted for Qwen3.6 was the routed pair only (coop a 110 + b 76 us). Per layer at m = 1 the kernels take
-about 290 us: routed 186 + the K5 shared expert as its own serial coop a + b (62 + 41 us) on only 16 of 56 SMs + router and
-top-k ~19 us; that is 8.7 ms of the 18.1 ms the P100 is busy per token. m = 2: ~420 us per layer. Ornith: routed 96 + 59 =
-155 us at m = 1, ~250 us at m = 2. Cause: on sm_60 the coop kernels use 107-114 registers per thread at 512 threads, so one
-block fits per SM; stage a has 64 blocks (after the first 56, 8 SMs run a second ~55 us block while 48 sit idle), stage b has
-128 short latency-bound blocks that run in 3 waves where the work would fill 2.3. Avoidable time > 40% of the layer. Next:
-a persistent single-launch coop kernel with an atomic work queue (same tiles, bit-identical outputs, down items start as
-soon as their slot's gate/up is done), then the shared expert folded into the same queue. Not built yet.
+Superseded by the persistent-kernel entry in "Done" and the phase 1 table in "Open ideas" (per-layer times before and
+after, `EXL3_MOE_COOP_FUSED`).
+
+## Pending integration (reported by the user, not in this branch, not verified here)
+
+Nov 1-2: changes in the user's main checkout (branch `pascal-fast`, uncommitted when checked: `pascal-fast` has no commits
+ahead of `origin/worktree-pascal-gemv-k5`) let GLM-4.7-Flash (MLA, `qk_nope_head_dim` 192, padded to 256) run on GPUs with
+<= 64 KB of shared memory (RTX 2060 64 KB, P100 48 KB). Only Python files in the Triton MLA layer: `modules/mla_attn.py`
+(`autosplit_prepare` respects `_bc_mla_enable` and falls back to the eager path on `BCKernelTooLarge`),
+`modules/attention_fn/bc_mla.py` (`absorb_bn` fallback ladder 128 / 64 / 32), `modules/attention_fn/mla_triton.py` (absorb
+tiles sized with `pick_config` and a halving ladder, `torch.bmm` fallback, gather block 32 below 64 KB, prefill MHA
+`block_m` allowed down to 16). Reported result: `GLM-4.7-Flash-exl3-3bpw-H4` split over the 2060 and the P100,
+`-cs 262144 -cq 4 -mtp -ndt 1 -dds`, ~14.35 t/s, MTP acceptance 66.7%. This also addresses the MLA absorb shared-memory
+limit listed under Known issues for Ling-type models. To integrate: commit them on `pascal-fast`, push, then merge and
+re-test on both GPUs.
