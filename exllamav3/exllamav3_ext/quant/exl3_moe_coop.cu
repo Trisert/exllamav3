@@ -337,8 +337,24 @@ void exl3_moe_coop_launch_pair
     }
     p.f_sh_done = ps.f_queue;
     p.f_sh_wait = pls.grid_b;
-    if (ps.a_global) moe_coop_rot(ps, stream);
-    if (p.a_global) moe_coop_rot(p, stream);
+    const char* rp_env = std::getenv("EXL3_MOE_ROT_PAIR");   // per call: tests compare both forms in one process
+    const bool rot_pair = rp_env && std::atoi(rp_env) == 1;
+    if (rot_pair && ps.a_global && p.a_global)
+    {
+        // One launch for both rotation pre-kernels (bit-identical: same per-warp work)
+        auto rgrid = [](const MoeCoopParams& q)
+        {
+            const int items = q.bsz * q.topk * (q.Hi / 128) * (q.gated ? 2 : 1);
+            return CEIL_DIVIDE(items, MOE_COOP_THREADS / 32);
+        };
+        const int g0 = rgrid(ps), g1 = rgrid(p);
+        exl3_moe_coop_ns::exl3_moe_coop_rot2_kernel<<<g0 + g1, MOE_COOP_THREADS, 0, stream>>>(ps, p, g0);
+    }
+    else
+    {
+        if (ps.a_global) moe_coop_rot(ps, stream);
+        if (p.a_global) moe_coop_rot(p, stream);
+    }
     void* args[] = { (void*) &p, (void*) &ps };
     const int grid = std::min(resident, pl.grid_a + pl.grid_b + pls.grid_a + pls.grid_b);
     cuda_check(cudaLaunchKernel(kd.kernel, dim3(grid), dim3(MOE_COOP_THREADS), args, kd.smem, stream));

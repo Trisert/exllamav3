@@ -31,6 +31,11 @@ from ..util import profile_opt
 # (launch-all-samplers, one pinned stage, one synchronize) path
 _NO_BATCH_READBACK = False
 
+# EXL3_MTP_DEFER_CONF=1: with a one-token MTP window the confidence-calibrated cut can never fire, so the draft
+# confidence stays on the device and is read once after verification (calibration labels only) instead of a
+# blocking readback inside the draft step. Same tokens, same calibration
+_MTP_DEFER_CONF = os.environ.get("EXL3_MTP_DEFER_CONF", "0") == "1"
+
 class Generator:
 
     # Sparse drafting head and its per-round flag (set up in the constructor when enabled; class-level
@@ -1263,7 +1268,9 @@ class Generator:
             # Drafters that re-project their state for the next step hand it back through params
             temp_hidden = params["next_target_hidden"] if "next_target_hidden" in params else batch_state
             draft_conf = params.get("draft_conf")
-            if cal is not None and draft_conf is not None:
+            if cal is not None and draft_conf is not None and _MTP_DEFER_CONF and window == 1:
+                conf_cols.append(draft_conf.float())
+            elif cal is not None and draft_conf is not None:
                 c = draft_conf.float().cpu()
                 conf_cols.append(c)
                 est = [cal.estimate(v) for v in c.view(-1).tolist()]
@@ -2018,6 +2025,8 @@ class Generator:
         if self.draft_calibrator is not None and self._draft_conf_round is not None:
             st = self._draft_conf_round
             self._draft_conf_round = None
+            if st["conf"].is_cuda:
+                st["conf"] = st["conf"].cpu()   # deferred (EXL3_MTP_DEFER_CONF): verification has synchronized
             cal = self.draft_calibrator
             row = 0
             for job, a_idx, b_idx in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):

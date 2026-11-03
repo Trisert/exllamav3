@@ -7,6 +7,7 @@ launches. Shapes are the 35B-A3B MoE (Hi 2048, I 512, top-8 of 64 experts: 64 ga
 default selection takes the persistent kernel on the P100 and the RTX 2060. Also checks that both paths leave the
 shared counters clean for each other (they share one scratch per device in the model).
 """
+import os
 import pytest
 import torch
 
@@ -135,9 +136,18 @@ def test_dual_shared_routed(device, cb, K, K_sh, bsz):
     ref = run_sep()
     o1 = run_pair()
     o2 = run_pair()
+    # EXL3_MOE_ROT_PAIR=1: both rotation pre-kernels (bsz > 1) in one launch, same result
+    old = os.environ.get("EXL3_MOE_ROT_PAIR")
+    os.environ["EXL3_MOE_ROT_PAIR"] = "1"
+    try:
+        o3 = run_pair()
+    finally:
+        if old is None: del os.environ["EXL3_MOE_ROT_PAIR"]
+        else: os.environ["EXL3_MOE_ROT_PAIR"] = old
     assert torch.isfinite(o1).all()
     assert torch.equal(o1, ref), f"dual vs separate: max diff {(o1 - ref).abs().max().item():.3e}"
     assert torch.equal(o2, o1)
+    assert torch.equal(o3, o1), "paired rotation pre-kernels differ"
     for sc in (sc_r, sc_s):
         assert int(sc[6][-(sc[0].shape[0] + 2):].abs().sum()) == 0, "queue / ready counters not left clean"
 

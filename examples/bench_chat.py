@@ -41,6 +41,7 @@ def main(args):
         draft_model = draft_model, draft_cache = draft_cache,
         num_draft_tokens = args.num_draft_tokens, dynamic_draft_tokens = args.dynamic_draft,
         draft_confidence = args.draft_confidence,
+        sparse_draft_head = args.sparse_draft_head,
     )
     fmt = prompt_formats[args.mode]("User", "Assistant")
     system_prompt = fmt.default_system_prompt(False)

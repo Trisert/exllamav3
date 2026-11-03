@@ -9,7 +9,7 @@ import triton.language as tl
 
 from .common import AttnArgs, get_non_causal_span_arglist
 from .smem import pick_config, shared_bytes, tile_ladder, halving_ladder
-from ...util.backend import ROCM, gfx_arch, attn_decode_config
+from ...util.backend import ROCM, gfx_arch, attn_decode_config, attn_live_split
 
 
 def _is_power_of_2(x: int) -> bool:
@@ -934,6 +934,7 @@ def _paged_attn_decode_split_kernel(
     HAS_SINKS: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    LIVE_SPLIT: tl.constexpr = False,   # split the live kv length (from cache_seqlens) instead of the table bound
 ):
     """Flash-decoding phase 1: one program per (batch, kv_head, row block, kv split). The rows of a
     kv head are its (query position, sibling q head) pairs packed densely (decode_row_layout), so a
@@ -975,6 +976,12 @@ def _paged_attn_decode_split_kernel(
         w_span = tl.cdiv(tl.cdiv(total_k_len - w_lo, num_splits), BLOCK_N) * BLOCK_N
         n_start = w_lo + split * w_span
         n_end = tl.minimum(n_start + w_span, total_k_len)
+    elif LIVE_SPLIT:
+        # Spread the live length over all splits (the host-side split_len comes from the padded block-table
+        # bound, which leaves most splits idle and a few walking several tiles at short contexts)
+        l_span = tl.cdiv(tl.cdiv(total_k_len, num_splits), BLOCK_N) * BLOCK_N
+        n_start = split * l_span
+        n_end = tl.minimum(n_start + l_span, total_k_len)
     else:
         n_start = split * split_len
         n_end = tl.minimum(n_start + split_len, total_k_len)
@@ -1199,6 +1206,7 @@ def paged_attn_triton_decode(
     n_kv_heads_override: int | None = None,
     num_warps: int | None = None,
     num_stages: int | None = None,
+    live_split: bool | None = None,     # None: EXL3_ATTN_LIVE_SPLIT (util/backend.py)
 ) -> torch.Tensor:
     """Flash-decoding paged attention for short queries: the kv sequence is split across
     programs (sized from the block table, so no host sync on cache_seqlens) and reduced in a
@@ -1261,6 +1269,7 @@ def paged_attn_triton_decode(
     # K + V tiles in smem across num_stages; on small-smem devices the ladder halves the kv tile. Tile and
     # launch shape per backend / architecture (util/backend.py) unless the caller sets them
     cfg_block_n, cfg_warps, cfg_stages = attn_decode_config(q.device, hd_pad)
+    live_split = attn_live_split(q.device) if live_split is None else live_split
     if num_warps is None:
         num_warps = cfg_warps
     if num_stages is None:
@@ -1303,7 +1312,7 @@ def paged_attn_triton_decode(
             qck, qcv, q_len, kv_append_len, n_q_heads, n_kv_heads,
             page_size, head_dim, hd_pad, float(softmax_scale),
             bool(causal), int(window_left), int(window_right), float(softcap or 0.0),
-            splits == 1, has_sinks, block_rows, block_n,
+            splits == 1, has_sinks, block_rows, block_n, live_split and splits > 1,
         )
         return args, splits, partial_o, partial_ml
 

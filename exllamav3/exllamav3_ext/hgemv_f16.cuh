@@ -12,3 +12,7 @@
 
 bool hgemv_f16_try(const at::Tensor& a, const at::Tensor& b, at::Tensor& c, cudaStream_t stream);
 void hgemv_f16(at::Tensor a, at::Tensor b, at::Tensor c, int64_t ksplit);
+
+// Router logits + softmax top-k in one launch (routing_std; EXL3_ROUTER_FUSED=1); false = caller runs the two launches
+bool hgemv_router_topk_try(const at::Tensor& a, const at::Tensor& b, at::Tensor& c, at::Tensor& topk_indices,
+                           at::Tensor& topk_weights, const void* per_expert_scale, const void* bias, cudaStream_t stream);

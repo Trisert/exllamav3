@@ -79,7 +79,19 @@ def attn_decode_config(device, hd_pad: int) -> tuple[int, int, int]:
     kv tile, the top of the shared-memory ladder on devices that cannot hold it"""
     if hd_pad <= 128 and gfx_arch(device) == "gfx1100":
         return 32, 2, 2
+    if attn_live_split(device) and not ROCM and torch.cuda.get_device_capability(device) in ((6, 0), (7, 5)):
+        # With the live split, 16-key tiles: sm_60 / sm_75 run tl.dot on scalar FMAs, and the smaller tile halves
+        # the per-program latency at short contexts (microbenchmark, head_dim 256, q_len 2, 16 q / 2 kv heads,
+        # 4-bit cache: P100 63 -> 30 us, RTX 2060 90 -> 29 us at 500 keys; 98 -> 62 / 127 -> 83 us at 3500)
+        return 16, *ATTN_SPLIT_WARPS_STAGES
     return max(16, 8192 // hd_pad), *ATTN_SPLIT_WARPS_STAGES
+
+
+def attn_live_split(device) -> bool:
+    """EXL3_ATTN_LIVE_SPLIT=1: the decode split kernel divides the live kv length (read from cache_seqlens on the
+    device) over its splits instead of the block-table bound the host derives split_len from. The generator pads
+    the table to 16 pages, so at short contexts most splits idled while a few walked several tiles each"""
+    return os.environ.get("EXL3_ATTN_LIVE_SPLIT", "0") == "1"
 
 
 # --- Turing (sm_75) prefill ---------------------------------------------------------------------------------

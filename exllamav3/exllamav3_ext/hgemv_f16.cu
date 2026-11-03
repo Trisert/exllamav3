@@ -1,5 +1,6 @@
 #include <cuda_fp16.h>
 #include "hgemv_f16.cuh"
+#include "routing_topk.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
 #include "util.h"
@@ -56,7 +57,14 @@ __device__ __forceinline__ void fma8(float* acc, float xv, const uint4& w)
     }
 }
 
-template <int M, bool OUT_F32>
+// No epilogue
+struct NoEpi
+{
+    static constexpr bool active = false;
+    __device__ __forceinline__ void operator()(const half*, int, int) const {}
+};
+
+template <int M, bool OUT_F32, class Epi = NoEpi>
 __global__ __launch_bounds__(THREADS)
 void hgemv_kernel
 (
@@ -69,7 +77,8 @@ void hgemv_kernel
     const int N,
     const int ldx,
     const int ldy,
-    const int kchunk
+    const int kchunk,
+    const Epi epi = Epi()           // runs on the final fp16 output in the block that wrote it (one column tile)
 )
 {
     __shared__ float xs[M][XSTAGE];
@@ -154,7 +163,15 @@ void hgemv_kernel
                 ((half*) y)[(size_t) m * ldy + n] = __float2half_rn(s);
         }
     }
-    if (!split) return;
+    if (!split)
+    {
+        if constexpr (Epi::active && !OUT_F32)
+        {
+            __syncthreads();
+            epi((const half*) y, ldy, M);
+        }
+        return;
+    }
 
     // Last block of this column tile adds the partials of all K slices, in slice order
     __threadfence();
@@ -183,6 +200,11 @@ void hgemv_kernel
         }
     }
     if (t == 0) counters[blockIdx.x] = 0;
+    if constexpr (Epi::active && !OUT_F32)
+    {
+        __syncthreads();
+        epi((const half*) y, ldy, M);
+    }
 }
 
 struct Buffers
@@ -363,4 +385,53 @@ void hgemv_f16(at::Tensor a, at::Tensor b, at::Tensor c, int64_t ksplit)
     const hgemv::Buffers* buf = ks > 1 ? hgemv::get_buffers(device, stream) : nullptr;
     TORCH_CHECK(ks <= 1 || buf, "hgemv_f16: scratch cannot be allocated during a graph capture");
     hgemv_launch(a, b, c, (int) M, buf, stream, ks, kchunk);
+}
+
+
+// Router projection + softmax top-k in one launch (EXL3_ROUTER_FUSED=1, sm_60 / sm_75 where hgemv is on): the
+// same hgemv kernel and split as the hgemm path, the top-k of routing_std_topk_kernel runs in the block that
+// holds the final logits, so scores, indices and weights are bit-identical to the two launches
+bool hgemv_router_topk_try(const at::Tensor& a, const at::Tensor& b, at::Tensor& c, at::Tensor& topk_indices,
+                           at::Tensor& topk_weights, const void* per_expert_scale, const void* bias, cudaStream_t stream)
+{
+    // Read per call (cheap next to the launch) so tests can compare both paths in one process
+    const char* env = std::getenv("EXL3_ROUTER_FUSED");
+    if (!env || std::strcmp(env, "1") != 0) return false;
+    int64_t M;
+    if (!a.is_cuda() || !hgemv::enabled(a.device().index())) return false;
+    if (!hgemv_covered(a, b, c, M)) return false;
+    if (c.dtype() != at::kHalf || !c.is_contiguous()) return false;
+    const int K = (int) a.size(-1), N = (int) b.size(-1);
+    if (N > hgemv::COLS || N > hgemv::THREADS) return false;
+    if (!topk_indices.is_contiguous() || !topk_weights.is_contiguous()) return false;
+    const int device = a.device().index();
+    int ksplit, kchunk;
+    hgemv::pick_split(device, (int) M, K, N, ksplit, kchunk);
+    const hgemv::Buffers* buf = nullptr;
+    if (ksplit > 1)
+    {
+        buf = hgemv::get_buffers(device, stream);
+        if (!buf) return false;
+    }
+    const int lda = a.dim() >= 2 ? (int) a.stride(-2) : K;
+    const int ldc = N;
+    RouterTopkEpi epi { (int64_t*) topk_indices.data_ptr(), (half*) topk_weights.data_ptr(),
+                        (const bfloat16*) per_expert_scale, (const half*) bias, N, (int) topk_indices.size(-1) };
+    dim3 grid(1, ksplit);
+    float* scratch = ksplit > 1 ? buf->scratch : nullptr;
+    int* counters = ksplit > 1 ? buf->counters : nullptr;
+    const half* x = (const half*) a.data_ptr();
+    const half* w = (const half*) b.data_ptr();
+    #define RT_LAUNCH(MM) hgemv::hgemv_kernel<MM, false, RouterTopkEpi><<<grid, hgemv::THREADS, 0, stream>>> \
+        (x, w, c.data_ptr(), scratch, counters, K, N, lda, ldc, kchunk, epi)
+    switch (M)
+    {
+        case 1: RT_LAUNCH(1); break;
+        case 2: RT_LAUNCH(2); break;
+        case 3: RT_LAUNCH(3); break;
+        case 4: RT_LAUNCH(4); break;
+    }
+    #undef RT_LAUNCH
+    cuda_check(cudaPeekAtLastError());
+    return true;
 }

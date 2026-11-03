@@ -684,8 +684,8 @@ __device__ __forceinline__ void rotate_chunk(const MoeCoopParams& p, int row, co
 // Rotation pre-kernel (bsz > 1): warp per (slot, chunk, projection) into had_g / had_u
 
 #ifdef EXL3_MOE_COOP_DEFINE_ROT
-__global__ __launch_bounds__(THREADS)
-void exl3_moe_coop_rot_kernel(const MoeCoopParams p)
+__device__ __forceinline__
+void moe_coop_rot_body(const MoeCoopParams& p, const int bidx)
 {
     __shared__ int16_t sh_order[MAX_SLOTS];
     __shared__ int16_t sh_local[MAX_SLOTS];
@@ -696,8 +696,8 @@ void exl3_moe_coop_rot_kernel(const MoeCoopParams p)
     const int nproj = p.gated ? 2 : 1;
     const int chunks = p.Hi / 128;
     const int slots = p.bsz * p.topk;
-    if (blockIdx.x == 0) build_runs(p, sh_order, sh_local, sh_scan, sh_res);
-    const int item = blockIdx.x * (THREADS / 32) + warp;
+    if (bidx == 0) build_runs(p, sh_order, sh_local, sh_scan, sh_res);
+    const int item = bidx * (THREADS / 32) + warp;
     if (item >= slots * chunks * nproj) return;
     const int s = item / (chunks * nproj);
     const int rem = item % (chunks * nproj);
@@ -717,8 +717,24 @@ void exl3_moe_coop_rot_kernel(const MoeCoopParams p)
     half* dst = (is_gate ? p.had_g : p.had_u) + (size_t) s * p.Hi;
     rotate_chunk(p, si.row, suh, c, dst, lane);
 }
+
+__global__ __launch_bounds__(THREADS)
+void exl3_moe_coop_rot_kernel(const MoeCoopParams p)
+{
+    moe_coop_rot_body(p, blockIdx.x);
+}
+
+// Both rotation pre-kernels of a (shared, routed) pair in one launch (EXL3_MOE_ROT_PAIR): blocks below
+// grid_first take the first parameter set, the rest the second; the same warps do the same work
+__global__ __launch_bounds__(THREADS)
+void exl3_moe_coop_rot2_kernel(const MoeCoopParams p0, const MoeCoopParams p1, const int grid_first)
+{
+    if ((int) blockIdx.x < grid_first) moe_coop_rot_body(p0, blockIdx.x);
+    else moe_coop_rot_body(p1, blockIdx.x - grid_first);
+}
 #else
 __global__ void exl3_moe_coop_rot_kernel(const MoeCoopParams p);
+__global__ void exl3_moe_coop_rot2_kernel(const MoeCoopParams p0, const MoeCoopParams p1, const int grid_first);
 #endif
 
 // Static shared memory of one work item (an A or B block's worth of work)
