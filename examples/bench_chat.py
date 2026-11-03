@@ -1,7 +1,7 @@
 """
 Non-interactive benchmark that mirrors examples/chat.py: same model/cache/MTP arguments, same prompt format, and the
 same per-turn statistics (generate t/s, prompt t/s, draft acceptance), plus the P100 temperature and SM clock.
-Greedy sampling, so two builds with bit-identical kernels generate the same tokens and the draft acceptance matches.
+Greedy sampling by default (-sample for the chat.py sampler), so two builds with bit-identical kernels generate the same tokens and the draft acceptance matches.
 
   python examples/bench_chat.py -m <model> -gs 4.0,15.0 -cs 32768 -cq 4 -mtp -ndt 1 -dds \
       [-mode qwen35] [-prompts "Implement a quicksort in go" "Implement quicksort in rust"] [-max_new 1000] [-smi_index 0]
@@ -56,7 +56,7 @@ def main(args):
         ids = tokenizer.encode(text, add_bos = fmt.add_bos(), encode_special_tokens = True)
         pre = smi(args.smi_index)
         job = Job(input_ids = ids, max_new_tokens = args.max_new, stop_conditions = stop_conditions,
-                  sampler = ArgmaxSampler())
+                  sampler = model_init.get_arg_sampler(args) if args.sample else ArgmaxSampler())
         generator.enqueue(job)
         out, last = "", {}
         while generator.num_remaining_jobs():
@@ -85,11 +85,13 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    model_init.add_args(parser, cache = True, add_draft_model_args = True)
+    model_init.add_args(parser, cache = True, add_draft_model_args = True, add_sampling_args = True)
     parser.add_argument("-mode", "--mode", type = str, default = "qwen35")
     parser.add_argument("-prompts", "--prompts", nargs = "+",
                         default = ["Implement a quicksort in go", "Implement quicksort in rust"])
     parser.add_argument("-max_new", "--max_new", type = int, default = 1000)
     parser.add_argument("-smi_index", "--smi_index", type = int, default = 0, help = "nvidia-smi index of the P100")
     parser.add_argument("-tag", "--tag", type = str, default = "run")
+    parser.add_argument("-sample", "--sample", action = "store_true",
+                        help = "Use the sampler of chat.py (temperature, min-p, ...) instead of greedy; the draft acceptance then drops")
     main(parser.parse_args())
