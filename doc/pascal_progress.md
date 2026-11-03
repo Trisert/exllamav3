@@ -137,15 +137,15 @@ Not worth it: `fa60` tuning (prefill only, <2%), changing the `-gs` split (~0.5 
 Superseded by the persistent-kernel entry in "Done" and the phase 1 table in "Open ideas" (per-layer times before and
 after, `EXL3_MOE_COOP_FUSED`).
 
-## Pending integration (reported by the user, not in this branch, not verified here)
+## MLA shared-memory fallbacks (GLM-4.7-Flash), integrated Nov 3, `265b3945`
 
-Nov 1-2: changes in the user's main checkout (branch `pascal-fast`, uncommitted when checked: `pascal-fast` has no commits
-ahead of `origin/worktree-pascal-gemv-k5`) let GLM-4.7-Flash (MLA, `qk_nope_head_dim` 192, padded to 256) run on GPUs with
-<= 64 KB of shared memory (RTX 2060 64 KB, P100 48 KB). Only Python files in the Triton MLA layer: `modules/mla_attn.py`
-(`autosplit_prepare` respects `_bc_mla_enable` and falls back to the eager path on `BCKernelTooLarge`),
-`modules/attention_fn/bc_mla.py` (`absorb_bn` fallback ladder 128 / 64 / 32), `modules/attention_fn/mla_triton.py` (absorb
-tiles sized with `pick_config` and a halving ladder, `torch.bmm` fallback, gather block 32 below 64 KB, prefill MHA
-`block_m` allowed down to 16). Reported result: `GLM-4.7-Flash-exl3-3bpw-H4` split over the 2060 and the P100,
-`-cs 262144 -cq 4 -mtp -ndt 1 -dds`, ~14.35 t/s, MTP acceptance 66.7%. This also addresses the MLA absorb shared-memory
-limit listed under Known issues for Ling-type models. To integrate: commit them on `pascal-fast`, push, then merge and
-re-test on both GPUs.
+Three Python files of the Triton MLA layer (`modules/mla_attn.py`, `modules/attention_fn/bc_mla.py`,
+`modules/attention_fn/mla_triton.py`) were changed by the user so that MLA models with `qk_nope_head_dim` 192 (padded to 256) fit
+GPUs with <= 64 KB of shared memory (RTX 2060 64 KB, P100 48 KB): eager fallback on `BCKernelTooLarge`, `absorb_bn` ladder
+128 / 64 / 32, absorb tiles sized with `pick_config` and a halving ladder with a `torch.bmm` fallback, gather block 32 below 64 KB,
+prefill MHA `block_m` down to 16. Reported by the user: GLM-4.7-Flash 3bpw H4 over both GPUs, `-cs 262144 -cq 4 -mtp -ndt 1 -dds`,
+~14.35 t/s, acceptance 66.7%. Check in the main session on the merged build: loads and generates, plain 10.8 t/s (2 turns of 500
+tokens); the MTP run with `-cs 262144` failed with `CUDA error: out of memory` in `coop_autotune.cu:325` while the RTX 2060 held
+475 MiB of desktop processes (Chromium and others); the cause was not isolated (desktop memory on the 6 GB card, the persistent MoE
+scratch, or the context size) and the model was deleted afterwards, so the question is open. Ling-type models, which hit the same
+absorb limit, were not retried.
