@@ -3,7 +3,7 @@ EXL3_ROUTER_FUSED: the router projection (hgemv) and the softmax top-k of routin
 running in the hgemv block that holds the final logits. It must be bit-identical to the two launches (hgemv +
 routing_std_topk_kernel): logits, selected experts and weights. Covers 2..4 rows (the hgemm path; one row takes
 routing_gemv_kernel and is never fused), split and unsplit K, expert counts up to 256, with and without the
-per-expert scale. Runs where the hgemv path is on (sm_60, sm_75).
+per-expert scale, and exact ties (repeated gate columns). Runs where the hgemv path is on (sm_60, sm_75).
 """
 
 import os
@@ -40,11 +40,17 @@ def _run(x, gate, gate_t, rows, e, topk, pes, fused):
 @pytest.mark.skipif(not _hgemv_on(), reason = "hgemv path is off on this device")
 @pytest.mark.parametrize("rows, k, e, topk", CONFIGS)
 @pytest.mark.parametrize("scaled", (False, True))
+@pytest.mark.parametrize("ties", (False, True))
 @torch.inference_mode()
-def test_router_fused_bit_identical(rows, k, e, topk, scaled):
+def test_router_fused_bit_identical(rows, k, e, topk, scaled, ties):
     gen = torch.Generator().manual_seed(rows * 1000 + k + e)
     x = torch.randn((rows, k), generator = gen).half().cuda()
-    gate = (torch.randn((k, e), generator = gen) / k ** 0.5).half().cuda()
+    gate = (torch.randn((k, e), generator = gen) / k ** 0.5).half()
+    if ties:
+        # repeated gate columns give exactly equal logits: the selection order among ties must match
+        src = torch.randint(0, max(e // 4, 1), (e,), generator = gen)
+        gate = gate[:, src].contiguous()
+    gate = gate.cuda()
     gate_t = gate.T.contiguous()
     pes = (torch.rand((e,), generator = gen) + 0.5).bfloat16().cuda() if scaled else None
     s0, i0, w0 = _run(x, gate, gate_t, rows, e, topk, pes, False)

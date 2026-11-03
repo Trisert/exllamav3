@@ -240,6 +240,18 @@ the model-level KL against SDPA is ~1e-3, below the 0.8e-3..5.4e-3 between the f
 cache. The switch is read per call. `1` forces it on any CUDA device (it is HFMA2 / fp32 SIMT code and
 runs from sm_60 up), `0` keeps SDPA.
 
+### `EXL3_ATTN_LIVE_SPLIT` (default: `0`)
+
+Flash-decoding split of the paged decode attention (`_paged_attn_decode_split_kernel`, also inside the
+graphed BC attention). By default the host sizes the splits from the block-table bound, and the generator
+pads the table to 16 pages (4096 tokens), so at short contexts a few splits walk several key tiles while
+the rest idle. `1` makes the kernel divide the live length (read from `cache_seqlens` on the device, so
+graph replay stays valid) over the same splits, and on sm_60 / sm_75 uses 16-key tiles. Only the split
+boundaries move; the result equals the bound split up to the reduction order
+(`tests/kernels/attention/test_decode_live_split.py`). Microbenchmark (head_dim 256, 16 q / 2 kv heads,
+q_len 2, 4-bit cache): P100 63 -> 30 us at 500 keys, 98 -> 62 us at 3500; RTX 2060 90 -> 29 us and
+127 -> 83 us.
+
 ### `EXL3_QC_PREFILL_NS` (default: `0` = measure)
 
 Pipeline stage count for the direct quantized-cache prefill kernel. Unset/`0`, the best of
@@ -657,6 +669,29 @@ module allocates it), gate/up and down at one width and the wide tile. The dual 
 routed K 2..4 with shared K = K, K + 1, K + 2 (mcg, mul1); other pairs launch the shared expert first,
 as before. `1` forces the persistent kernel wherever it applies (testing), `0` keeps the separate
 launches.
+
+### `EXL3_ROUTER_FUSED` (default: `0`)
+
+`routing_std` (softmax top-k router) at 2..4 rows on the devices where the fp16 GEMV (`EXL3_HGEMV`) is on:
+the router projection and the top-k run as one launch. The hgemv kernel is unchanged (same split, same
+summation order); the block that holds the final logits (the last k-slice block of the single column
+tile, router widths up to 256 experts) runs the `routing_std_topk_kernel` code on them in its epilogue.
+Logits, indices and weights are bit-identical to the two launches (`tests/kernels/routing/test_router_fused.py`).
+Single rows keep `routing_gemv_kernel`. Read per call.
+
+### `EXL3_MOE_ROT_PAIR` (default: `0`)
+
+For the dual persistent MoE launch (shared + routed experts, more than one row, e.g. an MTP verify step):
+the two input-rotation pre-kernels run as one launch, the blocks of the shared expert's rotation first.
+Same per-warp work, bit-identical (`tests/kernels/moe/test_moe_coop_fused.py::test_dual_shared_routed`).
+Read per call.
+
+### `EXL3_MTP_DEFER_CONF` (default: `0`)
+
+Generator, MTP drafting with `-dds` and a one-token draft window: the window can never be cut, so the draft
+confidence is kept on the device and read once after verification (for the calibration labels) instead of a
+blocking readback in the draft step. Same tokens and calibration. The draft ids still come back to the
+host before verification (the embedding lookup needs them), so the gain is small.
 
 ### `EXL3_MOE_COOP_WIDE` (default: unset)
 

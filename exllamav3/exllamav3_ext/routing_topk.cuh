@@ -109,18 +109,16 @@ void warp_topk_shared
 }
 
 
-// Softmax top-k of one row of router logits (routing_std): block of >= num_warps * 32 threads (warps past
-// CEIL_DIVIDE(num_experts, 32) idle but reach the barriers), sh_key holds num_experts + num_warps floats
+// Softmax top-k of one row of router logits (routing_std), in two steps so the fused router epilogue can run the
+// selection of several rows on separate warps. Step 1, whole block (>= num_warps * 32 threads; warps past
+// CEIL_DIVIDE(num_experts, 32) idle but reach the barriers): logits (+ bias) into sh_key, which holds
+// num_experts + num_warps floats, and the max logit, returned to every thread
 __device__ __forceinline__
-void std_topk_row
+float std_topk_load_max
 (
     const half* __restrict__ scores,
-    int64_t* __restrict__ topk_indices,
-    half* __restrict__ topk_weights,
-    const bfloat16* __restrict__ per_expert_scale,
     const half* __restrict__ bias,
     int num_experts,
-    int K,
     float* sh_key
 )
 {
@@ -151,24 +149,55 @@ void std_topk_row
         max_logit = __shfl_sync(0xffffffffu, max_logit, 0);
     }
     __syncthreads();
+    return max_logit;
+}
 
-    if (warp_id == 0)
+// Step 2, one warp: top-k selection, softmax over the selected logits, per-expert scale, store
+__device__ __forceinline__
+void std_topk_select
+(
+    const float* sh_key,
+    float max_logit,
+    int64_t* __restrict__ topk_indices,
+    half* __restrict__ topk_weights,
+    const bfloat16* __restrict__ per_expert_scale,
+    int num_experts,
+    int K
+)
+{
+    int lane_id = threadIdx.x % 32;
+    float e;
+    int out_idx;
+    warp_topk_shared(sh_key, nullptr, num_experts, K, e, out_idx);
+    e = lane_id < K ? exp_det(e - max_logit) : 0.0f;
+    float sum = warp_reduce_sum_first_k(e, K) + 1e-20f;
+    e /= sum;
+
+    if (lane_id < K)
     {
-        float e;
-        int out_idx;
-        warp_topk_shared(sh_key, nullptr, num_experts, K, e, out_idx);
-        e = lane_id < K ? exp_det(e - max_logit) : 0.0f;
-        float sum = warp_reduce_sum_first_k(e, K) + 1e-20f;
-        e /= sum;
-
-        if (lane_id < K)
-        {
-            if (per_expert_scale)
-                e *= __bfloat162float(per_expert_scale[out_idx]);
-            topk_indices[lane_id] = (int64_t) out_idx;
-            topk_weights[lane_id] = __float2half_rn(e);
-        }
+        if (per_expert_scale)
+            e *= __bfloat162float(per_expert_scale[out_idx]);
+        topk_indices[lane_id] = (int64_t) out_idx;
+        topk_weights[lane_id] = __float2half_rn(e);
     }
+}
+
+__device__ __forceinline__
+void std_topk_row
+(
+    const half* __restrict__ scores,
+    int64_t* __restrict__ topk_indices,
+    half* __restrict__ topk_weights,
+    const bfloat16* __restrict__ per_expert_scale,
+    const half* __restrict__ bias,
+    int num_experts,
+    int K,
+    float* sh_key
+)
+{
+    float max_logit = std_topk_load_max(scores, bias, num_experts, sh_key);
+    if (threadIdx.x / 32 == 0)
+        std_topk_select(sh_key, max_logit, topk_indices, topk_weights, per_expert_scale, num_experts, K);
 }
 
 // hgemv epilogue: the block that holds the final router logits (one column tile, N <= 256) runs the top-k of
@@ -186,12 +215,20 @@ struct RouterTopkEpi
 
     __device__ __forceinline__ void operator()(const half* y, int ldy, int M) const
     {
-        __shared__ float sh_key[256 + 8];
+        // Logits and max of every row first (whole block), then each row's selection on its own warp. (A 256-wide
+        // bitonic sort in the selection order instead of the K serial warp-argmax rounds measured slower on the
+        // P100, 27 vs 18 us for the fused launch)
+        __shared__ float sh_key[4][256 + 8];
+        __shared__ float sh_max[4];
         for (int m = 0; m < M; ++m)
         {
-            __syncthreads();
-            std_topk_row(y + (size_t) m * ldy, topk_indices + K * m, topk_weights + K * m,
-                         per_expert_scale, bias, num_experts, K, sh_key);
+            float mx = std_topk_load_max(y + (size_t) m * ldy, bias, num_experts, sh_key[m]);
+            if (threadIdx.x == 0) sh_max[m] = mx;
         }
+        __syncthreads();
+        const int w = threadIdx.x / 32;
+        if (w < M)
+            std_topk_select(sh_key[w], sh_max[w], topk_indices + K * w, topk_weights + K * w,
+                            per_expert_scale, num_experts, K);
     }
 };
