@@ -79,7 +79,8 @@ class InferParams:
         # kernel, which is far below the memory roofline there, while separate calls take the GEMV path
         # (the GEMV covers K <= 5; wider tensors keep the fused kernel). Same on Turing sm_75 for mul1, where every
         # K <= 4 shape takes the GEMV (measured on the RTX 2060; EXL3_GEMV_SM75=0 keeps the tile kernel and the MGEMM)
-        if device is not None and K <= 5:
+        # (EXL3_GEMV=0 turns the GEMV off, so there is nothing to unfuse for and the MGEMM stays)
+        if device is not None and K <= 5 and os.environ.get("EXL3_GEMV", "1") != "0":
             import torch
             device = torch.device(device)
             if device.type == "cuda" and device.index is not None and not torch.version.hip:

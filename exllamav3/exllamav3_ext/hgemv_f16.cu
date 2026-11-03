@@ -238,7 +238,10 @@ static bool enabled(int device)
     return on == 1;
 }
 
-// Scratch and counters for one (device, stream); null if they would have to be allocated during a capture
+// Scratch and counters for one (device, stream); null if they would have to be allocated during a capture.
+// Entries (about 4.25 MiB each) live for the process: torch hands out streams from a fixed pool (32 per device) and
+// the generator uses the current stream, so the map stays small. Code that creates fresh streams per request
+// would grow it, and then needs a release hook (not needed here)
 static const Buffers* get_buffers(int device, cudaStream_t stream)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
