@@ -213,15 +213,23 @@ class BCMLA:
         absorb_bm = min(64, triton.next_power_of_2(max(R, 16)))
         _absorb_sig, _absorb_range = mla_absorb_signature()
         # pointer_range_32 is part of the compile contract -- see mla_absorb_signature()
-        k_absorb = _compile_kernel(dev, _mla_absorb_kernel,
-            _absorb_sig
-            | {n: "constexpr" for n in (
-                "n_q_heads", "QK_DIM", "Q_STRIDE", "D_nope", "NOPE_PAD", "D_c", "BLOCK_M", "BLOCK_N")},
-            dict(n_q_heads = H, QK_DIM = QK, Q_STRIDE = self.w_q, D_nope = D_nope,
-                 NOPE_PAD = triton.next_power_of_2(D_nope), D_c = D_c,
-                 BLOCK_M = absorb_bm, BLOCK_N = 128),
-            4, 2,
-            pointer_range_32 = _absorb_range)
+        absorb_bn = 128
+        while absorb_bn >= 32:
+            try:
+                k_absorb = _compile_kernel(dev, _mla_absorb_kernel,
+                    _absorb_sig
+                    | {n: "constexpr" for n in (
+                        "n_q_heads", "QK_DIM", "Q_STRIDE", "D_nope", "NOPE_PAD", "D_c", "BLOCK_M", "BLOCK_N")},
+                    dict(n_q_heads = H, QK_DIM = QK, Q_STRIDE = self.w_q, D_nope = D_nope,
+                         NOPE_PAD = triton.next_power_of_2(D_nope), D_c = D_c,
+                         BLOCK_M = absorb_bm, BLOCK_N = absorb_bn),
+                    4, 2,
+                    pointer_range_32 = _absorb_range)
+                break
+            except BCKernelTooLarge:
+                if absorb_bn == 32:
+                    raise
+                absorb_bn //= 2
 
         if self.quant:
             groups = D_c // 32
@@ -327,7 +335,7 @@ class BCMLA:
             qtmp, stmp,
             k_stage, k_absorb, k_append, k_split, k_combine, k_unfold,
             block_n, splits_cap, programs,
-            triton.cdiv(R, absorb_bm), D_c // 128, triton.cdiv(R, unfold_bm),
+            triton.cdiv(R, absorb_bm), D_c // absorb_bn, triton.cdiv(R, unfold_bm),
         )
 
         if self.indexer_mode is not None:

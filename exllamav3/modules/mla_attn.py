@@ -1163,13 +1163,16 @@ class MLAttention(Module):
         bcm = self.dispatch_cache.get(key)
         if bcm is None:
             from .attention_fn.bc_mla import build_bc_mla
-            bcm = build_bc_mla(self, layer)
+            bcm = build_bc_mla(self, layer) if _bc_mla_enable else None
         if bcm:
-            from .attention_fn.bc_attn import MAX_BSZ
+            from .attention_fn.bc_attn import MAX_BSZ, BCKernelTooLarge
             regimes = (0, 1) if self.indexer_mode is not None else (0,)
-            for b, q in ((1, 1), (MAX_BSZ, MAX_DECODE_QLEN)):
-                for rg in regimes:
-                    bcm._configure(b, q, rg)
+            try:
+                for b, q in ((1, 1), (MAX_BSZ, MAX_DECODE_QLEN)):
+                    for rg in regimes:
+                        bcm._configure(b, q, rg)
+            except BCKernelTooLarge:
+                self.dispatch_cache[key] = False
 
 
     def autosplit_extra_measure(self, params):
