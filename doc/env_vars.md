@@ -640,6 +640,24 @@ Split-k factor of the fused decode MoE kernels: `n` runs every column chunk as `
 disjoint k ranges whose partial sums the last-arriving block adds. Measured as neutral to harmful
 on every GPU here, so the default is no split. Testing knob only.
 
+### `EXL3_MOE_COOP_FUSED` (default: unset = auto on sm_60 / sm_75)
+
+Persistent single-launch form of the fused decode MoE kernels (`exl3_moe_coop_f_kernel`, and
+`exl3_moe_coop_d_kernel` for a layer with an EXL3 shared expert). A grid of one block per resident
+slot pulls the two-launch path's blocks as work items from an atomic queue (shared gate/up, routed
+gate/up, shared down, routed down); a down item waits on per-slot ready counters that the gate/up
+epilogues set, and the routed down epilogue waits for the shared expert's output. The items are the
+same blocks, so the result is bit-identical to the separate launches (`tests/kernels/moe/test_moe_coop_fused.py`).
+It fixes the wave tails on sm_60, where the coop kernels hold one 512-thread block per SM (107-114
+registers): 64 gate/up blocks on 56 SMs ran as a full wave plus 8 lone blocks, 128 down blocks as 3
+waves, and the shared expert's 16-block launches ran alone on 16 SMs. Auto: on sm_60 and sm_75 when
+the gate/up stage alone fills the device (the 16 + 16 block shared-expert launch on its own got
+slower in the persistent form); needs the counter scratch's tail (`exl3_moe_coop_ctr_len_fused`, the
+module allocates it), gate/up and down at one width and the wide tile. The dual kernel is compiled for
+routed K 2..4 with shared K = K, K + 1, K + 2 (mcg, mul1); other pairs launch the shared expert first,
+as before. `1` forces the persistent kernel wherever it applies (testing), `0` keeps the separate
+launches.
+
 ### `EXL3_MOE_COOP_WIDE` (default: unset)
 
 Tile geometry of the fused decode MoE kernels (the bsz <= 8 path of `BlockSparseMLP`): `0` forces
