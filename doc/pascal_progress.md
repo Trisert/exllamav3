@@ -17,6 +17,45 @@ Reference machine: Tesla P100 16 GB (SM 6.0, passively cooled, power cap 125 W, 
 today. Deeper drafting (`-ndt 2/3`) is not a lever: acceptance of the extra tokens drops (82% -> 70% -> 66-70%) and the MoE verify
 cost grows with the distinct experts read, so only kernel and scheduling work counts.
 
+### Stage 0: per-iteration budget of the MTP iteration (Nov 3, measured)
+
+torch profiler around `Generator.iterate` in the real decode (chat template, "Implement a quicksort in go", greedy, 60
+iterations from iteration 150, `-gs 4.0,15.0 -cs 32768 -cq 4 -mtp -ndt 1 -dds`, P100 1328 MHz, 57-64 C). Unprofiled
+900-token runs: Qwen3.6 27.70 ms/iter, 1.927 tok/iter (69.6 t/s, 92.7% accepted); Ornith 28.01 ms, 1.767 tok/iter (63.1 t/s,
+76.8%). Every step of the iteration is serial: the 2060 and the P100 run concurrently for 0.01 ms per iteration.
+
+| ms per iteration (kernel times) | Qwen3.6 | Ornith |
+| :--- | ---: | ---: |
+| draft: MTP layer on the 2060 (m = 1) | 0.48 | 0.47 |
+| draft: lm_head on the P100 (m = 1) | 1.10 (5 bpw GEMV) | 1.74 (fp16) |
+| verify, 2060 layers (m = 2) | 5.46 (10 layers) | 5.47 (9 layers) |
+| -- of which MoE / projections / attention | 2.61 / 2.10 (tile GEMM, K = 5) / 0.31 | 2.11 / ~2.5 (fp16) / 0.39 |
+| verify, P100 layers + lm_head (m = 2) | 19.29 | 17.19 (+1.1 unattributed) |
+| -- MoE persistent kernel | 8.02 (30 x 267 us) | 6.04 (31 x 195 us) |
+| -- rotation pre-kernels / router GEMV / top-k | 0.42 / 0.54 / 0.32 | 0.24 / 0.35 / 0.28 |
+| -- projections (m = 2) | 5.78 (EXL3 5 bpw GEMV) | ~6.7 (fp16 hgemv) |
+| -- lm_head m = 2 | 1.27 | 1.75 |
+| -- attention (split 1.02, combine 0.13, rope, cache quant) | 1.34 | 1.30 |
+| -- GatedDeltaNet (recurrence 0.66, conv 0.28, norms, ...) / RMS norms | 1.33 / 0.28 | 1.1 / 0.25 |
+| MTP prefill of the accepted token (2060, attention part only) | 0.30 | 0.20 |
+| no GPU busy (profiled / unprofiled estimate) | 1.83 / ~0.95 | 2.38 / ~1.2 |
+
+Host side: the draft step ends with a blocking `draft_conf.cpu()` (confidence calibration of `-dds`), so the verify
+launch waits for the draft head; after verify one `cudaDeviceSynchronize`, the accept walk and the MTP prefill launch
+(~0.4 ms without GPU work); 620 sub-5 us gaps per iteration in graph replay (~0.4 ms profiled). Ornith launches ~900
+kernels per iteration outside graphs (0.57 ms of small gaps in its verify).
+
+Measured gates:
+- All Qwen3.6 layers on the P100 (`-gs 0,15.9 -cs 8192`, fits): 28.12 ms/iter vs 27.70 split; verify GPU time 25.07 vs
+  24.75 ms. The 2060 is as fast per layer as the P100 at m = 2 (~550-600 us), the hand-off itself costs ~nothing. **Ruled out.**
+- Cross-GPU hand-off: no peer access between the two cards (either direction); a P100 -> 2060 -> P100 round trip of
+  2 x 2048 fp16 with two tiny kernels costs 59 us, an event ping-pong without data 50 us. An expert split across the GPUs
+  would pay >= 2 ms per m = 2 pass (40 layers) against an estimated <= 3 ms gross gain, and the 2060 cannot hold
+  ~40% of the experts. **Ruled out.**
+- Decode attention splits sized from the live length instead of the 16-page-padded block table (experiment: no
+  padding): split kernel P100 127 -> 96 us, 2060 97 -> 36 us; Qwen3.6 27.65 -> 27.25 ms/iter (+1.0%). The P100 cost is
+  then ~96 us for a single 32-token tile per program (255 registers): the kernel itself is the problem on sm_60.
+
 ## Done (newest first)
 
 | Date | Commit | What | Measured result |
@@ -127,6 +166,23 @@ MTP settings (35B, two prompts, 160 W): `-ndt 1` is the safe choice (57.3 t/s); 
 - Qwen3.8-Flash-Next (125B total, 512 experts): 30 GB of weights at 1.66 bpw plus a 20 GB n-gram table; needs CPU expert
   offload (`-mcs`, experimental) and ~50 GB of disk. Dropped for now.
 - Disk is nearly full (~12 GB free of 222 GB): the two 27B models and Ornith take ~50 GB.
+
+## Candidates towards 100 t/s (Nov 3, estimates from the Stage 0 budget, not measured unless stated)
+
+| # | Item | Qwen3.6 est. ms/iter | Ornith est. | Confidence |
+| :--- | :--- | ---: | ---: | :--- |
+| 1 | Decode attention: device-side split span from `cache_seqlens` (0.40 measured) + sm_60 per-program cost (~96 us -> ~20) | 1.0-1.3 | ~1.1 | high / medium |
+| 2 | Router GEMV + top-k (+ rotation) in one kernel or in the persistent MoE queue (P100 42.6 us/layer + 3 launches -> ~10) | 0.9-1.2 | ~0.6 | medium |
+| 3 | MoE m = 2 efficiency (~200 G weights/s vs 400-460 for the GEMV; latency-bound down stage) | 1.5-2.5 | 1.2-1.8 | low-medium, large effort |
+| 4 | Sparse draft head (`-sdh`, exists) for the m = 1 draft head | ~0.9 | ~1.5 | acceptance to be measured; changes the command line or a default |
+| 5 | Host: no `draft_conf` sync at window 1; MTP prefill + next draft as one m = 2 pass | 0.5-0.8 | 0.5-0.8 | medium |
+| 6 | sm_75 GEMV for K = 5 (2060 projections run the tile GEMM, 2.1 ms) | ~0.6 | - | medium |
+| 7 | P100 m = 2 EXL3 GEMV (issue-bound, 5.8 ms) | 0.6-0.9 | - | low |
+| 8 | Ornith: graphs for the fp16 layers; hgemv small shapes | - | 1.0-1.5 | medium |
+
+Sum for Qwen3.6: optimistic ~8 ms (27.7 -> ~19.7), midpoints ~6 ms (-> ~21.7 ms, ~89 t/s at 1.93 tok/iter, ~85 without
+`-sdh`). 19.7 ms needs every item at its optimistic end, including the MoE rewrite. Ornith needs 17.7 ms at 1.77 tok/iter;
+the list reaches ~21 ms (~84 t/s), so 100 t/s on Ornith is not reachable with these items.
 
 ## Ranking of next steps (Opus, Nov 1, estimates from code reading, none measured)
 
