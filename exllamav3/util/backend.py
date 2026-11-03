@@ -88,10 +88,10 @@ def attn_decode_config(device, hd_pad: int) -> tuple[int, int, int]:
 
 
 def attn_live_split(device) -> bool:
-    """EXL3_ATTN_LIVE_SPLIT=1: the decode split kernel divides the live kv length (read from cache_seqlens on the
+    """EXL3_ATTN_LIVE_SPLIT (default on, 0 disables): the decode split kernel divides the live kv length (read from cache_seqlens on the
     device) over its splits instead of the block-table bound the host derives split_len from. The generator pads
     the table to 16 pages, so at short contexts most splits idled while a few walked several tiles each"""
-    return os.environ.get("EXL3_ATTN_LIVE_SPLIT", "0") == "1"
+    return os.environ.get("EXL3_ATTN_LIVE_SPLIT", "1") == "1"
 
 
 # --- Turing (sm_75) prefill ---------------------------------------------------------------------------------

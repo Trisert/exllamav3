@@ -338,7 +338,7 @@ void exl3_moe_coop_launch_pair
     p.f_sh_done = ps.f_queue;
     p.f_sh_wait = pls.grid_b;
     const char* rp_env = std::getenv("EXL3_MOE_ROT_PAIR");   // per call: tests compare both forms in one process
-    const bool rot_pair = rp_env && std::atoi(rp_env) == 1;
+    const bool rot_pair = !rp_env || std::atoi(rp_env) != 0;   // default on, EXL3_MOE_ROT_PAIR=0 disables
     if (rot_pair && ps.a_global && p.a_global)
     {
         // One launch for both rotation pre-kernels (bit-identical: same per-warp work)

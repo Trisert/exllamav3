@@ -240,12 +240,12 @@ the model-level KL against SDPA is ~1e-3, below the 0.8e-3..5.4e-3 between the f
 cache. The switch is read per call. `1` forces it on any CUDA device (it is HFMA2 / fp32 SIMT code and
 runs from sm_60 up), `0` keeps SDPA.
 
-### `EXL3_ATTN_LIVE_SPLIT` (default: `0`)
+### `EXL3_ATTN_LIVE_SPLIT` (default: `1`)
 
 Flash-decoding split of the paged decode attention (`_paged_attn_decode_split_kernel`, also inside the
 graphed BC attention). By default the host sizes the splits from the block-table bound, and the generator
 pads the table to 16 pages (4096 tokens), so at short contexts a few splits walk several key tiles while
-the rest idle. `1` makes the kernel divide the live length (read from `cache_seqlens` on the device, so
+the rest idle. `1` (default since Nov 3; `0` restores the old split) makes the kernel divide the live length (read from `cache_seqlens` on the device, so
 graph replay stays valid) over the same splits, and on sm_60 / sm_75 uses 16-key tiles. Only the split
 boundaries move; the result equals the bound split up to the reduction order
 (`tests/kernels/attention/test_decode_live_split.py`). Microbenchmark (head_dim 256, 16 q / 2 kv heads,
@@ -679,14 +679,14 @@ tile, router widths up to 256 experts) runs the `routing_std_topk_kernel` code o
 Logits, indices and weights are bit-identical to the two launches (`tests/kernels/routing/test_router_fused.py`).
 Single rows keep `routing_gemv_kernel`. Read per call.
 
-### `EXL3_MOE_ROT_PAIR` (default: `0`)
+### `EXL3_MOE_ROT_PAIR` (default: `1`)
 
 For the dual persistent MoE launch (shared + routed experts, more than one row, e.g. an MTP verify step):
 the two input-rotation pre-kernels run as one launch, the blocks of the shared expert's rotation first.
 Same per-warp work, bit-identical (`tests/kernels/moe/test_moe_coop_fused.py::test_dual_shared_routed`).
 Read per call.
 
-### `EXL3_MTP_DEFER_CONF` (default: `0`)
+### `EXL3_MTP_DEFER_CONF` (default: `1`)
 
 Generator, MTP drafting with `-dds` and a one-token draft window: the window can never be cut, so the draft
 confidence is kept on the device and read once after verification (for the calibration labels) instead of a

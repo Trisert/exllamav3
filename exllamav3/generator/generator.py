@@ -31,10 +31,10 @@ from ..util import profile_opt
 # (launch-all-samplers, one pinned stage, one synchronize) path
 _NO_BATCH_READBACK = False
 
-# EXL3_MTP_DEFER_CONF=1: with a one-token MTP window the confidence-calibrated cut can never fire, so the draft
+# EXL3_MTP_DEFER_CONF (default on, 0 disables): with a one-token MTP window the confidence-calibrated cut can never fire, so the draft
 # confidence stays on the device and is read once after verification (calibration labels only) instead of a
 # blocking readback inside the draft step. Same tokens, same calibration
-_MTP_DEFER_CONF = os.environ.get("EXL3_MTP_DEFER_CONF", "0") == "1"
+_MTP_DEFER_CONF = os.environ.get("EXL3_MTP_DEFER_CONF", "1") == "1"
 
 class Generator:
 
