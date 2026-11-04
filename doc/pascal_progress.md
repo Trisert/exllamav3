@@ -9,6 +9,23 @@ Reference machine: Tesla P100 16 GB (SM 6.0, passively cooled, power cap 125 W, 
 (`-gs 4.0,15.0 -cs 32768 -cq 4`, MTP `-mtp -ndt 1 -dds`) with `examples/bench_chat.py`, `bench_chat_ab.sh` and
 `bench_prefill.py`. P100 cooled to <= 62 C before every run, builds alternated (ABAB); it throttles at 79 C.
 
+## Upstream sync (Nov 4): turboderp-org/exllamav3 v1.6.6 + LFM3 (branch `pascal-sync-v166`)
+
+Merged `upstream/master` into the fork (one conflict, `block_sparse_mlp.py` scratch buffer: kept `torch.zeros`, not verified
+that every sm_60 kernel writes every slot). Verified on the P100 (+2060 for the sm_75 kernels):
+
+- Kernel tests `gemm + moe + attention + routing`: 1469 passed, 59 skipped, 25 failed, all 25 in
+  `routing/test_routing_gemm_det.py`: the deterministic int8 routing GEMM is sm_80+ only by design
+  (`routing_gemm_det_fits` returns false for cc < 8, cuBLAS serves other arches) and the test does not gate on the arch.
+  Not a regression. `attention/test_fa75.py` and `test_prefill_sdpa_window.py` are sm_75 kernels: they crash on the P100
+  ("unspecified launch failure") and the crash poisons the CUDA context, which made ~370 later tests fail in a full run
+  (each file passes alone); on the 2060 they pass (49 passed, 8 skipped). Run them with `CUDA_VISIBLE_DEVICES=0`.
+- Decode on the merged build (`bench_chat.py`, MTP `-ndt 1 -dds`, one turn, run while the prefill agent shared the GPU):
+  Qwen3.6 70.90 t/s (94.8% accepted, was 72-73: re-measure on an idle GPU), Ornith 67.44 t/s (84.5%, was 65-69).
+- LFM3-1.7B quantised to 4.0 bpw (head 6 bpw): `models/LFM3-1.7B-exl3-4.0bpw`. The 2060 (5.6 GiB) ran out of memory on the
+  lm_head (vocab x hidden, 6 bpw); `convert.py -w <work> -r -d 0` resumed it on the P100 in 4 minutes. `chat.py` has no LFM
+  prompt mode, `-mode chatml` is the closest (`<|im_start|>`), untested.
+
 ## Target (set Nov 3 by the user)
 
 **100 t/s** with MTP (`-mtp -ndt 1 -dds`, `-gs 4.0,15.0 -cq 4`) on Qwen3.6-35B-A3B and on Ornith-1.5-35B-A3B, measured with
