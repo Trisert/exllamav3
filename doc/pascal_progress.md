@@ -21,7 +21,8 @@ that every sm_60 kernel writes every slot). Verified on the P100 (+2060 for the 
   ("unspecified launch failure") and the crash poisons the CUDA context, which made ~370 later tests fail in a full run
   (each file passes alone); on the 2060 they pass (49 passed, 8 skipped). Run them with `CUDA_VISIBLE_DEVICES=0`.
 - Decode on the merged build (`bench_chat.py`, MTP `-ndt 1 -dds`, one turn, run while the prefill agent shared the GPU):
-  Qwen3.6 70.90 t/s (94.8% accepted, was 72-73: re-measure on an idle GPU), Ornith 67.44 t/s (84.5%, was 65-69).
+  Qwen3.6 70.90 t/s (94.8% accepted) and Ornith 67.44 t/s (84.5%). Re-measured on an idle GPU (two runs each): Qwen3.6
+  73.97 / 74.05 t/s, Ornith 67.40 / 67.61 t/s. No regression against 72-73 and 65-69 before the merge.
 - LFM3-1.7B quantised to 4.0 bpw (head 6 bpw): `models/LFM3-1.7B-exl3-4.0bpw`. The 2060 (5.6 GiB) ran out of memory on the
   lm_head (vocab x hidden, 6 bpw); `convert.py -w <work> -r -d 0` resumed it on the P100 in 4 minutes. `chat.py` has no LFM
   prompt mode, `-mode chatml` is the closest (`<|im_start|>`), untested.
