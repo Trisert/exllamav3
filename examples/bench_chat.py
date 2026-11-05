@@ -35,7 +35,9 @@ def smi(index):
 
 @torch.inference_mode()
 def main(args):
+    t_load = time.time()
     model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(args)
+    print(f"LOAD {time.time() - t_load:.1f} s (incl. warmup)", flush = True)
     generator = Generator(
         model = model, cache = cache, tokenizer = tokenizer,
         draft_model = draft_model, draft_cache = draft_cache,
@@ -66,6 +68,9 @@ def main(args):
                 if r.get("eos"):
                     last = r
         context[-1] = (user, out)
+        if args.save_text:
+            with open(args.save_text, "a" if i else "w") as f:
+                f.write(out + "\n")
         post = smi(args.smi_index)
         new_tokens = last.get("new_tokens", 0)
         tps = new_tokens / (last.get("time_generate", 1e-6) or 1e-6)
@@ -93,6 +98,8 @@ if __name__ == "__main__":
     parser.add_argument("-max_new", "--max_new", type = int, default = 1000)
     parser.add_argument("-smi_index", "--smi_index", type = int, default = 0, help = "nvidia-smi index of the P100")
     parser.add_argument("-tag", "--tag", type = str, default = "run")
+    parser.add_argument("-save_text", "--save_text", type = str, default = None,
+                        help = "Write the generated text of every turn to this file (compare builds/kernels byte for byte)")
     parser.add_argument("-sample", "--sample", action = "store_true",
                         help = "Use the sampler of chat.py (temperature, min-p, ...) instead of greedy; the draft acceptance then drops")
     main(parser.parse_args())

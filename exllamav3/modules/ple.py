@@ -581,8 +581,11 @@ class PLELayer(Module):
         coming forward over input_ids on a worker thread (NGramEmbedding.prefetch), with the
         carried id context read from the recurrent state slots the forward will use. The gather
         then overlaps block 0. A history that doesn't match what forward() then builds is simply
-        not used, so this can only affect timing, never results.
+        not used, so this can only affect timing, never results. Not for model warmup, whose
+        lookups decode zero rows instead of reading the table (NGramEmbedding.forward).
         """
+        if params.get("tp_warmup"):
+            return
         history, _, _ = self._state_history(self._prepare_ids(input_ids), params)
         self.ple_embedding.prefetch(history)
 

@@ -260,17 +260,21 @@ class RowTable:
         return pin
 
     @torch.inference_mode()
-    def _stage(self, ids: torch.Tensor, pin: _PinSet, resolve) -> tuple:
+    def _stage(self, ids: torch.Tensor, pin: _PinSet, resolve, skip_read: bool = False) -> tuple:
         """Resolve + gather for ids into pin; returns the number of rows staged and whether they
         are in output order. Runs on the prefetch worker or inline (inference mode is
-        thread-local, and the staging buffers are inference tensors)."""
+        thread-local, and the staging buffers are inference tensors). skip_read: stage zero rows
+        instead of reading the table (model warmup, whose values are meaningless)."""
         if pin.event is not None:
             # the previous lookup's non_blocking uploads read this set; the generator issues
             # chunk forwards back to back with no host sync, so wait before rewriting it
             pin.event.synchronize()
         uids, in_order = resolve(ids, pin)
         U = uids.numel()
-        self._gather_rows(uids, pin.packed[:U])
+        if skip_read:
+            pin.packed[:U].zero_()
+        else:
+            self._gather_rows(uids, pin.packed[:U])
         return U, in_order
 
     def _match(self, ids: torch.Tensor) -> dict | None:
@@ -345,6 +349,7 @@ class RowTable:
         decode,
         device: torch.device,
         synced: bool = False,
+        skip_read: bool = False,
     ) -> torch.Tensor:
         """
         ids: contiguous int64 CPU ids
@@ -355,6 +360,10 @@ class RowTable:
         decode(rows, pin, U): stored rows on the device -> (U, dim) decoded rows
         synced: the caller guarantees a sync point before the next lookup (the generator's
             decode loop), so the uploads need no event to guard the staging set
+        skip_read: decode zero rows instead of reading the table (model warmup: the shapes and
+            kernels are the same, the values are meaningless; a random-id warmup chunk otherwise
+            costs ~35 s of random reads on a slow disk). A queued prefetch for the same ids is
+            still taken; nothing staged here outlives the call
         Returns the (n, dim) decoded rows on the device.
         """
         entry = self._match(ids)
@@ -366,7 +375,7 @@ class RowTable:
             self.prefetch_stats["miss"] += 1
             pin = self._acquire_pin(n)
         try:
-            U, in_order = entry["future"].result() if entry is not None else self._stage(ids, pin, resolve)
+            U, in_order = entry["future"].result() if entry is not None else self._stage(ids, pin, resolve, skip_read)
             out = decode(pin.packed[:U].to(device, non_blocking = True), pin, U)
             if not in_order:
                 out = out.index_select(0, pin.inverse[:n].to(device, non_blocking = True))

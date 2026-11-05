@@ -112,6 +112,18 @@ On ROCm both kernels run on RDNA's int8 WMMA instructions (`rocm/det_gemm_rocm.c
 per-chunk integer sums are exact and the fp32 combination keeps the same fixed order, so ranks
 agree across RDNA generations as well.
 
+### `EXL3_GR_MIX3` (default: on for compute capability < 8, off elsewhere; CUDA only)
+
+Kernel pair of the decode-sized gated-residual mix (`ext.gr_mix`, 1 to 4 rows, the Qwen3.8 shape
+D = 2560, rank 320). `1` runs `gr_dots_kernel3` / `gr_finalize_kernel3` (`hc_gr_decode3.cuh`): one
+stream per dots block, its rows held in shared memory, one fn row per warp, and a finalize that
+issues all its loads before the dots-dependent prologue and spreads the epilogue over the lanes.
+`0` runs the older `gr_dots_kernel2` / `gr_finalize_kernel2` pair. The outputs are bit-identical
+(same per-lane chunks, FMA order and reduction trees; `tests/kernels/hyperconnections/test_gr_mix_decode.py`).
+Unset picks `1` on Pascal and Turing, where it was measured (13 MB per site at 2 rows: P100 54-70 ->
+39 us, RTX 2060 80-100 -> 54 us), and keeps the older pair on sm_80+. Other shapes and row counts
+ignore the switch.
+
 ### `EXL3_BC_GDN` (default: `1`)
 
 Gated-delta-net (Qwen3-Next/3.5, KDA in GLM-5.3/Kimi Linear) counterpart of `EXL3_BC_ATTN`:

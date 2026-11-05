@@ -73,6 +73,7 @@ class NGramEmbedding(Module):
 
         self.table = None
         self.scale = None
+        self._skip_read = False     # set for the duration of a warmup lookup (forward)
         self.K = None               # None for an unquantized table
         self.num_rows = 0
         self.head_bias = None
@@ -338,7 +339,8 @@ class NGramEmbedding(Module):
             rows = packed.float()
             if self.scale is not None:
                 s = self.scale.lookup(pin.uids[:U], U, lambda ids, _: (ids, True),
-                                      lambda r, *_: (r.float() - 127.0).exp2(), packed.device)
+                                      lambda r, *_: (r.float() - 127.0).exp2(), packed.device,
+                                      skip_read = self._skip_read)
                 rows = (rows.view(U, s.shape[1], -1) * s.unsqueeze(-1)).view(U, -1)
             return rows
         heads = pin.heads[:U].to(packed.device, non_blocking = True)
@@ -372,5 +374,11 @@ class NGramEmbedding(Module):
         ids = x.to("cpu", torch.int64).contiguous()
         bsz = ids.shape[0]
         H = self.num_heads
-        out = self.table.lookup(ids, bsz * out_len * H, self._resolve, self._decode, self.device)
+        # Model warmup (tp_warmup) decodes zero rows: same shapes and kernels, no random table reads
+        self._skip_read = bool(params.get("tp_warmup"))
+        try:
+            out = self.table.lookup(ids, bsz * out_len * H, self._resolve, self._decode, self.device,
+                                    skip_read = self._skip_read)
+        finally:
+            self._skip_read = False
         return out.view(bsz, out_len, H * self.head_dim).to(out_dtype or self.out_dtype or torch.half)

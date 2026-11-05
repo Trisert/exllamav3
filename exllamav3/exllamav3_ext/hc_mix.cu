@@ -1268,6 +1268,8 @@ void hc_apply
 
 #if defined(USE_ROCM)
     #include "rocm/gr_dots_rdna.cuh"
+#else
+    #include "hc_gr_decode3.cuh"
 #endif
 
 void gr_mix
@@ -1280,7 +1282,9 @@ void gr_mix
     double rms_eps,
     at::Tensor dots,                     // (R, M + 1, H) float workspace
     c10::optional<at::Tensor> post,      // (R, H) float out, or none (final-mixer form)
-    at::Tensor mixed                     // (R, D) half or float out
+    at::Tensor mixed,                    // (R, D) half or float out
+    int64_t variant                      // decode kernels: 0 = gr_*_kernel2 pair, 1 = gr_*_kernel3 pair
+                                         // (hc_gr_decode3.cuh, R <= 4, bit-identical), -1 = 1 on cc < 8
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(streams.device());
@@ -1324,6 +1328,28 @@ void gr_mix
     (void) nch; (void) nit;
 #else
     const bool fast = R <= GR_MAX_R && D % 256 == 0 && (nch == 10 || nch == 16 || nch == 20) && (nit == 5 || nit == 8 || nit == 16) && LR % 2 == 0;
+#endif
+#if !defined(USE_ROCM)
+    if (fast && variant != 0)
+    {
+        bool use3 = variant == 1;
+        if (variant < 0)
+        {
+            int dev; cudaGetDevice(&dev);
+            static int cc_major[64] = {};
+            if (dev < 64 && !cc_major[dev]) { cudaDeviceProp p; cudaGetDeviceProperties(&p, dev); cc_major[dev] = p.major; }
+            use3 = dev < 64 && cc_major[dev] < 8;
+        }
+        // the kernel3 finalize reads the dots as float4 (H = 4)
+        use3 = use3 && ((uintptr_t) dots.data_ptr()) % 16 == 0;
+        if (use3 && gr_mix3_launch((const float*) streams.data_ptr(), ws_p, (const half*) fn.data_ptr(), w_p, (const half*) upt.data_ptr(),
+                                   (float*) dots.data_ptr(), post ? (float*) post.value().data_ptr() : nullptr, mixed.data_ptr(),
+                                   mixed.dtype() == at::kHalf, M, D, LR, R, (float) rms_eps, stream))
+        {
+            cuda_check(cudaPeekAtLastError());
+            return;
+        }
+    }
 #endif
     if (fast)
     {

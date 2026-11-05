@@ -95,7 +95,8 @@ void gr_mix
     double rms_eps,
     at::Tensor dots,
     c10::optional<at::Tensor> post,
-    at::Tensor mixed
+    at::Tensor mixed,
+    int64_t variant = -1
 );
 
 // Tiled deterministic GatedResidual mix for prefill row counts (hc_mix_tiled.cu)

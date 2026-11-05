@@ -151,7 +151,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("dequant_blocks", &dequant_blocks, "dequant_blocks");
     m.def("hc_mix_num_chunks", &hc_mix_num_chunks, "hc_mix_num_chunks");
     m.def("hc_apply", &hc_apply, "hc_apply");
-    m.def("gr_mix", &gr_mix, "gr_mix");
+    m.def("gr_mix", &gr_mix, "gr_mix", py::arg("streams"), py::arg("wstreams"), py::arg("fn"), py::arg("upt"), py::arg("w"),
+          py::arg("rms_eps"), py::arg("dots"), py::arg("post"), py::arg("mixed"), py::arg("variant") = -1);
     m.def("gr_mix_tiled", &gr_mix_tiled, "gr_mix_tiled");
     m.def("gr_mix_tiled_slices", &gr_mix_tiled_slices, "gr_mix_tiled_slices");
     m.def("routing_std", &routing_std, "routing_std");

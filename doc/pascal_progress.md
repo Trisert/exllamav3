@@ -163,6 +163,33 @@ Gains are per MTP iteration of the best configuration found (`-mcs 256 -mtp -ndt
 | 10 | QSA at long context: the 2060's `_dsa_indexer_fewq_kernel` takes 189 us/layer at 21k against ~37 us on the P100's eager-sized config (sparse split ~140 us on both), so the sm_75 indexer configuration looks wrong rather than slow; cheap probe: the eager tile size on sm_75 | ~1-2 ms at 21k tokens, nothing below ~2k | low-medium |
 | - | Ruled out: `-mct 15` (SMT siblings slower), `-mcl` < 24 (does not fit), `-ngr` (RAM), `-mcs 288 -mcpa` (no gain over warm `-mcs 288`, fit marginal) | | |
 
+### Qwen3.8-Flash-Next: gated residual decode kernels and warmup n-gram skip (Nov 5, candidates #2 and #8)
+
+- `EXL3_GR_MIX3` (default on for cc < 8): new `gr_dots_kernel3` / `gr_finalize_kernel3` (`hc_gr_decode3.cuh`) for
+  R <= 4 on the D 2560 / rank 320 shape. Old dots used 255 registers (2 blocks/SM, 2-3 waves) and re-read 4 stream rows
+  from L2 per fn pair; new dots: one stream per block in shared memory, one fn row per warp (53-84 regs). New finalize:
+  R templated, up loads and prologue dots loads issued before the first barrier, epilogue spread over the lanes.
+  **Bit-identical** to the old pair (`tests/kernels/hyperconnections/test_gr_mix_decode.py`, 36 cases, both GPUs).
+- Microbenchmark (13 MB per site, cold tables, ext flags): P100 read peak ~450-520 GB/s (not 240).
+
+| per site, us | P100 R = 1 | P100 R = 2 | 2060 R = 1 | 2060 R = 2 |
+| :--- | ---: | ---: | ---: | ---: |
+| old pair (weighted / unweighted) | 51-55 / 66-70 | 54-58 / 70-75 | 73-86 / 96-100 | 78-80 / 100 |
+| new pair | 34 | 39 | 50-54 | 54-55 |
+
+- `bench_chat` ABAB (`-mcs 256 -mtp -ndt 1 -dds`, same restored expert profile each run): new 32.33 / 32.11 t/s, old
+  (`EXL3_GR_MIX3=0`) 30.47 / 30.41 t/s: **+5.9%**, acceptance 96.1% in all four, generated text byte-identical (md5).
+- Tried and dropped: one-launch ticketed dots+finalize (slower on the P100, 39 -> 45 us), finalize with one warp per
+  (column, stream) (no gain).
+- Warmup n-gram skip: warmup lookups (`tp_warmup`) decode zero rows instead of reading the table, and the PLE prefetch is
+  skipped in warmup (warmup routing is randomized anyway, so the expert profile is unaffected). Warmup 40.2-40.6 s in the
+  four runs above vs ~72 s in Stage 0 (different session, not an A/B); total load 152-163 s, dominated by the weight
+  read from the USB SSD. Test: `test_warmup_skips_table_reads` (real table, disk mode).
+- Open: in-model profiler of the new kernels (harness window was too short for MTP, `PROFNEW` must be > 2x `PROFFROM + 30`);
+  a load-time A/B against the old warmup; transposed (fewer-shuffle) finalize reduction (~1 us/site est.); 8-bit
+  gated-residual tables (#5). Pre-existing, unrelated: `test_embedding_table.py::test_quantize_embedding[2-*]` fails
+  on the P100 (`quantize.cu:144` invalid argument).
+
 ## Target (set Nov 3 by the user)
 
 **100 t/s** with MTP (`-mtp -ndt 1 -dds`, `-gs 4.0,15.0 -cq 4`) on Qwen3.6-35B-A3B and on Ornith-1.5-35B-A3B, measured with
