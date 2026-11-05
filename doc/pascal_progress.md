@@ -323,6 +323,33 @@ not byte-bound, so the floor is not reachable; m = 1 costs ~17 us per expert, an
   ~0.2 ms); the dual kernels spill 24-64 B at the 128-register cap; per distinct expert the 1.5 bpw staged decode
   (`dq_dispatch`, HALF) is now the cost.
 
+### Qwen3.8-Flash-Next: dual-kernel empty-row race fixed; full-reply ndt sweep (Nov 5, branch `flash-fix-ndt`)
+
+- **Race (was in Known issues), real and fixed.** A token row with no active routed slot (all picks CPU-side under
+  `-mcs`, or all weights zero) is written by `write_empty_row_chunk` (gated shared term only). In the dual kernel that
+  ran in the rotation pre-kernel (bsz > 1) or a routed A item (bsz 1), before the same launch's shared down items:
+  stale `sh_out`. `tests/kernels/moe/test_moe_coop_dual_empty.py` (15 cases, NaN-filled `sh_buf`) failed 15/15 on
+  the old build. Fix: those writes are skipped when `p.f_sh_wait` is set and the last shared down item (atomic on
+  `f_sh_done`) writes all empty rows. Bit-identical to the separate launches; moe tests 368 + 2 skipped (P100),
+  370 (2060). Cost: none measurable, `exl3_moe_coop_pair` microbench (h1 + 5 bpw, ABAB) 689 -> 681 us at m = 4,
+  223 -> 218 at m = 1.
+- Greedy text is not reproducible across loads at full reply length (same config, different md5 and length):
+  identical-text controls are not available here; use >= 3 loads.
+- Full replies (`bench_chat -max_new 3000`, all ran to EOS; `EXL3_AUTOSPLIT_MARGIN_MB=64` needed to load since desktop
+  apps now hold ~570 MiB on the 2060; profiles restored before each load; `-sdh 16384`, no `-dds`), 3 loads each:
+
+| prompt | config | t/s | tokens / step | acceptance | reply tokens |
+| :--- | :--- | ---: | ---: | ---: | :--- |
+| code (quicksort go) | `-ndt 3` | 31.67 (32.2 / 30.4 / 32.5) | 3.32 | 77.2% | 898-942 |
+| code | `-ndt 2` | 30.15 (30.5 / 30.4 / 29.6) | 2.70 | 84.7% | 897-905 |
+| prose (Roman Republic) | `-ndt 3` | 17.48 (16.8 / 17.9 / 17.7) | 1.88 | 29.3% | 1373-1755 |
+| prose | `-ndt 2` | 19.63 (19.8 / 19.6 / 19.5) | 1.81 | 40.4% | 1509-1900 |
+
+  Prose drafts far worse than code (29-40% vs 77-85%; sparse-head miss rate 0%, so not the `-sdh` subset). Code
+  favours ndt 3 (+5%), prose ndt 2 (+12%). Not measured (stopped on request): `-ndt 1`, `-dds` at any ndt,
+  `-sdh 0 / 8192 / 32768`, `-dc`. With 1.8 tokens per step on prose, `-ndt 1` is the likely prose winner.
+- `bench_chat` now prints tokens per step ((new - 1) / (new - 1 - accepted)) and the sparse-head miss rate / mode.
+
 ## Target (set Nov 3 by the user)
 
 **100 t/s** with MTP (`-mtp -ndt 1 -dds`, `-gs 4.0,15.0 -cq 4`) on Qwen3.6-35B-A3B and on Ornith-1.5-35B-A3B, measured with
@@ -470,11 +497,6 @@ MTP settings (35B, two prompts, 160 W): `-ndt 1` is the safe choice (57.3 t/s); 
 - Triton prefill attention on sm_60 (illegal memory access, predates the fork).
 
 ## Known issues
-
-- (Nov 5) Dual MoE kernel with expert-range masking (`-mcs` CPU split, now reachable through `EXL3_MOE_COOP_DUAL_H`):
-  a token whose routed picks all lie outside the GPU range gets its output row from `write_empty_row_chunk` (rotation
-  pre-kernel / first A item), which reads the shared expert's output before the same launch has produced it. Rare
-  (~92% of slots are GPU-resident under `-mcs 256`), not observed; `EXL3_MOE_COOP_DUAL_H=0` avoids it.
 
 - `tests/kernels/routing/test_routing_gemm_det.py`: 25 failures on both the P100 and the RTX 2060 (the int8 deterministic
   router GEMM needs sm_80; the test skips only builds without it). Untouched code. Stage 1 check (Nov 3): gemm + moe 672

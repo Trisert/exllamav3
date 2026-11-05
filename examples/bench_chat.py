@@ -80,8 +80,12 @@ def main(args):
         if "accepted_draft_tokens" in last:
             a = last["accepted_draft_tokens"]
             d = a + last["rejected_draft_tokens"]
-            line += f" | draft {a}/{d} ({100 * a / max(d, 1):.1f}%)"
+            # the prefill emits the first token; every step after it its accepted drafts plus one of its own
+            line += f" | draft {a}/{d} ({100 * a / max(d, 1):.1f}%) | {(new_tokens - 1) / max(new_tokens - 1 - a, 1):.2f} tok/step"
             accept.append(a / max(d, 1))
+        sh = generator.sparse_head
+        if sh is not None:
+            line += f" | sdh miss {100 * sh.miss_rate:.1f}% {'on' if sh.mode_sparse else 'off'} ({sh.mode_switches} sw)"
         line += f" | P100 {pre} -> {post}"
         print(line, flush = True)
         gen_rates.append(tps)
