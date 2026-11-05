@@ -190,6 +190,79 @@ Gains are per MTP iteration of the best configuration found (`-mcs 256 -mtp -ndt
   gated-residual tables (#5). Pre-existing, unrelated: `test_embedding_table.py::test_quantize_embedding[2-*]` fails
   on the P100 (`quantize.cu:144` invalid argument).
 
+### Qwen3.8-Flash-Next: draft length and MTP step profile (Nov 5, measured)
+
+New best: **`-gs 4.0,15.0 -cs 8192 -cq 4 -mcs 256 -mtp -ndt 3 -sdh 16384`**, `bench_chat` **43.42 t/s** (88.6% of
+drafts accepted). `-ndt 3` without `-sdh`: `bench_chat` 40.08 t/s (82.9%). Previous best `-ndt 1 -dds`: 32.2.
+
+Method: one load per sweep (`tmp/ndt/ndt_body.py`): a fresh `Generator` per run (cold dds calibrator, as in `bench_chat`),
+greedy, code prompt, 300 tokens, `time_generate`, P100 cooled to <= 62 C before each run, one throwaway run per draft width
+first. All runs produced byte-identical text (one md5), as greedy verification should. Two loads, ABAB orders.
+
+| config | t/s (runs) | tokens / step | ms / step | conditional acceptance, positions 1 / 2 / 3 / 4 |
+| :--- | :--- | ---: | ---: | :--- |
+| `-ndt 1 -dds` | 35.02 (4), 34.91 (2) | 1.96 | 56.4 | 96.1 |
+| `-ndt 1` | 34.97 (2) | 1.96 | 56.4 | 96.1 |
+| `-ndt 2 -dds` | 36.34 (4; 37.3 without one 34.1 outlier) | 2.80 | 75.4 | 97.2 / 85.6 |
+| `-ndt 2` | 37.13 (2) | 2.80 | 75.6 | 97.2 / 85.6 |
+| `-ndt 3 -dds` | 40.10 (2) | 3.45 | 86.3 | 95.4 / 84.3 / 89.6 |
+| `-ndt 3` | 40.63 (2), 40.23 (3) | 3.49 | 86.6 | 95.3-97.7 / 82-85 / 88.5 |
+| `-ndt 3 -sdh 16384` | 43.80 (3) | 3.66 | 84.0 | 97.5 / 90.4 / 92.2 (warm token profile) |
+| `-ndt 4`, `-ndt 4 -dds` | 39.90 (2), 39.95 (2) | 4.05 | 102 | 97.3 / 83.3 / 85.0 / 84.3 |
+
+- Unlike Qwen3.6, extra draft positions pay: the MTP head keeps ~85-90% conditional acceptance at positions 2-3, and the
+  step cost grows sub-linearly (m = 2 -> 4: 56 -> 87 ms for 1.96 -> 3.49 tokens, 28.8 -> 24.8 ms per token). `-ndt 4`
+  costs +16 ms per step for +0.56 tokens (no gain; m = 5 also leaves the `GR_MIX3` R <= 4 path). `-dds` never helps here
+  (it only truncates; acceptance is high), so drop it.
+- `-sdh 16384` at ndt 3: +8.9% (harness, 40.2 -> 43.8), `bench_chat` 40.08 -> 43.42 (+8.3%). It removes the draft head's
+  three full-vocab m = 1 GEMVs (1.1 ms each on the P100) and, oddly, raised acceptance (82.9 -> 88.6% in `bench_chat`). Cold
+  start: the first `-sdh` run of the load (token profile from earlier Qwen3.6 runs) fell to 77.7% / 33.2 t/s; afterwards
+  normal. `~/.cache/exllamav3/token_stats` now holds this model's profile.
+- First generation after a load is slower: run 0 at ndt 1 was 61.9 ms/step vs 56.4 later (32.0 vs 35.0 t/s). That is why
+  single-turn `bench_chat` at ndt 1 reads ~32 against 35 in the warm harness; at ndt 3 the two agree (40.1 / 40.2).
+
+**MTP step profile** (torch.profiler, 80 decode iterations after 40 warmup iterations, 480-token job; profiled wall is ~8 ms per
+step above the unprofiled one, mostly host-side). ms per step, real kernels only (spans of the CPU-expert stream wait excluded):
+
+| | ndt 1 -dds (m = 2) | ndt 2 -dds (m = 3) | ndt 3 (m = 4) |
+| :--- | ---: | ---: | ---: |
+| profiled wall (unprofiled) | 57.8 (56.4) | 77.5 (75.4) | 94.9 (86.6) |
+| P100 busy / 2060 busy / both at once | 43.3 / 8.6 / 0.0 | 59.1 / 11.1 / 1.3 | 66.0 / 13.3 / 0.05 |
+| no GPU kernel running | 6.0 | 8.7 | 15.6 (~7 unprofiled) |
+| P100 MoE coop (`coop_f<1>` per layer, x37) | 19.9 (302 us) | 24.8 (389 us) | 28.7 (468 us) |
+| P100 EXL3 GEMV/GEMM, incl. lm_heads | 13.2 | 21.5 | 22.4 |
+| -- 5 bpw `exl3_gemv_kernel<5,true,2,M,..>` x60 / x41 | 74 / 83 us (M = 2) | 125 / 113 us (M = 1) | 126 / 113 us (M = 1) |
+| -- main lm_head (4 bpw) / draft lm_head (m = 1, 1.1 ms each) | 1.3 / 1.1 | 2.4 / 2.2 | 2.4 / 3.3 |
+| P100 gated residual (`gr_*_kernel3`) | 5.0 | 6.7 | 8.3 |
+| P100 GDN / attention / router + hc | 1.8 / 1.7 / 0.9 | 2.2 / 2.1 / 0.9 | 2.5 / 2.1 / 0.9 |
+| 2060 MoE / GEMV-GEMM / gated residual | 2.9 / 3.8 / 1.1 | 4.0 / 4.3 / 1.5 | 5.0 / 4.9 / 2.0 |
+
+- At m >= 3 the P100 5 bpw GEMV switches from the 2-row variant (template M = 2, 74 us at m = 2) to the 1-row one
+  (M = 1, 125 us for m = 3 and for m = 4): from m = 2 to 3, GEMV jumps +8.3 ms, then +0.9 ms to m = 4. The main lm_head
+  shows the same thing (1.3 -> 2.4 ms). At m >= 3 an extra `exl3_moe_coop_f_kernel<5, 2, false>` (182 us x41, 7.5 ms)
+  also appears; its m = 2 counterpart is not in the top list. Not identified yet (shared expert or split path).
+- The two GPUs never overlap (0.05 ms): the 2060's 13.3 ms is pure serial time on top of the P100's 66.
+- CPU expert worker (`EXL3_MOE_CPU_PROF`, separate load, per job, all phases): 207 us at ndt 1, 252 us at ndt 3, 259 us at
+  ndt 4; ~13 jobs per step at ndt 1, ~22 at ndt 3, so ~2.8 / ~5.5 ms busy per step. Unprofiled, the no-GPU time at ndt 3
+  is ~7 ms (profiled 15.6 minus the ~8 ms profiler inflation), so most of the CPU work now shows as GPU idle time.
+  Runtime toggling with `exl3_moe_cpu_set_prof` does not work (read at worker startup), so set the env var before loading.
+
+**Re-ranked next steps** (base: `-ndt 3 -sdh 16384`, ~84 ms per step, 3.66 tokens, 43.4 t/s `bench_chat`; target 40-55 t/s,
+55 t/s = 66.5 ms per step at this acceptance):
+
+| # | Candidate | Est. gain, ms per step | Risk / effort |
+| :--- | :--- | ---: | :--- |
+| 1 | P100 5 bpw GEMV at m = 3-4: use the 2-row variant (M = 2, two row pairs) or a 4-row one in place of M = 1 (126 / 113 us). Cheap probe first: dispatch m = 4 as two m = 2 calls, or relax the M choice in `exl3_gemv_cfg`; the main lm_head gets the same fix | 3-5 (+ ~1 lm_head) | low-medium (dispatch first, kernel only if needed) |
+| 2 | Identify the m >= 3 `coop_f<5, 2, false>` launch (7.5 ms); if it is the shared expert or a fallback that runs at m = 2 through a cheaper path, route m = 3-4 the same way | 2-4 | low to find out, medium to fix |
+| 3 | P100 MoE coop `coop_f<1>` at m = 4 (468 us x37 = 17.3 ms, decode-compute-bound; union of ~2x the experts) | 4-6 for 25-35% faster | high effort |
+| 4 | Gated residual at m = 4 (8.3 + 2.0 ms): 8-bit tables (bytes halve; R = 4 still fits `GR_MIX3`) | 3-4 | medium (mixing accuracy) |
+| 5 | CPU expert time at m = 4 (~5.5 ms busy, ~7 ms no-GPU): `-mct 8`, more GPU expert slots (VRAM freed by #4), or start the CPU job earlier | 1-3 | low (config) to medium |
+| 6 | 2060 K = 5 GEMV (old #6; 2060 GEMV/GEMM 4.9 ms at m = 4) | ~1 | low |
+| 7 | `-sdh` cold start: ship or pre-seed the token profile (first run of a load at 77.7% acceptance) | first-run only | low |
+| - | Measured, no gain: `-ndt 4` (39.9 t/s vs 40.2 at ndt 3), `-dds` at any ndt. `-ndt 4 -sdh` not tested | | |
+
+#1 + #2 + #4 together (~10 ms) would give ~74 ms per step, ~49 t/s. 55 t/s also needs #3.
+
 ## Target (set Nov 3 by the user)
 
 **100 t/s** with MTP (`-mtp -ndt 1 -dds`, `-gs 4.0,15.0 -cq 4`) on Qwen3.6-35B-A3B and on Ornith-1.5-35B-A3B, measured with
