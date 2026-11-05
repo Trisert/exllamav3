@@ -116,6 +116,10 @@ MoeCoopKernel exl3_moe_coop_kernel_d_r2(int bits_s, int cb, int Hi);
 MoeCoopKernel exl3_moe_coop_kernel_d_r3(int bits_s, int cb, int Hi);
 MoeCoopKernel exl3_moe_coop_kernel_d_r4(int bits_s, int cb, int Hi);
 
+// Dual kernel with half-integer routed rates (K + 0.5, mul1 codebook only) and an integer-rate shared expert of
+// 4..6 bits (exl3_moe_coop_inst_dh.cu); null for other combinations
+MoeCoopKernel exl3_moe_coop_kernel_d_h(int bits_r, int bits_s, int cb, int Hi);
+
 #define EXL3_MOE_COOP_D_SMEM(R, S) \
     max(max(smem_a_bytes<R>(Hi), smem_b_bytes<R>()), max(smem_a_bytes<S>(Hi), smem_b_bytes<S>()))
 

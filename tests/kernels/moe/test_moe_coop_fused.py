@@ -89,13 +89,13 @@ def _scratch(smax, rows, Hi, I, Ho, device, fused):
     ]
 
 
-@pytest.mark.parametrize("bsz", [1, 2, 8])
-@pytest.mark.parametrize("cb,K,K_sh", [(2, 3, 5), (2, 3, 3), (1, 3, 4), (2, 2, 4), (1, 4, 6)])
+@pytest.mark.parametrize("bsz", [1, 2, 4, 8])
+@pytest.mark.parametrize("cb,K,K_sh", [(2, 3, 5), (2, 3, 3), (1, 3, 4), (2, 2, 4), (1, 4, 6), (2, 1.5, 5), (2, 2.5, 4)])
 def test_dual_shared_routed(device, cb, K, K_sh, bsz):
     """Shared + routed experts in one persistent launch (exl3_moe_coop_pair, the BC_BlockSparseMLP decode path)
     against the shared launch followed by the routed launch, bit for bit"""
     Hi, I, Ho, E, topk = 2048, 512, 2048, 64, 8
-    gen = torch.Generator().manual_seed(1000 + 10 * K + K_sh + bsz)
+    gen = torch.Generator().manual_seed(int(1000 + 10 * K + K_sh + bsz))
     keep = []
     def tabs(E_, K_):
         out = []
