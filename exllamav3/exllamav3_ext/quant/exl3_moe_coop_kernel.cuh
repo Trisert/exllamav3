@@ -693,7 +693,9 @@ __device__ __forceinline__ int token_active_slots(const MoeCoopParams& p, int ro
 
 // A token with no active slot on this rank (expert-parallel sharding: every pick lives elsewhere)
 // gets no arrival in the down stage, so nobody would write its output row. Writes one 128-chunk of
-// that row: the shared-expert term when there is one, else zeros. Warp-level
+// that row: the shared-expert term when there is one, else zeros. Warp-level. In the dual kernel
+// (p.f_sh_wait) the shared output is produced by the same launch, so these rows are written by the
+// last shared down item (write_empty_rows) instead of the rotation pre-kernel / gate-up stage
 __device__ __forceinline__ void write_empty_row_chunk(const MoeCoopParams& p, int row, int chunk, int lane)
 {
     const int col = chunk * 128 + lane * 4;
@@ -717,10 +719,10 @@ __device__ __forceinline__ void write_empty_row_chunk(const MoeCoopParams& p, in
             gv = 1.0f / (1.0f + __expf(-dot));
         }
         const float* sh = p.sh_out + (size_t) row * p.H + col;
-        if (col + 0 < p.H) o0 = gv * sh[0];
-        if (col + 1 < p.H) o1 = gv * sh[1];
-        if (col + 2 < p.H) o2 = gv * sh[2];
-        if (col + 3 < p.H) o3 = gv * sh[3];
+        if (col + 0 < p.H) o0 = gv * __ldcg(sh + 0);
+        if (col + 1 < p.H) o1 = gv * __ldcg(sh + 1);
+        if (col + 2 < p.H) o2 = gv * __ldcg(sh + 2);
+        if (col + 3 < p.H) o3 = gv * __ldcg(sh + 3);
     }
     float* dst = p.out + (size_t) row * p.out_stride + col;
     if (col + 3 < p.H_out)
@@ -731,6 +733,17 @@ __device__ __forceinline__ void write_empty_row_chunk(const MoeCoopParams& p, in
         if (col + 1 < p.H_out) dst[1] = o1;
         if (col + 2 < p.H_out) dst[2] = o2;
     }
+}
+
+// Every empty token row of the call, one block (dual kernel, after the shared down stage)
+__device__ __forceinline__ void write_empty_rows(const MoeCoopParams& p)
+{
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    for (int row = 0; row < p.bsz; ++row)
+        if (token_active_slots(p, row) == 0)
+            for (int oc = warp; oc < p.Ho / 128; oc += THREADS / 32)
+                write_empty_row_chunk(p, row, oc, lane);
 }
 
 // Input rotation of one 128-chunk of a slot's x row: zero-padded from H to Hi, * suh, Hadamard
@@ -780,7 +793,7 @@ void moe_coop_rot_body(const MoeCoopParams& p, const int bidx)
     {
         // Empty token row (no active slot on this rank): its first slot's warps write the output
         // chunks c, c + chunks, ... (Hi chunks vs Ho chunks may differ)
-        if (rem % nproj == 0 && s % p.topk == 0 && token_active_slots(p, si.row) == 0)
+        if (!p.f_sh_wait && rem % nproj == 0 && s % p.topk == 0 && token_active_slots(p, si.row) == 0)
             for (int oc = c; oc < p.Ho / 128; oc += chunks)
                 write_empty_row_chunk(p, si.row, oc, lane);
         return;
@@ -859,7 +872,7 @@ __device__ __forceinline__ void a_item(const MoeCoopParams& p, const int item, u
     {
         // bsz 1: an inactive slot's blocks (up projection, split 0) write the output chunks of an
         // empty token row, one warp per chunk, strided by the number of gate/up groups
-        if (!p.a_global && run_idx < p.bsz * p.topk && !is_gate && ks == 0 && run_idx % p.topk == 0)
+        if (!p.a_global && !p.f_sh_wait && run_idx < p.bsz * p.topk && !is_gate && ks == 0 && run_idx % p.topk == 0)
         {
             const int row = run_idx / p.topk;
             if (token_active_slots(p, row) == 0)
@@ -1231,7 +1244,15 @@ void exl3_moe_coop_d_kernel(const MoeCoopParams p, const MoeCoopParams ps)
             b_item<bitsS, cb, true, false, true>(ps, t, smem_dyn, ss);
             __threadfence();
             __syncthreads();
-            if (threadIdx.x == 0) atomicAdd(p.f_sh_done, 1);
+            if (threadIdx.x == 0) ss.flag = atomicAdd(p.f_sh_done, 1) == n_sb - 1;
+            __syncthreads();
+            if (ss.flag)
+            {
+                // Last shared down item: the shared output is complete, write the empty token rows
+                __threadfence();
+                write_empty_rows(p);
+            }
+            __syncthreads();
             continue;
         }
         t -= n_sb;
