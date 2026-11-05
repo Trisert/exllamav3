@@ -9,6 +9,213 @@ Reference machine: Tesla P100 16 GB (SM 6.0, passively cooled, power cap 125 W, 
 (`-gs 4.0,15.0 -cs 32768 -cq 4`, MTP `-mtp -ndt 1 -dds`) with `examples/bench_chat.py`, `bench_chat_ab.sh` and
 `bench_prefill.py`. P100 cooled to <= 62 C before every run, builds alternated (ABAB); it throttles at 79 C.
 
+## Strategy: paths forward (Nov 6)
+
+Desk analysis (no GPU runs): this log, `doc/env_vars.md`, the kernel and generator sources, the local model files and
+web sources. Labels: **[M]** measured on this machine (where in this file or the code), **[D]** derived by arithmetic from
+measured numbers, **[E]** estimate, **[L]** literature or third-party. The Qwen3.8-27B Stage 0 profile (branch
+`dense27-stage0`) was running when this was written; every 27B kernel item below depends on it.
+
+Use case: local coding agents (long contexts, tool outputs re-read every turn, mostly code out), 27B in non-thinking
+mode with the model-card sampling (temp 0.7, top_p 0.8, top_k 20, presence 1.5).
+
+### Findings that change the plan
+
+1. **For agents, prefill dominates the turn, not decode.** A turn in an agent session is "new tool output in, a short
+   tool call out". With 2500 new tokens and 300 output tokens per turn [E: assumed workload], prefill from the measured
+   curves (27B 159 / 169 / 124 / 85 / 75 t/s at 0.5k / 2k / 8k / 16k / 30k tokens, heat-limited from 8k [M, "Done"];
+   35B 440-796 [M]; Flash-Next 196-237 up to 16k [M]; beyond the measured range [E]):
+
+   | seconds per turn (prefill + decode) | 10k context | 50k | 100k |
+   | :--- | ---: | ---: | ---: |
+   | 27B, today (heat-limited prefill, `-ndt 2` decode 28 t/s) | 22 + 11 = 33 | 39 + 12 = 50 [E] | 50 + 12 = 62 [E] |
+   | 27B, P100 not throttling (prefill at kernel speed [E]) | 17 + 11 = 27 | 21 + 12 = 33 | 28 + 12 = 40 |
+   | Qwen3.6-35B-A3B 3 bpw | 3 + 4 = 8 | 5 + 4 = 10 [E] | 7 + 5 = 11 [E] |
+   | Flash-Next `-ndt 3`, full replies (32 t/s) | 11 + 9 = 21 | 12 + 10 = 23 [E] | 14 + 11 = 25 [E] |
+
+   Prefill is 65-80% of a 27B turn. The kernel-speed column assumes 170 t/s for the GEMMs plus attention that grows
+   with context: 16 layers x 24 heads x 256 x 4 FLOP per key = 0.39 MFLOP per token per 1k of context, against 54 GFLOP
+   per token for the weights, so at 50k / 100k attention adds +36% / +73% of the FLOPs (at fa60's lower efficiency
+   ~1.2x that) [D]. The 75 t/s at 30k is heat (400-900 MHz instead of 1328) [M], so **cooling the P100 is the largest
+   single prefill lever** for the 27B, and it costs no agent time.
+2. **The 27B decode floor is not the ~30 ms bandwidth floor.** Weights read per token: decoder 11.39 GiB (MLP 7.98,
+   GatedDeltaNet 2.63, attention 0.78) + lm_head 0.89 GiB (6 bpw) = 12.28 GiB [M: safetensors headers; the 2.37 GiB
+   embedding is a CPU table, the vision tower is not read]. At the measured read peaks (P100 450-590 GB/s, 2060 280-300)
+   with 16 of 64 layers on the 2060 that is 27-33 ms [D]. But the EXL3 GEMV is issue-bound on both cards: P100
+   17408 x 5120 at 4 bpw takes 212 us at m = 1 = 420 G weights/s, 210 GB/s [M: comment in `exl3_gemv.cu`]; the 2060
+   runs 16 layers of the 27B in 18 ms = 340 G weights/s [M: `EXL3_GEMV_SM75` entry]. 19.6 G weights on the P100 (incl.
+   lm_head) / 420 G/s + 6.1 G on the 2060 / 340 G/s = **47 + 18 = 65 ms, which is the measured plain decode** [D]. The
+   whole 27B decode is the GEMV at its current per-weight cost; GDN, attention and norms are in the noise of this
+   estimate (Stage 0 will give the real split). The ideal ~8.6 issue slots per weight (~550 G weights/s on the P100 at
+   1328 MHz) would give ~36 + 18 = 54 ms [D], so the kernel headroom left in the P100 GEMV is ~20-25%, not 2x.
+   Corollary: **on sm_60 fewer bits do not buy decode speed** (cost scales with weights, not bytes; weak evidence: the
+   K = 3 5120 x 17408 GEMV at ~0.3 ms vs K = 4 17408 x 5120 at 212 us, different shapes [M, code comments]). Do not go
+   below 4 bpw on the 27B for speed.
+3. **The 2-GPU pipeline costs the 27B ~18 of 65 ms**, and tensor parallelism is the only lever that removes it. The two
+   GPUs never overlap in one stream [M]. Upstream has TP (`-tp`, `native` backend: all-reduce through pinned host memory,
+   sm_60 fallbacks for the acquire/release loads in `ptx.cuh` exist) and the MTP head borrows the target lm_head in TP
+   mode (`Model.lm_head_argmax`); `-sdh` is disabled under TP (`generator.py` line 449), CPU MoE offload asserts
+   layer-split (so no TP for Flash-Next), BC graph paths fall back under TP (eager decode). Never tried on this fork.
+   Bound for the 27B: a full layer set costs 72 ms on the 2060 and 58 ms on the P100 [D, from point 2]. The 2060 can
+   hold ~35% of each layer (5.6 GiB minus ~0.57 GiB of desktop, minus cache and scratch [M/E]), so TP time =
+   max(0.35 x 72, 0.65 x 58 + 3.3 lm_head) = 41 ms + 128 all-reduces per token (2 per layer; 15-50 us each [E: the
+   cross-GPU event ping-pong is 50 us, M]) = **43-48 ms vs 65 (x1.35-1.5 plain)**; MTP steps scale alike [E]. Prefill:
+   the 2060 takes ~35% of the FLOPs instead of 25% of the layers [E: x1.2-1.35, and less P100 heat]. For Qwen3.6 the
+   2060's serial share is 5.5 of 27.7 ms [M] minus ~80 all-reduces: <= ~10% [E], not worth it.
+4. **PCIe: the P100 sits on a gen3 x4 link, the 2060 on gen3 x16** [M: `/sys/bus/pci/devices/0000:03:00.0`
+   (0x15f8) `current_link_width` 4, max 16; `0000:06:00.0` (0x1f08) x16; cross-check with `nvidia-smi -q`]. ~3.5 GB/s
+   to the P100 caps TP prefill all-reduces (42 MB per all-reduce at a 4096-token chunk, 128 per chunk: ~1.5 s per
+   ~24 s chunk [D]) and the GPU-streamed experts of Flash-Next prefill (`EXL3_MOE_STREAM_T` scales its threshold with
+   the probed link rate). Moving the P100 to the CPU-attached x16 slot is a user decision worth checking.
+5. **Presence penalty is applied over the prompt too.** `SS_PresFreqP` penalizes every token found in `past_ids`, which
+   is the whole `sequence_ids` (prompt + output; `job.prepare_sampling_past_ids`), windowed to the last sustain + decay
+   tokens (`rep_pen.cu`; `chat.py` defaults both to `-penr` 1024, so full penalty over 1024 tokens fading over 1024 more).
+   vLLM's `presence_penalty`, which the Qwen card assumes, counts the generated text only [L: vLLM SamplingParams docs:
+   "based on whether they appear in the generated text so far"; `repetition_penalty` is the one that includes the
+   prompt]. In an agent turn the last 1-2k tokens are the tool output the model must quote (edit `old_string`, paths,
+   identifiers), so presence 1.5 here pushes the model away from exact copies: a code-fidelity risk and an acceptance
+   loss for MTP and suffix drafting. It also forces the serial verification walk (`reqs_past_ids`). The card itself warns
+   that high values cause "language mixing and a slight decrease in model performance" [L: model README]. Note also that
+   the card's SWE-bench Pro / DeepSWE numbers were run in thinking mode (temp 1.0, top_p 0.95, presence 0) with the
+   Claude Code harness [L], not with the non-thinking preset.
+6. **Verify width has cliffs on sm_60, so long drafts do not transfer from the literature.** The GEMV covers m <= 8
+   (`EXL3_GEMV_MAX_M`); m = 9..64 runs the emulated-MMA tile GEMM, ~16x slower per projection (5120 x 17408 K = 3:
+   ~4.8 ms vs ~0.3 ms, `exl3_gemv.cu` comment [M]); reconstruct + HFMA2 GEMM only from 64 rows
+   (`EXL3_RECON_THRESHOLD_SM60`). Inside m <= 8, MMODE 4 covers m = 3..4 only, m = 5..8 take the slower MMODE 1; the
+   gated-residual decode kernels stop at R = 4; the 27B jumps at 4 rows (unexplained, Stage 0). SuffixDecoding's 3.9x
+   on SWE-bench agent traces [L: Oliaro et al., NeurIPS 2025; Snowflake Arctic Inference ~4x] assumes a near-free wide
+   verify (H100-class, memory-bound); here a hybrid draft of more than 7 tokens would cost a tile-GEMM pass.
+7. **Sampling is not a lever.** Verification samples the target at each position and compares with the drafted argmax,
+   which is speculative sampling with a deterministic draft (acceptance = p_target(draft)); only multi-candidate (tree)
+   drafts raise acceptance under sampling. Measured: 27B `-ndt 2` 27.9 t/s with the model-card sampling vs 28.2 greedy
+   [M, Nov 5 session notes]. Literature: EAGLE-3 acceptance length at T = 1 is ~6% below T = 0 on MT-Bench / HumanEval
+   [L: LK-losses paper, arXiv 2602.23881, Table of T = 0 / 1].
+8. **The ~7 ms of "no GPU" per Flash-Next step is the CPU expert wait, not launch gaps** (unprofiled ~7 ms at `-ndt 3`,
+   CPU worker ~5.5 ms busy per step [M, "draft length and MTP step profile"]). CUDA graphs would not remove it; starting
+   the CPU job earlier or moving hot experts to the GPU would.
+9. **Quality: at full precision the 27B and Flash-Next are about tied on coding; the quant gap is not.** Model-card /
+   aggregator numbers [L]: SWE-bench Pro 27B 61.7, Flash-Next 62.5, Qwen3.6-35B-A3B 49.5 (Qwen3.6-27B 53.5); LiveCodeBench
+   v6 90.3 / 91.9 / 80.4; NL2Repo 42.3 / 48.1 / 29.4. EXL3 KL vs bpw on Llama-3.1-8B (repo chart
+   `doc/llama31_8b_instruct_kld_bpw.png`): 4.0 bpw 0.013, 2.5 0.151, 2.0 0.312, 1.8 0.764 [L]; a third-party Gemma-3 27B
+   set: 4.0 bpw 0.039, 3.0 0.11, 2.0 0.45 [L]. Flash-Next runs 1.5 bpw routed experts (5 bpw attention). Large MoE experts
+   are believed more tolerant of low bits than a dense 8B, but no KL or task score for this quant was found; that is the
+   main open question of the model choice.
+
+### Headroom per model
+
+| | measured | floor | gap is |
+| :--- | :--- | :--- | :--- |
+| Qwen3.8-27B 4 bpw, plain | 65 ms/token [M] | bandwidth 27-33 ms [D]; GEMV per-weight cost today 65 ms [D]; ideal issue rate ~54 ms [D] | GEMV issue cost (both cards) + 2-GPU serialization (18 ms); TP is the large lever, kernels ~10-15% |
+| 27B MTP `-ndt 2` (code) | 28.2 t/s greedy, 27.9 sampled [M] | with TP x1.35-1.5 [E] | m = 4 step jump (Stage 0); drafting is fine on code |
+| Qwen3.8-Flash-Next 1.66 bpw | ~84 ms per `-ndt 3` step, 3.3-3.7 tokens [M] | MoE bytes ~50 us/layer vs ~600 measured (issue-bound decode of 1.5 bpw trellis) [M] | P100 busy ~60 ms, 2060 13 ms serial, CPU ~7 ms; remaining listed items 1-3 ms each; prose acceptance 29-40% [M] is a drafting limit |
+| Qwen3.6-35B-A3B 3 bpw | ~26.4 ms/iter, 74 t/s [M] | doc's candidate list reaches ~21.7 ms (midpoints) [E] | MoE m = 2 (now partly addressed by the m34 kernels, not re-measured on Qwen3.6) |
+
+CPU: idle for the 27B and Qwen3.6 (only the host thread); the AVX2 expert kernel does ~2 GB/s of trellis per core [M],
+so CPU compute cannot take a useful share of a dense model. It is enough for suffix-automaton drafting.
+
+### Candidate paths
+
+Gains are per model; "code" = code-heavy agent output, "prose" = explanations. h = hours of agent work.
+
+| # | Path | Model | Expected gain | Effort | Risk | Depends on |
+| :--- | :--- | :--- | :--- | ---: | :--- | :--- |
+| P1 | Cool the P100 (blower / shroud), then re-measure prefill at 8k-30k | all | 27B prefill 75 -> ~135 t/s at 30k [E, kernel-limited estimate]; removes thermal drift from every A/B | 0 h (user) | none | - |
+| P2 | Agent benchmark: `eval/spec_decode.py` agentic_code / agentic_curl traces (3k-30k tokens, `-temp`), reporting prefill t/s, decode t/s, tokens/step per category; a step-cost script (ms/step at fixed m = 1..8, 16, 32, 64); a resident-process A/B harness that toggles per-call env switches | all | none directly; makes every later gain measurable on the real workload and replaces the single quicksort prompt | 4-6 h | low | - |
+| P3 | Presence penalty over generated tokens only (option or default: window starts at the first generated position) | 27B (non-thinking preset) | code fidelity of edits [unquantified]; acceptance on agent turns [E: a few points]; host walk parallel again | 2-4 h | low | P2 to measure |
+| P4 | TP probe for the 27B: `-tp -gs a,b` load, `bench_chat` plain + MTP, KL vs layer-split; then tune the split | 27B | decode x1.35-1.5, prefill x1.2-1.35 [E]; MTP code 28 -> ~36-40 t/s [E] | 2 h probe, +6-12 h if it runs | high: untested on sm_60, eager decode under TP, x4 link, VRAM on the 2060 | - |
+| P5 | 27B Stage 0 top item (likely the m = 4 jump, then GEMV / lm_head at m = 3..4) | 27B | if m = 4 costs like m = 3: `-ndt 3` code +10-20% over ndt 2 [E] | 4-10 h | medium | `dense27-stage0` |
+| P6 | P100 GEMV MMODE 4 for m = 5..8 and slab dispatch (8-row GEMV slabs) for m = 9..32 instead of the tile GEMM | 27B, Flash-Next | enables `-hdt` 4-15 and wider drafts at ~linear cost; nothing by itself | 6-10 h | medium (bit-identity per row is testable) | P2 step-cost curve |
+| P7 | `-hdt` suffix drafting on agent turns (exists, never measured here) | 27B, Qwen3.6 | edit-heavy turns x1.1-1.5 decode [E], prose 0; literature 3.9x does not transfer (finding 6) | 1-2 h to measure | low | P2; P6 for `-hdt` > 3 |
+| P8 | Agent serving config: `-ccs` + `-dcd` (prefix pages and recurrent checkpoints survive reloads and evictions), `recurrent_checkpoint_interval_pp` 4096-8192 (default 32768: a history edit at 60k re-prefills from 32k, ~6 min), `-cs` >= 131072 (4-bit KV = 16 KB/token, 1.6 GB at 100k [D]); GDN checkpoint ~80 MB [D], 4 GB `-rcs` = ~50. Reuse needs a byte-stable history: the 27B template keeps past reasoning (`preserve_thinking` defaults on), so it is the harness that must resend history unchanged | 27B | avoids multi-minute re-prefills; restores a 100k context from disk in ~10 s at 210 MB/s instead of ~15 min of prefill [D] | 2-3 h incl. a check | low | - |
+| P9 | Quality gate: `eval/humaneval.py` (or 20 agent tasks) on 27B 4.0 vs Flash-Next 1.66 vs Qwen3.6 3.0 | model choice | decides whether any more Flash-Next work is worth it | 3-4 h (mostly GPU time) | low | - |
+| P10 | Prefill: pipeline consecutive chunks across the two GPUs (2060 on chunk n+1 while the P100 runs chunk n; GDN state order is per layer, so valid) | 27B, Qwen3.6 | <= the 2060's share of prefill time [E: 10-20%] | 6-12 h | medium | P1 (heat otherwise dominates) |
+| P11 | fa60 attention (branch `fa60-prefill`, kernel -14% done) | 27B at long context | attention is ~25-45% of prefill FLOPs at 50-100k [D]; 1.5x faster attention = +8-15% there [E] | 4-8 h | low-medium | P1 |
+| P12 | Cost-aware draft length: pick ndt per round from recent acceptance x the measured ms/step(m) table (`-dds` only truncates on confidence) | 27B, Flash-Next prose | prose +5-12% (Flash-Next prose `-ndt 2` already +12% over ndt 3 [M]) [E] | 3-5 h | low | P2 step-cost curve |
+| P13 | 2060 tensor-core prefill with weights streamed from pinned RAM over its x16 link (12.3 GB per chunk ~1 s) | 27B | unknown, up to ~2x prefill if the 2060 sustains ~20 TFLOPs on EXL3 reconstruct + GEMM [E, unmeasured] | 2-4 days | high | microbenchmark first (see uncertainties) |
+| P14 | Flash-Next leftovers (CPU job earlier, 2060 K = 5 GEMV, more GPU expert slots) | Flash-Next | 1-3 ms each of ~84 per step [M/E], <= ~10% total, inside the 5% load spread per item | 4-10 h | medium | P9 says Flash-Next is worth it |
+| P15 | Qwen3.6 re-measure on the current build (MoE m34 / dual kernels apply at m = 2) | Qwen3.6 | unknown, the Flash-Next m = 2 microbenchmark went 484 -> 383 us [M] | 0.5 h | none | - |
+
+**Recommended order for the next five work items:**
+
+1. **P2, agent benchmark + step-cost curve + resident A/B harness.** Every open question below (penalty, `-hdt`, ndt on
+   prose, the verify cliffs, TP) is decided by these numbers, and the current single-prompt `bench_chat` method has a
+   ~5% load-to-load spread that hides most of the remaining items.
+2. **P3, presence-penalty scope**, with P8 (agent serving config) in the same session. Cheap, about correctness of the
+   actual use case, measured with P2 (agentic traces sampled with presence 1.5 over prompt vs over output vs 0: acceptance
+   and whether quoted strings in tool calls match the context byte for byte).
+3. **P4, TP probe for the 27B.** The only item with a plausible x1.3-1.5 on both decode and prefill. Two hours decides it;
+   stop at the first blocker that needs more than a day.
+4. **P5 (+P6 if the curve asks for it), the 27B Stage 0 top item.** After Stage 0 lands; P6 only if P2 shows m = 5..8 and
+   9..16 are where agent turns want to verify (P7).
+5. **P9, quality gate.** Before any more Flash-Next kernel work (P14). If Flash-Next 1.66 bpw does not beat the 27B on
+   coding, freeze it as is.
+
+In parallel, for the user: **P1 (P100 cooling)** and the slot question (finding 4).
+
+### Recommended NOT doing (with evidence)
+
+- **Tree / Medusa-style drafts and lookahead decoding on the P100.** Verify cost grows per row (issue-bound GEMV), m > 8
+  falls to the tile GEMM (~16x per projection [M, code comment]), and GDN layers need a branched state (STree [L: Wu et
+  al., NeurIPS 2025] needs custom scan kernels). Revisit only if P6 makes m = 9..32 cheap.
+- **More Flash-Next kernel micro-work before P9.** Remaining items are 1-3 ms of ~84 ms each [M], the model does not fit
+  in VRAM (CPU experts, 152-170 s loads, n-gram table random reads on the USB SSD at long context [M]), prose decode is
+  17-20 t/s from a 29-40% draft acceptance that kernels cannot fix [M], and its 1.66 bpw quality is unmeasured.
+- **The Qwen3.6 100 t/s target**, as long as quality matters more than speed: its own budget reaches ~89 t/s only with the
+  MoE rewrite at its optimistic end ("Candidates towards 100 t/s"), and it is the weakest coder of the three (SWE-bench
+  Pro 49.5 vs 61.7 [L]). Keep it as the fast fallback model (a turn costs ~8-11 s vs ~33-62 s for the 27B [E]).
+- **Lower bpw on the 27B for speed** (finding 2: per-weight cost), **KV below 4 bit** (1.6 GB at 100k is ~4 ms of a
+  65 ms step at 400 GB/s [D]), **`-rs32`** (doubles state and checkpoints, no speed).
+- **Draft model on the 2060 / overlapping draft with verify.** With `-sdh` the draft costs ~0.5 ms on the 2060 plus a
+  near-free head [M, Qwen3.6 Stage 0], so overlap saves <= ~2%; a separate drafter needs VRAM the 27B uses and MTP
+  already accepts 85-97% on code [M].
+- **CUDA graphs for the Flash-Next idle time** (finding 8), **8-bit gated-residual tables** (no gain, [M]),
+  **`-ndt 4`** on Flash-Next and **`-ndt 3`** on the 27B until the m = 4 jump is explained [M], **router fusion**,
+  **all layers on the P100 / experts split across GPUs** [M], **power cap above 160 W** (heat, [M]).
+- **Rejection-sampling variants for the model-card sampler** (finding 7): the loss to sampling is ~1% on code [M].
+
+### Key uncertainties and the cheapest measurement for each
+
+| Uncertainty | Why it matters | Cheapest measurement |
+| :--- | :--- | :--- |
+| ms/step of the 27B and Flash-Next at m = 1..8, 16, 32, 64 | sets `-hdt`, ndt, P6, P12; explains the m = 4 jump | one load, a loop of `model.forward` at q_len m with a fixed cache position, 20 min |
+| Does `-tp` load and run on P100 + 2060 (sm_60 paths, eager decode, x4 link), and what is the all-reduce cost per token | P4, the largest decode + prefill lever | one load of the 27B with `-tp -gs 4.5,15` (tune), `bench_chat` plain then `-mtp -ndt 2`, plus a KL check against layer-split: 1-2 h |
+| Presence penalty over prompt: effect on acceptance and on exact copies in tool calls | correctness of the real use; P3 | `spec_decode.py -single "Agentic, code" -temp` (after adding presence to its sampler) with 1.5 vs 0 vs the fixed scope, diff the tool-call strings against the trace: 1 h |
+| `-hdt` gain on agent traces at the m the P100 can verify cheaply (hdt 2-3 now) | P7 | `spec_decode.py` agentic workloads, `-mtp -ndt 2` vs `+ -hdt 3`: 1 h |
+| Prose acceptance of the 27B MTP head under sampling, ndt 1 vs 2 | P12; agent replies contain prose | `spec_decode.py` creative/translation categories with `-temp`: 1 h |
+| Flash-Next 1.66 bpw vs 27B 4.0 bpw coding quality | model choice, P14 | `eval/humaneval.py` on both (HumanEval is near saturation, so treat a gap > 3 points as signal), or 20 real tasks from the user's agent: 3-4 h |
+| 27B prefill at 32k / 64k / 131k with and without heat | the end-to-end limit (finding 1) | `bench_prefill.py` at those lengths, logging clocks (`nvidia-smi dmon`): 1 h; repeat after P1 |
+| Can the P100 clocks be locked (`nvidia-smi -ac` / `-lgc`) below the throttle point | removes thermal drift from A/B runs | one `nvidia-smi -q -d SUPPORTED_CLOCKS` and a 10-minute steady run: 15 min |
+| 2060 EXL3 prefill GEMM rate (reconstruct + `hgemm_f16acc`) at 27B shapes vs the P100 | P13 and the P10 share | microbenchmark of a 5120 x 17408 layer at m = 4096 on each card: 30 min |
+| Qwen3.6 speed on the current build | whether its numbers in this log are stale | one `bench_chat` run: 10 min |
+| P100 link really x4 under load | finding 4 | `nvidia-smi -q -d PCI` during a load: 1 min |
+
+### Tooling and methodology
+
+- **Loads.** The 27B is 15.7 GiB on a USB SATA SSD (~210 MB/s [M]): ~80 s cold. It fits the page cache of the 31 GB
+  machine if Flash-Next (28 GiB of weights) is not loaded in between, so batch 27B sessions and avoid alternating models;
+  a resident process (P2) removes most loads altogether. An internal disk would roughly halve the 85 s weight read of
+  Flash-Next [E, Stage 0 list].
+- **Noise.** Load-to-load spread is ~5% [M] and greedy text is not reproducible across loads at full reply length [M],
+  so 8-load ABAB/BABA is what the last items needed. Split the metric: kernel work is judged by ms/step at fixed m in a
+  resident process (switches read per call, e.g. `EXL3_GEMV_M34`, can be toggled in-process; mark each switch in
+  `env_vars.md` as per-call or load-time), drafting work by tokens/step over the 22 `spec_decode.py` workloads
+  (`-dstats` records per-round data). t/s is then the product, with much less noise than single runs.
+- **Thermal drift.** P1, or locked clocks (table above); log clocks and temperature with every run.
+- **Builds.** ccache is installed and torch's JIT puts it in front of nvcc; header edits rebuild every including unit
+  (`exl3_gemv_kernel.cuh`, `exl3_moe_coop_kernel.cuh` are widely included), so keep experiments in `.cu` files where
+  possible. 16 jobs only with no model loaded.
+
+Sources: [vLLM SamplingParams](https://docs.vllm.ai/en/latest/api/vllm/sampling_params.html);
+[SuffixDecoding, NeurIPS 2025](https://neurips.cc/virtual/2025/poster/115453);
+[Snowflake Arctic Inference + suffix decoding](https://www.snowflake.com/en/engineering-blog/fast-speculative-decoding-vllm-arctic);
+[STree, NeurIPS 2025](https://arxiv.org/pdf/2505.14969); [EAGLE-3](https://arxiv.org/pdf/2503.01840);
+[LK losses (EAGLE-3 at T = 0 / 1)](https://arxiv.org/pdf/2602.23881);
+[Qwen3.8-27B benchmarks](https://orcarouter.ai/blog/qwen-3-8-27b-benchmarks) and the local model card
+(`models/Qwen3.8-27B-exl3-4.00bpw/README.md`); [BenchLM Qwen3.6-35B-A3B vs Qwen3.8-Flash-Next](https://benchlm.ai/md/compare/qwen3-6-35b-a3b-vs-qwen3-8-flash-next.md);
+[Gemma-3 27B EXL3 KL by bpw](https://huggingface.co/WeReCooking/Gemma-3-R1984-27B-EXL3);
+[exl2 TP vs pipeline on 2x 3090, 17.8 -> 24.6 t/s](https://red.127.pp.ua/r/LocalLLaMA/comments/1f5qcdl/simple_tensor_parallel_generation_speed_test_on)
+(anecdotal, symmetric cards with P2P-less PCIe). No reliable llama.cpp P100 decode number for a 27B was found.
+
 ## Upstream sync (Nov 4): turboderp-org/exllamav3 v1.6.6 + LFM3 (branch `pascal-sync-v166`)
 
 Merged `upstream/master` into the fork (one conflict, `block_sparse_mlp.py` scratch buffer: kept `torch.zeros`, not verified
