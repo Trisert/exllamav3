@@ -231,16 +231,18 @@ step above the unprofiled one, mostly host-side). ms per step, real kernels only
 | no GPU kernel running | 6.0 | 8.7 | 15.6 (~7 unprofiled) |
 | P100 MoE coop (`coop_f<1>` per layer, x37) | 19.9 (302 us) | 24.8 (389 us) | 28.7 (468 us) |
 | P100 EXL3 GEMV/GEMM, incl. lm_heads | 13.2 | 21.5 | 22.4 |
-| -- 5 bpw `exl3_gemv_kernel<5,true,2,M,..>` x60 / x41 | 74 / 83 us (M = 2) | 125 / 113 us (M = 1) | 126 / 113 us (M = 1) |
+| -- 5 bpw `exl3_gemv_kernel<5,true,2,MMODE,..>` x60 / x41 | 74 / 83 us (MMODE 2) | 125 / 113 us (MMODE 1) | 126 / 113 us (MMODE 1) |
 | -- main lm_head (4 bpw) / draft lm_head (m = 1, 1.1 ms each) | 1.3 / 1.1 | 2.4 / 2.2 | 2.4 / 3.3 |
 | P100 gated residual (`gr_*_kernel3`) | 5.0 | 6.7 | 8.3 |
 | P100 GDN / attention / router + hc | 1.8 / 1.7 / 0.9 | 2.2 / 2.1 / 0.9 | 2.5 / 2.1 / 0.9 |
 | 2060 MoE / GEMV-GEMM / gated residual | 2.9 / 3.8 / 1.1 | 4.0 / 4.3 / 1.5 | 5.0 / 4.9 / 2.0 |
 
-- At m >= 3 the P100 5 bpw GEMV switches from the 2-row variant (template M = 2, 74 us at m = 2) to the 1-row one
-  (M = 1, 125 us for m = 3 and for m = 4): from m = 2 to 3, GEMV jumps +8.3 ms, then +0.9 ms to m = 4. The main lm_head
-  shows the same thing (1.3 -> 2.4 ms). At m >= 3 an extra `exl3_moe_coop_f_kernel<5, 2, false>` (182 us x41, 7.5 ms)
-  also appears; its m = 2 counterpart is not in the top list. Not identified yet (shared expert or split path).
+- The P100 5 bpw GEMV dispatch (`exl3_gemv.cu`, MMODE template parameter): m = 2 uses the direct two-row dot product
+  (MMODE 2, 74 us), m = 3..8 the MMA path (MMODE 1, 125 us at m = 3 and m = 4); the four-row direct path (MMODE 3)
+  exists but was measured slower than MMODE 1 at m = 3..4 earlier. So GEMV jumps +8.3 ms from m = 2 to 3, then +0.9 ms to
+  m = 4; the main lm_head does the same (1.3 -> 2.4 ms). Two m = 2 calls (2 x 74 us) would be slower than MMODE 1.
+- The shared expert (5 bpw) runs as `coop_a<5>` + `coop_b<5>` at m = 2 (88 + 60 us x41, 6.1 ms) and as one
+  `coop_f<5, 2, false>` at m >= 3 (182 us x41, 7.5 ms): normal scaling with m, not a fallback.
 - The two GPUs never overlap (0.05 ms): the 2060's 13.3 ms is pure serial time on top of the P100's 66.
 - CPU expert worker (`EXL3_MOE_CPU_PROF`, separate load, per job, all phases): 207 us at ndt 1, 252 us at ndt 3, 259 us at
   ndt 4; ~13 jobs per step at ndt 1, ~22 at ndt 3, so ~2.8 / ~5.5 ms busy per step. Unprofiled, the no-GPU time at ndt 3
@@ -252,16 +254,15 @@ step above the unprofiled one, mostly host-side). ms per step, real kernels only
 
 | # | Candidate | Est. gain, ms per step | Risk / effort |
 | :--- | :--- | ---: | :--- |
-| 1 | P100 5 bpw GEMV at m = 3-4: use the 2-row variant (M = 2, two row pairs) or a 4-row one in place of M = 1 (126 / 113 us). Cheap probe first: dispatch m = 4 as two m = 2 calls, or relax the M choice in `exl3_gemv_cfg`; the main lm_head gets the same fix | 3-5 (+ ~1 lm_head) | low-medium (dispatch first, kernel only if needed) |
-| 2 | Identify the m >= 3 `coop_f<5, 2, false>` launch (7.5 ms); if it is the shared expert or a fallback that runs at m = 2 through a cheaper path, route m = 3-4 the same way | 2-4 | low to find out, medium to fix |
-| 3 | P100 MoE coop `coop_f<1>` at m = 4 (468 us x37 = 17.3 ms, decode-compute-bound; union of ~2x the experts) | 4-6 for 25-35% faster | high effort |
-| 4 | Gated residual at m = 4 (8.3 + 2.0 ms): 8-bit tables (bytes halve; R = 4 still fits `GR_MIX3`) | 3-4 | medium (mixing accuracy) |
-| 5 | CPU expert time at m = 4 (~5.5 ms busy, ~7 ms no-GPU): `-mct 8`, more GPU expert slots (VRAM freed by #4), or start the CPU job earlier | 1-3 | low (config) to medium |
-| 6 | 2060 K = 5 GEMV (old #6; 2060 GEMV/GEMM 4.9 ms at m = 4) | ~1 | low |
-| 7 | `-sdh` cold start: ship or pre-seed the token profile (first run of a load at 77.7% acceptance) | first-run only | low |
+| 1 | P100 MoE coop `coop_f<1>` at m = 4 (468 us x37 = 17.3 ms, decode-compute-bound; union of ~2x the experts), plus the shared expert `coop_f<5>` (7.5 ms) | 4-6 for 25-35% faster | high effort, medium risk |
+| 2 | P100 5 bpw GEMV at m = 3-4: a four-row direct product (MMODE 3 rework) near the m = 2 cost per byte, ~90 us in place of 126 / 113; the main lm_head too | 2-4 (+ ~0.5 lm_head) | medium-high: kernel work, MMODE 3 measured slower before |
+| 3 | Gated residual at m = 4 (8.3 + 2.0 ms): 8-bit tables (bytes halve; R = 4 still fits `GR_MIX3`) | 3-4 | medium (mixing accuracy) |
+| 4 | CPU expert time at m = 4 (~5.5 ms busy, ~7 ms no-GPU): `-mct 8`, more GPU expert slots (VRAM freed by #3), or start the CPU job earlier | 1-3 | low (config) to medium |
+| 5 | 2060 K = 5 GEMV (old #6; 2060 GEMV/GEMM 4.9 ms at m = 4) | ~1 | low |
+| 6 | `-sdh` cold start: ship or pre-seed the token profile (first run of a load at 77.7% acceptance) | first-run only | low |
 | - | Measured, no gain: `-ndt 4` (39.9 t/s vs 40.2 at ndt 3), `-dds` at any ndt. `-ndt 4 -sdh` not tested | | |
 
-#1 + #2 + #4 together (~10 ms) would give ~74 ms per step, ~49 t/s. 55 t/s also needs #3.
+#2 + #3 + #4 (~8 ms) would give ~76 ms per step, ~48 t/s; 55 t/s (66.5 ms) also needs #1.
 
 ## Target (set Nov 3 by the user)
 
