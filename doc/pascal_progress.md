@@ -254,7 +254,7 @@ step above the unprofiled one, mostly host-side). ms per step, real kernels only
 
 | # | Candidate | Est. gain, ms per step | Risk / effort |
 | :--- | :--- | ---: | :--- |
-| 1 | P100 MoE coop `coop_f<1>` at m = 4 (468 us x37 = 17.3 ms, decode-compute-bound; union of ~2x the experts), plus the shared expert `coop_f<5>` (7.5 ms) | 4-6 for 25-35% faster | high effort, medium risk |
+| 1 | P100 MoE coop `coop_f<1>` at m = 4 (468 us x37 = 17.3 ms, decode-compute-bound; union of ~2x the experts), plus the shared expert `coop_f<5>` (7.5 ms) | 4-6 for 25-35% faster (**done in part**: -4.5 ms, see "P100 MoE at m = 4") | high effort, medium risk |
 | 2 | P100 5 bpw GEMV at m = 3-4: a four-row direct product (MMODE 3 rework) near the m = 2 cost per byte, ~90 us in place of 126 / 113; the main lm_head too | 2-4 (+ ~0.5 lm_head) | medium-high: kernel work, MMODE 3 measured slower before |
 | 3 | Gated residual at m = 4 (8.3 + 2.0 ms): 8-bit tables (bytes halve; R = 4 still fits `GR_MIX3`) | 3-4 | medium (mixing accuracy) |
 | 4 | CPU expert time at m = 4 (~5.5 ms busy, ~7 ms no-GPU): `-mct 8`, more GPU expert slots (VRAM freed by #3), or start the CPU job earlier | 1-3 | low (config) to medium |
@@ -293,6 +293,35 @@ a next-row prefetch (bit-identical, kept on that branch only).
   99.34%; greedy text diverges at ~token 240 of 300 on a near-tie.
 - `bench_chat` best config, 8 loads ABAB + BABA, profiles restored: fp16 42.48 / 38.52 / 39.80 / 41.54, q8 43.73 / 42.28 /
   37.63 / 39.39 t/s, means 40.59 vs 40.76: **no gain** inside the ~5% load-to-load spread. Not worth the changed text.
+
+### Qwen3.8-Flash-Next: P100 MoE at m = 4 (Nov 5, re-ranked #1, branch `flash-moe-m4`)
+
+Profile (torch.profiler, 80 steps of the best config, `tmp/moem4`), P100 MoE per step: routed `coop_f<h1>` 18.87 ms
+(510 us x37), shared expert `coop_f<5>` 7.47 (182 us x41, separate launch: the dual kernel had no half-rate
+instance), 2 bpw routed layers `coop_f<2>` 2.04 (x4), CPU-split collect / issue 0.73 / 0.57, rotation 0.67, top-k
+0.46, gaps between MoE kernels 0.88: **30.8 ms**. Routing at m = 4 (hook on `run_bszN`, 2378 calls): 36.8 active GPU
+slots and 21.7 distinct GPU experts per call; runs of 1 / 2 / 3 / 4 rows = 59 / 22 / 11 / 9% of runs.
+Bandwidth floor per layer: 21.7 x 0.92 MB (1.5 bpw, 3 x 2560 x 640) + 3.1 MB shared (5 bpw) = 23 MB, ~50 us at
+450-520 GB/s, against ~690 us measured: far from the 15% stop rule, but the kernel is issue-bound (decode + HFMA2),
+not byte-bound, so the floor is not reachable; m = 1 costs ~17 us per expert, and m = 4 is ~21 us per distinct expert.
+- `EXL3_MOE_COOP_M34` (default on): multi-row runs (2..4 rows) on sm_60 take the one-output-per-lane form of the
+  emulated MMA (as GEMV MMODE 4): 8 shuffles + 8 HFMA2 per fragment instead of 16 + 32 plus the A gather. Kept in
+  `ch` / `acc0` (low half / `.x`), so 128 registers stay with small spills (stack 8-16 B).
+- `EXL3_MOE_COOP_DUAL_H` (default on): dual persistent kernel (shared + routed in one queue) for half-rate routed
+  experts (h1 / h2 with 4..6 bpw shared, `exl3_moe_coop_inst_dh.cu`): the 4-row shared expert had 20 real blocks
+  per stage on 56 SMs. Both **bit-identical** (`tests/kernels/moe/test_moe_coop_m34.py`, 35 cases; dual cases added
+  to `test_moe_coop_fused.py`; moe tests 353 + 2 skipped on the P100, 355 on the 2060).
+- Microbenchmark, Flash-Next shapes, routed h1 + shared 5 bpw pair, us: P100 m = 4 706 -> 599, m = 2 484 -> 383,
+  m = 1 270 -> 222; 2060 m = 4 475 -> 439. In the model: MoE kernels **30.8 -> 26.3 ms per step** (`d_kernel<1, 5>`
+  580 us x37 in place of 510 + 182), same greedy text.
+- `bench_chat` best config, 8 loads ABAB + BABA, profiles restored before each (A = `EXL3_MOE_COOP_M34=0
+  EXL3_MOE_COOP_DUAL_H=0`, same `.so`): A 36.64 / 37.25 / 42.35 / 38.48, B 37.46 / 41.01 / 40.23 / 47.40 t/s, means
+  **38.68 -> 41.53 (+7.4%)**, ~91 -> ~85 ms per step (wide spread this session, P100 at 67-71 C at turn start).
+  Text byte-identical in 7 of 8; the odd one is an A run (diverges at line 35, the known run-to-run drift), so not
+  the new kernels.
+- Left: the 4 layers with 2 bpw routed experts still launch the shared expert separately (`d_r2` covers S = 2..4;
+  ~0.2 ms); the dual kernels spill 24-64 B at the 128-register cap; per distinct expert the 1.5 bpw staged decode
+  (`dq_dispatch`, HALF) is now the cost.
 
 ## Target (set Nov 3 by the user)
 
@@ -441,6 +470,11 @@ MTP settings (35B, two prompts, 160 W): `-ndt 1` is the safe choice (57.3 t/s); 
 - Triton prefill attention on sm_60 (illegal memory access, predates the fork).
 
 ## Known issues
+
+- (Nov 5) Dual MoE kernel with expert-range masking (`-mcs` CPU split, now reachable through `EXL3_MOE_COOP_DUAL_H`):
+  a token whose routed picks all lie outside the GPU range gets its output row from `write_empty_row_chunk` (rotation
+  pre-kernel / first A item), which reads the shared expert's output before the same launch has produced it. Rare
+  (~92% of slots are GPU-resident under `-mcs 256`), not observed; `EXL3_MOE_COOP_DUAL_H=0` avoids it.
 
 - `tests/kernels/routing/test_routing_gemm_det.py`: 25 failures on both the P100 and the RTX 2060 (the int8 deterministic
   router GEMM needs sm_80; the test skips only builds without it). Untouched code. Stage 1 check (Nov 3): gemm + moe 672

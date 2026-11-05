@@ -729,6 +729,19 @@ the two input-rotation pre-kernels run as one launch, the blocks of the shared e
 Same per-warp work, bit-identical (`tests/kernels/moe/test_moe_coop_fused.py::test_dual_shared_routed`).
 Read per call.
 
+### `EXL3_MOE_COOP_M34` (default: `1`)
+
+Pascal (sm_60), fused decode MoE: expert runs of 2..4 rows (one expert picked by several tokens of an MTP
+verify step, and the shared expert at m = 2..4) take the one-output-per-lane form of the emulated MMA, as
+`EXL3_GEMV_M34` does for the GEMV. Bit-identical (`tests/kernels/moe/test_moe_coop_m34.py`). `0` restores the
+emulated MMA. Read per call.
+
+### `EXL3_MOE_COOP_DUAL_H` (default: `1`)
+
+Dual persistent MoE launch (shared + routed experts in one queue) also for half-integer routed rates (mul1,
+1.5 / 2.5 bpw routed with a 4..6 bpw shared expert, e.g. Qwen3.8-Flash-Next). Bit-identical to the separate
+launches. `0` keeps the separate shared and routed launches. Read per call.
+
 ### `EXL3_MTP_DEFER_CONF` (default: `1`)
 
 Generator, MTP drafting with `-dds` and a one-token draft window: the window can never be cut, so the draft
