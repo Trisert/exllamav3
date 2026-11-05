@@ -41,7 +41,125 @@ experts of the first N layers run on the CPU (`-mcl N`, 31 GB RAM machine).
 - Baseline, `-gs 4.0,15.0 -cs 8192 -cq 4 -mcl 24`, `bench_chat.py` code prompt, 300 new tokens, greedy: **17.77 t/s** without MTP;
   **23.43 t/s** with `-mtp -ndt 1 -dds` (96.1% accepted). Load plus 300 tokens takes under 3 minutes.
 - Not yet known: where the decode time goes (CPU expert worker vs GPU), the smallest `-mcl` that fits, `-mcs` (tail split) vs `-mcl`,
-  cost of the n-gram table, prefill speed, behaviour of the eager QSA path on sm_60 at long context.
+  cost of the n-gram table, prefill speed, behaviour of the eager QSA path on sm_60 at long context. Answered in Stage 0 below.
+
+### Qwen3.8-Flash-Next Stage 0: measurements (Nov 5)
+
+Method: one load per configuration (`flash_body.py` harness: bench-style decode of the code prompt, 300 tokens greedy, plus a torch
+profiler window of 30 iterations; `EXL3_MOE_CPU_PROF=1` for the CPU worker's per-job times, steady state taken as the delta of
+the cumulative counters). `-gs 4.0,15.0 -cq 4 -cs 8192` unless noted, P100 cooled to <= 62 C before each load (61-71 C during
+the runs, 1328 MHz). Run-to-run spread between loads of the same config is ~5% (mcl 24: 18.40 / 19.28 / 19.44 t/s), so
+single-load differences below that are noise. Machine facts that matter here: Ryzen 7 5800X (8 cores, AVX2), DRAM read
+40-44 GB/s (torch sum, 1-16 threads); the model lives on `/home`, a LUKS volume on a **USB-attached Kingston SA400 SATA SSD**
+(~210 MB/s measured while loading); 31 GB RAM, so the 28 GiB of weights cannot stay in the page cache between loads.
+
+Harness pitfall (cost a sweep): a sampler thread that held `sys._current_frames()` frames during `model_init.init` kept the
+loader's CUDA tensors alive and made every marginal config fail with "Insufficient VRAM"; with the frame dropped (or no
+sampler) the fits below are reproducible. A previous run's CPU-worker child can also still hold VRAM for a few seconds after
+`os._exit`; the runner waits for no python CUDA process before loading.
+
+**Fit and decode speed** (`bench_chat.py` where marked, otherwise the harness; t/s over 300 tokens):
+
+| Config | GPU alloc 2060 / P100 (GiB) | decode t/s | ms/iter | CPU job (us, per layer-token) |
+| :--- | ---: | ---: | ---: | ---: |
+| `-mcl 18 / 20 / 22 / 23` | - | does not fit | | |
+| `-mcl 24` (7 worker threads, default) | 2.91 / 13.91 | 18.40-19.44 (`bench_chat` 19.44) | 51.9-54.3 | 620 (14.8 GB/s) |
+| `-mcl 24 -mct 4` | same | 15.68 | 63.7 | 1039 (8.7 GB/s) |
+| `-mcl 24 -mct 8` | same | 19.86 | 50.4 | 562 (16.3 GB/s) |
+| `-mcl 24 -mct 15` (SMT siblings) | same | 18.00 | 55.5 | 783 (13.2 GB/s) |
+| `-mcs 256` (= 24 x 512 experts on the CPU, warm hot/cold profile) | 3.20 / 13.95 | **22.53** | 44.6 | - |
+| `-mcs 288`, cold (no expert profile yet) / warm | 2.48 / 13.05 | 20.88 / 22.65 | 48.2 / 44.4 | 360 / 179 |
+| `-mcs 320` (profile of one earlier run) | 2.54 / 11.50 | 20.09 | 50.0 | 400 |
+| `-mcs 288 -mcpa` (4 promote spares per layer, warm) | 2.95 / 12.82 | 21.57 (one load also failed to fit) | 46.4 | - |
+| MTP `-mtp -ndt 1 -dds`, `-mcl 24` | 3.90 / 14.12 | `bench_chat` **25.78** (96.1%), harness 24.58 / 21.33 profiled | - | 1077 (m = 2) |
+| MTP, `-mcs 256` (warm) | 3.81 / 13.95 | **29.32** (94.8%) | 67.7 | 234 (m = 2) |
+
+- `-mcl 24` is the smallest whole-layer offload that fits (23 fails on a clean GPU). The autosplit is greedy (the 2060 fills
+  first, then everything goes to the P100), so the margin is decided by where the first expert-carrying layer lands.
+- `-mcs` at equal VRAM (`-mcs 256`: 48 x 256 = 24 x 512 experts on the CPU, +0.33 GiB GPU alloc) is **+16-22%** over
+  `-mcl 24`. The gain comes from the hot/cold placement more than from the CPU/GPU overlap: the dynamic map moves the
+  frequently routed experts to the GPU slices, so with a saved profile (`~/.cache/exllamav3/expert_stats/`, written at unload)
+  the CPU job shrinks from 360 to 179 us per layer-token (s288 cold vs warm). The first load of a model is the cold case.
+- The CPU expert kernel is compute-bound, not DRAM-bound: it scales linearly with physical cores (4 -> 8 threads: 1039 -> 562
+  us/job) at ~2 GB/s of trellis per core, a third of the 40-44 GB/s the RAM delivers; SMT siblings make it slower. `-mct 8`
+  (all physical cores, the host thread shares one) is the better default on this 8-core part (+3-8%, inside the noise band).
+- `-mcpa`: with `-mcs 288` it fit on one of two loads (the promote spares cost VRAM) and gave no decode gain over warm
+  `-mcs 288` (21.57 vs 22.65 t/s, within noise); in prefill it gives +5-12% (below).
+
+**Decode iteration budget**, `-mcl 24`, no MTP, profiled window 53.3 ms/iter (unprofiled 51.9). Every part is serial: the
+CPU worker runs while both GPUs wait (the wait is a stream memop, not a kernel), and the two GPUs never overlap.
+
+| ms per token | |
+| :--- | ---: |
+| CPU routed experts, 24 layers x ~620 us (no GPU busy: 16.5 ms incl. host gaps) | 14.9 |
+| P100 (layers 24-47, 20.3 ms busy): MoE coop kernels for 10 experts + shared (`coop_f` 196 us + `a` 64 + `b` 42 per layer) | 7.2 |
+| -- EXL3 5 bpw GEMV (GDN qkv/z/out, attention q/k/v/o, shared expert) / lm_head (4 bpw) | 5.4 / 1.1 |
+| -- gated residual (`gr_dots_kernel2` + `gr_finalize_kernel2`, 2 sites per layer, ~43 us each) | 4.2 |
+| -- GatedDeltaNet recurrence + conv / attention (6 layers) / router + top-k / hyperconnection apply | 0.9 / 0.5 / 0.6 / 0.25 |
+| 2060 (layers 0-23, 16.5 ms busy): tile GEMM / sliced MGEMM for the 5 bpw projections at m = 1 | 10.6 |
+| -- gated residual / GDN / attention | 4.0 / 0.7 / 0.2 |
+| n-gram table lookup + PLE (host 1.6 ms, mostly hidden; 0.45 ms on the 2060) | ~0.5 |
+
+- The gated residual reads two fp16 tables per site, (320, 4 x 2560) down and the repacked up, 13 MB per site, 1.27 GB per
+  token over 96 sites (also 1.2 GiB of VRAM). At ~43 us per kernel that is ~150 GB/s on both cards: a quarter of the P100's
+  HBM2 and half the 2060's GDDR6. It is 8.2 ms per token, as much as the routed MoE on the P100.
+- The 2060 runs the 5 bpw projections on the tile GEMM (`exl3_mgemm_kernel` 262 us for the 25 MB qkv+z slice pair, ~95 GB/s),
+  because the sm_75 GEMV is gated to K <= 4 (`exl3_gemv_cfg`, `use_mgemm`); this model's attention/GDN weights are K = 5.
+  Probe `EXL3_GEMV=2 EXL3_QKV_SLICE=0` (forces the staged K = 5 GEMV everywhere and unfuses qkv+z): 2060 GEMM/GEMV time
+  10.57 -> 7.89 ms, 2060 busy 16.5 -> 14.0 ms per token (K = 5 GEMV at ~56 us for 15.6 MB, ~280 GB/s); the P100 gets slightly
+  worse under mode 2 (6.48 -> 6.67 ms), so a real change must be sm_75-only. Output text differs from the default after the
+  first sentence (different accumulation order); needs a perplexity/test check before it is claimed.
+- The P100 MoE coop kernel moves 10 x 0.9 MB of 1.5 bpw trellis in 196 us (~47 GB/s): decode-compute-bound, as on Qwen3.6.
+- With `-mcs 288` (cold) the split changes shape: the 2060 holds only ~6 layers (5.1 ms busy), the P100 42 (33.3 ms), and the
+  CPU wait not hidden behind the GPU is 9.0 ms per token; same kernels, so the same per-kernel levers apply.
+- **MTP** (the target mode), profiled windows of 30 iterations at ~1.95 tokens per iteration:
+  - `-mcl 24`: 77.4 ms/iter. The CPU worker at m = 2 (up to 20 distinct experts per job) takes ~1077 us per layer, 25.8 ms
+    per iteration (no GPU busy 29.5 ms, 38%); P100 30.0 ms (MoE coop 12.0, of which `coop_f` 340 us/layer; GEMV 9.4; gated
+    residual 5.2), 2060 18.0 ms (tile GEMM 10.7, gated residual 4.5).
+  - `-mcs 256`: 61.9 ms/iter. The CPU work is almost fully hidden (no GPU busy 4.9 ms, CPU job 234 us); the **P100 is the
+    bottleneck at 47.3 ms busy**: MoE coop 20.9 ms (`coop_f` 337 us x 37 + `a` 89 + `b` 60 per layer), EXL3 5 bpw GEMV at
+    m = 2 13.2 ms (~1.5 GB of projections at ~120 GB/s), gated residual 8.0 ms, attention 1.7, GDN 1.8. The 2060 holds only
+    ~7 layers (9.7 ms busy, of which gated residual 1.7).
+
+**Long context** (`-mcl 26 -cs 24576`, prompt = repository code, prefix reuse verified: the second job processed 4433 new
+tokens): decode at 20.8k tokens 16.91 t/s against ~17.3 at short context in the same load. Profiled: QSA kernels P100
+0.5 -> 1.24 ms per token (`_qsa_sparse_split_kernel` 139 us x 6), 2060 0.2 -> 2.1 ms (`_dsa_indexer_fewq_kernel` 189 us
+x 6 + sparse split 145 us x 6); the eager QSA path's host time in attention grows 1.3 -> 13.4 ms per token but is almost
+entirely hidden behind the GPU queue. The n-gram lookup goes 0.8 -> 4.7 ms host per token on novel text: rows missing from
+the page cache are random reads on the USB SSD. Total profiled iteration 54.1 -> 60.6 ms (+12%). No correctness problem.
+
+**Prefill** (default `-chunk_size 4096`, so the 4400-token prompt runs as a 4096 + ~330 chunk pair; `-mcl 26 -cs 24576`):
+
+| | 4421 tokens at 0 | 16405 tokens at 0 | 4433 tokens at 16.4k |
+| :--- | ---: | ---: | ---: |
+| default | 196 t/s (22.5 s) | 220 t/s | 225 t/s (19.7 s) |
+| `-mcpa` | 219 t/s (20.2 s) | 224 t/s | 237 t/s (18.7 s) |
+
+**Load time** (~155-170 s; stack sampler on the main thread, mcl 24): ~85 s reading 17-18 GiB of weights (I/O bound,
+~210 MB/s from the USB SSD; parent CPU 34 s over that span), then ~72 s in `model.warmup`, of which 35 s are n-gram table row
+lookups from disk (`row_table.lookup`, random reads for the warmup chunk), ~13-27 s the CPU MoE prefill of the warmup chunk,
+the rest GPU forwards. Triton compiles hit the disk cache (~1 s); the 30 s of `_configure` seen under cProfile in the first
+load were profiler overhead plus a cold cache. `-ngr` (18.5 GiB table in RAM) cannot be combined with an 11 GiB expert arena
+in 31 GB.
+
+### Qwen3.8-Flash-Next: ranked candidates (Nov 5, Stage 0 estimates, nothing implemented)
+
+Gains are per MTP iteration of the best configuration found (`-mcs 256 -mtp -ndt 1 -dds`, 61.9 ms profiled, ~1.95 tokens,
+29.3 t/s), where the P100 is the bottleneck; "risk" covers numerics and effort.
+
+| # | Candidate | Estimated gain | Risk / effort |
+| :--- | :--- | :--- | :--- |
+| 1 | Run `-mcs 256` (+ `-mct 8`) instead of `-mcl 24`, with a warm expert profile (ship or pre-seed it so the first load is warm) | **measured** +14-19% with MTP (24.6-25.8 -> 29.3 t/s), +16-22% without | none: configuration only |
+| 2 | Gated residual kernels at bandwidth: `gr_dots_kernel2` / `gr_finalize_kernel2` read 13 MB per site at ~150 GB/s | ~6 of 9.7 ms (P100 8.0 + 2060 1.7), ~10% | low-medium: two kernels, fp32 sum order |
+| 3 | P100 MoE coop kernel on 1.5 bpw experts (decode-bound, ~47 GB/s; 20.9 ms per MTP iteration) | 25-30% faster = 5-6 ms, ~9% | high effort, medium risk |
+| 4 | P100 EXL3 5 bpw GEMV at m = 2 (~120 GB/s, 13.2 ms) | 2-4 ms | medium-high: already tuned on the `pascal-gemv-k5` line |
+| 5 | Gated-residual tables in 8 bit (or EXL3) | halves #2's bytes again; frees ~0.6 GiB VRAM for GPU experts (fewer CPU misses) | medium: accuracy of the stream mixing |
+| 6 | sm_75 K = 5 GEMV + unfused qkv/z on the 2060 (relax the K <= 4 gate in `exl3_gemv_cfg` / `use_mgemm`, sm_75 only) | measured -2.6 ms at `-mcl 24` (24 layers on the 2060), ~0.8 ms under `-mcs 256` (~7 layers) | low: kernel exists; needs a sm_75 K = 5 test and PPL |
+| 7 | CPU expert kernel (AVX2, compute-bound at ~2 GB/s per core vs 40 GB/s RAM) | -5 ms or more at `-mcl 24` / cold profile; under warm `-mcs` the CPU is hidden (4.9 ms no-GPU) | high effort, medium risk |
+| 8 | Load: skip or shrink the n-gram row lookups in `warmup`; move the model off the USB SSD | -35 s of ~160 s load; the disk move roughly halves the 85 s weight read | low (warmup) / user decision (disk) |
+| 9 | n-gram rows: keep the hot part of the table in RAM, prefetch a token ahead | ~0.5 ms short context, ~4 ms at long context on novel text | low-medium |
+| 10 | QSA at long context: 2060 indexer (189 us/layer) and sparse split | ~2 ms at 21k tokens, nothing below ~2k | medium |
+| - | Ruled out: `-mct 15` (SMT siblings slower), `-mcl` < 24 (does not fit), `-ngr` (RAM), `-mcs 288 -mcpa` (no gain over warm `-mcs 288`, fit marginal) | | |
 
 ## Target (set Nov 3 by the user)
 
