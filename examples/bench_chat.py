@@ -57,6 +57,17 @@ def main(args):
         context.append((user, None))
         text = fmt.format(system_prompt, context, False)
         ids = tokenizer.encode(text, add_bos = fmt.add_bos(), encode_special_tokens = True)
+        if args.cool:
+            # wait until the P100 is at or below args.cool C before the turn (thermal throttling at 79 C otherwise
+            # dominates long replies)
+            while True:
+                try:
+                    t = int(subprocess.run(["nvidia-smi", "-i", str(args.smi_index), "--query-gpu=temperature.gpu",
+                                            "--format=csv,noheader,nounits"], capture_output = True, text = True).stdout.strip())
+                except Exception:
+                    break
+                if t <= args.cool: break
+                time.sleep(3)
         pre = smi(args.smi_index)
         job = Job(input_ids = ids, max_new_tokens = args.max_new, stop_conditions = stop_conditions,
                   sampler = model_init.get_arg_sampler(args) if args.sample else ArgmaxSampler())
@@ -103,6 +114,8 @@ if __name__ == "__main__":
                         help = "Max new tokens per turn; chat.py runs to EOS, so compare its acceptance with a value that does too (a short cap measures only the code part of a reply, which drafts better)")
     parser.add_argument("-smi_index", "--smi_index", type = int, default = 0, help = "nvidia-smi index of the P100")
     parser.add_argument("-tag", "--tag", type = str, default = "run")
+    parser.add_argument("-cool", "--cool", type = int, default = 0,
+                        help = "Before each turn, wait until the P100 (-smi_index) is at or below this temperature (C); 0 = off")
     parser.add_argument("-save_text", "--save_text", type = str, default = None,
                         help = "Write the generated text of every turn to this file (compare builds/kernels byte for byte)")
     parser.add_argument("-sample", "--sample", action = "store_true",

@@ -350,6 +350,106 @@ not byte-bound, so the floor is not reachable; m = 1 costs ~17 us per expert, an
   `-sdh 0 / 8192 / 32768`, `-dc`. With 1.8 tokens per step on prose, `-ndt 1` is the likely prose winner.
 - `bench_chat` now prints tokens per step ((new - 1) / (new - 1 - accepted)) and the sparse-head miss rate / mode.
 
+## Qwen3.8-27B (dense) stage 0
+
+Nov 5, branch `dense27-stage0` (= `flash-fix-ndt` c5145bcb, same `.so`; only `bench_chat -cool` added). Model
+`models/Qwen3.8-27B-exl3-4.00bpw`: 64 layers (48 GDN + 16 full attention, head_dim 256, 4 KV heads), hidden 5120, MLP
+17408, 4 bpw body, 6 bpw lm_head (954 MB, 248320 x 5120), 1-layer MTP head. `-gs 4.0,15.0 -cs 32768 -cq 4`: 17 layers
+plus the MTP layer on the 2060 (3.61 GiB), 47 layers plus the lm_head on the P100 (9.91 GiB), embedding on the CPU.
+Harness `tmp/d27s0/prof_m.py` (one load, a fresh Generator per draft width, code prompt, 400 tokens timed, torch.profiler
+window of 40 steps). Every number is labelled **greedy** or **card** (model-card sampling, non-thinking: `-temp 0.7
+-topp 0.8 -topk 20 -minp 0 -presp 1.5`).
+
+**The main result is thermal.** Cooled (P100 <= 62 C before each run) the P100 holds 1189-1252 MHz. Back-to-back runs
+without cooling (as the user asked from 22:40) keep it at 78-80 C with thermal slowdown in 74-83% of the nvidia-smi samples
+and a mean SM clock of 523-595 MHz (min 405). The P100 kernels get 1.9-2.7x slower (4 bpw down GEMV 189 -> 353 us at m = 1,
+294 -> 789 us at m = 4); the 2060 kernels do not change. Decode t/s roughly halves. The sampler costs nothing measurable
+(argmax/sample kernels 0.1 ms per step, host gaps unchanged), so greedy-cooled vs card-hot differ by heat, not by sampling.
+
+### Decode by draft width (m = rows per verify step)
+
+| m (config) | greedy, cooled: ms/step, tok/step, t/s, acc | card, hot (3 reps, one load): ms/step, tok/step, t/s mean (min-max), acc |
+| :--- | :--- | :--- |
+| 1 (no MTP) | 66.9, 1.00, 14.95 | 113.1, 1.00, 8.87 (8.49-9.60) |
+| 2 (`-ndt 1`) | 80.4, 1.94, 24.13, 94.2% | 146.9, 1.89, 12.89 (12.05-13.42), 89.0% |
+| 3 (`-ndt 2`) | 97.4, 2.74, 28.11, 87.0% | 213.8, 2.78, 13.01 (12.87-13.09), 89.2% |
+| 4 (`-ndt 3`) | 102.7, 3.38, **32.89**, 78.7% | 232.6, 3.13, 13.48 (11.72-14.52), 70.6% |
+
+Card-hot, two more loads of m = 3 / 4 (2 reps each, the M34 A/B below): 12.45 / 12.89 and 14.56 / 14.73 t/s, acceptance
+81.6-87.5% / 77.8-78.7%. Under card sampling acceptance at ndt 3 moves by ~8 points between reps (59.9-80.6%).
+
+`bench_chat` full replies (`-max_new 1000`, two turns per load: code "Implement a quicksort in go", then prose "Explain in
+detail how the Roman Republic became an empire"), one load each, **greedy**: no MTP 15.50 / 15.15 t/s (no cooling between
+turns; prose turn ended at 885 MHz); `-ndt 1 -dds` code 24.64 t/s (97.6%, 1.98 tok/step), prose 22.22 t/s (79.2%, 1.79
+tok/step) with the P100 cooled to 62 C before each turn, prose only 15.64 t/s without that cooling (506 MHz at the end).
+The code reply is short (317-328 tokens).
+
+**Missing (stopped on request, not measured):** the card-sampling `bench_chat` sweep (3 loads x {no MTP, ndt 1 -dds,
+ndt 2, ndt 3}, ndt 2/3 with `-dds`), so there is no card number for full code/prose replies yet; prefill at 2k / 8k / 24k
+with kernel shares (harness `ctx.py` ready); decode at 8k / 24k / 64k context (`ctx.py -cs 73728`); the `-gs 2.0,15.5`
+split probe; a matched A/B for `-sdh`. Nov 4 data from an older build (before MMODE 4), greedy, cooled, for reference
+only: prefill 226 t/s at 2k and 4k, 223 at 8k, 204 at 16k (P100 at 80 C by the end); hot back-to-back 4k / 8k / 16k fell
+to 182 / 110 / 93 t/s (thermal 59%).
+
+### Where a step goes (greedy, cooled, torch.profiler, ms per step)
+
+| | m = 1 | m = 2 | m = 3 | m = 4 |
+| :--- | ---: | ---: | ---: | ---: |
+| profiled wall (unprofiled) | 67.4 (66.9) | 80.8 (80.4) | 99.7 (97.4) | 105.8 (102.7) |
+| P100 verify (47 layers + lm_head) | 45.2 | 52.2 | 65.3 | 66.2 |
+| -- 4 bpw GEMV MLP gate+up / down | 16.4 / 8.9 | 19.4 / 10.0 | 22.9 / 13.7 | 23.1 / 13.8 |
+| -- 4 bpw GEMV GDN qkv / z / out | 4.0 / 2.5 / 2.9 | 4.7 / 3.0 / 3.2 | 5.7 / 3.5 / 4.3 | 5.7 / 3.5 / 4.3 |
+| -- 4 bpw GEMV attention q / k+v / o | 1.8 / 0.7 / 1.0 | 2.1 / 0.8 / 1.1 | 2.4 / 1.0 / 1.5 | 2.4 / 1.0 / 1.5 |
+| -- lm_head (6 bpw) | 2.6 | 3.2 | 3.9 | 3.9 |
+| -- GDN (conv, recurrence, gates) / attention / norms | 2.1 / 1.1 / 0.7 | 2.5 / 1.2 / 0.7 | 3.1 / 2.3 / 0.7 | 3.5 / 2.4 / 0.7 |
+| 2060 verify (17 layers, 4 bpw GEMV ~95%) | 20.7 | 21.3 | 22.0 | 22.5 |
+| draft head: target lm_head at m = 1 on the P100, per draft token 2.6-2.9 | - | 2.6 | 5.7 | 8.6 |
+| draft MTP layer on the 2060 (+ MTP prefill of the accepted token) | - | 1.3 + 0.6 | 2.6 + 0.6 | 3.9 + 0.6 |
+| recurrent rewind (P100 + 2060) | - | 0.07 | 0.2 | 0.4 |
+| no GPU busy (host, syncs, CPU embedding round trips) | 1.5 | 5.9 | 3.7 | 6.5 |
+
+- GEMV dispatch on the P100 (`exl3_gemv_kernel<4, fp32, cb 2, MMODE, cfg>`): m = 1 MMODE 0, m = 2 MMODE 2, m = 3..4
+  MMODE 4. gate/up (n 17408) take the wide config (112 blocks x 256), down (k 17408) the narrow one (56 x 512); per call
+  gate/up 171 / 202 / 239 / 241 us, down 136 / 152 / 207 / 208 us for m = 1 / 2 / 3 / 4. On the 2060 m >= 2 runs MMODE 1
+  (MMA): flat in m (gate/up 254 us, down 170 us).
+- **No jump at m = 4 on a cool GPU**: m 3 -> 4 costs +5.3 ms (one more draft lm_head +2.9, MTP layer +1.3, GDN, rewind,
+  gaps); the GEMV is identical at m = 3 and 4 (MMODE 4 serves both). The expensive step is m 2 -> 3 (+17 ms: GEMV MMODE 2
+  -> 4 +11 ms on the P100, one more draft step +4.4, paged attention 70 -> 154 us x12 +1 ms). The user's 161 ms/step at
+  `-ndt 3` matches the hot P100 (card-hot m = 4: 230 ms/step), so it is most likely thermal throttling, not a dispatch
+  path; not reproduced in a cool run.
+- `EXL3_GEMV_M34=0` (MMODE 1 at m = 3..4), greedy cooled one load: m = 3 125.3 ms (21.83 t/s), m = 4 132.3 ms (25.52 t/s)
+  against 97.4 / 102.7. Card-hot ABAB (2 loads each): on 211.0 / 213.1 ms (m = 3), 231.1 / 229.9 (m = 4); off 263.0 /
+  273.5, 286.3 / 285.8. **MMODE 4 is worth +24-29% at m = 3..4 on this model** (larger than on Flash-Next).
+- `-sdh 16384`, card-hot, one load (not matched, indicative): m = 2 134.9 ms (13.96 t/s, 88.2%), m = 3 198.2 ms (13.71
+  t/s, 86.1%) vs 146.9 / 211-214 without: -12 to -15 ms per step hot, consistent with removing the m = 1 draft lm_heads.
+
+**Floors.** Bytes per verify: P100 35 GDN x 192.5 MB + 12 attention x 186.3 MB + lm_head 954 MB = 9.93 GB; 2060 3.25 GB.
+At the P100's measured read peak (~450-520 GB/s, Flash-Next microbench) and an assumed ~300 GB/s on the 2060 (spec 336,
+not measured here) that is 20.7 + 10.8 = **31.5 ms** per verify at any m <= 4 (the two GPUs run serially, so the floors add),
+plus 2.0 ms per draft lm_head. Measured: P100 GEMV at m = 1 runs at 236-262 GB/s, at m = 4 at 150-187 GB/s (decode/ALU
+bound, as on Flash-Next); the 2060 at 155-180 GB/s at every m. GEMV at m = 4 is 63 ms on the P100 against a 20.7 ms floor.
+Per layer at m = 1 the P100 is faster (0.96 vs 1.22 ms), at m = 4 they are equal (1.32 ms), so moving layers to the P100
+(`-gs 2.0,15.5`, not measured) would help m = 1..2 only (~2.6 ms at m = 1).
+
+### Ranked candidates (estimates; base greedy-cooled `-ndt 3` 102.7 ms/step, 3.38 tok/step, 32.9 t/s)
+
+| # | Candidate | Est. gain | Risk / effort |
+| :--- | :--- | :--- | :--- |
+| 1 | Keep the P100 below 79 C (airflow / fan on the passive card; or a lower power cap, untested whether the cap clock beats the thermal 500-600 MHz) | hot card -> cool: 230 -> ~103 ms/step, ~13.5 -> ~30 t/s (card) | hardware/config, no code |
+| 2 | `-sdh 16384` (removes the per-draft-token full lm_head on the P100, 2.6-2.9 ms each, and the CPU embedding round trip) | ~8 ms/step at ndt 3 cool (-8%, ~35.5 t/s); hot probe -12..15 ms | config; needs matched A/B and acceptance check (Nov 4: cold token profile cost acceptance) |
+| 3 | P100 4 bpw GEMV at m = 3..4 (MMODE 4) closer to the m = 2 cost per call (gate/up 240 -> ~205, down 208 -> ~155, GDN/attn proj ~-20%) | ~10-12 ms/step (~-11%) | kernel work, medium-high |
+| 4 | P100 4 bpw GEMV efficiency at every m (236-262 GB/s at m = 1 vs ~480 peak; trellis decode bound) | up to ~20 ms at m = 4 if 1.5x | high |
+| 5 | 2060 GEMV at ~170 GB/s (half its bandwidth), 22 ms at every m | ~5-8 ms | medium |
+| 6 | Host gaps / syncs in the MTP loop (no-GPU 4-6.5 ms profiled): CPU embedding lookup per draft step, per-step syncs | 2-4 ms | low-medium |
+| 7 | Paged attention decode at m >= 3 (154 vs 70 us x12) and GDN recurrence at m = 4 (63 us x35) | ~1.5 ms | low-medium |
+| 8 | Split `-gs 2.0,15.5` | ~2.6 ms at m = 1, ~0 at m = 4 | config, unmeasured |
+
+Carries over from Flash-Next: GEMV MMODE 4 (in use, +24-29% here), `-sdh` (the MTP draft uses the target lm_head),
+`bench_chat` tokens/step. Does not apply: MoE coop / dual kernels, gated-residual `GR_MIX3`, CPU experts and `-mcs`, n-gram
+tables, QSA, the K = 5 GEMV work (this model is 4 bpw with a 6 bpw head; the 6 bpw head lives on the P100 so the sm_75
+K <= 4 gate does not matter). Harness pitfalls: `prof_m.py` overwrites `trace_m*.json` per run (the greedy traces above
+were overwritten by the card-hot ones; the tables come from the greedy analysis made before).
+
 ## Target (set Nov 3 by the user)
 
 **100 t/s** with MTP (`-mtp -ndt 1 -dds`, `-gs 4.0,15.0 -cq 4`) on Qwen3.6-35B-A3B and on Ornith-1.5-35B-A3B, measured with
