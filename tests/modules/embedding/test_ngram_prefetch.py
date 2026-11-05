@@ -163,3 +163,31 @@ def test_prefetch_disabled(make_module, monkeypatch, stream):
     mod.prefetch(h)
     assert not mod.table._pending
     assert torch.equal(fwd(mod, h), fwd(ref_mod, h))
+
+
+@pytest.mark.parametrize("stream", [True, False], ids = ["disk", "ram"])
+def test_warmup_skips_table_reads(make_module, monkeypatch, stream):
+    """Model warmup (params["tp_warmup"]) decodes zero rows without reading the table; forwards after it are
+    bit-identical to a module that never ran a warmup lookup"""
+    torch.manual_seed(2)
+    ref_mod = make_module(stream)
+    mod = make_module(stream)
+    chunks = [history(s) for s in (1, 4096, 300)]
+    refs = [fwd(ref_mod, h) for h in chunks]
+
+    reads = []
+    real_gather = rt.RowTable._gather_rows
+    def counting_gather(self, uids, out):
+        reads.append(uids.numel())
+        return real_gather(self, uids, out)
+    monkeypatch.setattr(rt.RowTable, "_gather_rows", counting_gather)
+    for h, ref in zip(chunks, refs):
+        out = mod.forward(h, {"tp_warmup": True})
+        torch.cuda.synchronize(mod.device)
+        assert out.shape == ref.shape and torch.isfinite(out.float()).all()
+    assert not reads
+    assert not mod.table._pending and not any(p.held for p in mod.table._pins)
+    assert mod._skip_read is False
+    for h, ref in zip(chunks, refs):
+        assert torch.equal(fwd(mod, h), ref)
+    assert reads

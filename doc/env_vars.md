@@ -112,6 +112,18 @@ On ROCm both kernels run on RDNA's int8 WMMA instructions (`rocm/det_gemm_rocm.c
 per-chunk integer sums are exact and the fp32 combination keeps the same fixed order, so ranks
 agree across RDNA generations as well.
 
+### `EXL3_GR_MIX3` (default: on for compute capability < 8, off elsewhere; CUDA only)
+
+Kernel pair of the decode-sized gated-residual mix (`ext.gr_mix`, 1 to 4 rows, the Qwen3.8 shape
+D = 2560, rank 320). `1` runs `gr_dots_kernel3` / `gr_finalize_kernel3` (`hc_gr_decode3.cuh`): one
+stream per dots block, its rows held in shared memory, one fn row per warp, and a finalize that
+issues all its loads before the dots-dependent prologue and spreads the epilogue over the lanes.
+`0` runs the older `gr_dots_kernel2` / `gr_finalize_kernel2` pair. The outputs are bit-identical
+(same per-lane chunks, FMA order and reduction trees; `tests/kernels/hyperconnections/test_gr_mix_decode.py`).
+Unset picks `1` on Pascal and Turing, where it was measured (13 MB per site at 2 rows: P100 54-70 ->
+39 us, RTX 2060 80-100 -> 54 us), and keeps the older pair on sm_80+. Other shapes and row counts
+ignore the switch.
+
 ### `EXL3_BC_GDN` (default: `1`)
 
 Gated-delta-net (Qwen3-Next/3.5, KDA in GLM-5.3/Kimi Linear) counterpart of `EXL3_BC_ATTN`:
@@ -309,6 +321,12 @@ projections (gate/up, q/k/v, the GatedDeltaNet input projections) are unfused so
 (mcg and 3INST are unmeasured there and keep the general heuristic). Qwen3.6-27B 4.00bpw decode, the
 2060's 16 layers: 26.8 -> 18.0 ms GPU time per token. `0` keeps the general heuristic (tile kernel
 for most of these shapes) and the fused MGEMM.
+
+### `EXL3_GEMV_M34` (default: `1`)
+
+Pascal (sm_60), m = 3..4 rows (MTP verify at `-ndt 2/3`): the GEMV takes MMODE 4, the emulated-MMA arithmetic
+with one output per lane, bit-identical to the MMA path and 10-40% faster. `0` restores the MMA path (MMODE 1).
+Read per call.
 
 ### `EXL3_GEMV_SMEM` (default: `-1`)
 
@@ -710,6 +728,19 @@ For the dual persistent MoE launch (shared + routed experts, more than one row, 
 the two input-rotation pre-kernels run as one launch, the blocks of the shared expert's rotation first.
 Same per-warp work, bit-identical (`tests/kernels/moe/test_moe_coop_fused.py::test_dual_shared_routed`).
 Read per call.
+
+### `EXL3_MOE_COOP_M34` (default: `1`)
+
+Pascal (sm_60), fused decode MoE: expert runs of 2..4 rows (one expert picked by several tokens of an MTP
+verify step, and the shared expert at m = 2..4) take the one-output-per-lane form of the emulated MMA, as
+`EXL3_GEMV_M34` does for the GEMV. Bit-identical (`tests/kernels/moe/test_moe_coop_m34.py`). `0` restores the
+emulated MMA. Read per call.
+
+### `EXL3_MOE_COOP_DUAL_H` (default: `1`)
+
+Dual persistent MoE launch (shared + routed experts in one queue) also for half-integer routed rates (mul1,
+1.5 / 2.5 bpw routed with a 4..6 bpw shared expert, e.g. Qwen3.8-Flash-Next). Bit-identical to the separate
+launches. `0` keeps the separate shared and routed launches. Read per call.
 
 ### `EXL3_MTP_DEFER_CONF` (default: `1`)
 

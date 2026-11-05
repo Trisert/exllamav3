@@ -63,6 +63,7 @@ struct MoeCoopParams
     int ksplit_a;               // split-k blocks per chunk per stage (launcher; partial rows at slot + q * slots)
     int ksplit_b;
     int dbg;                    // diagnostics (EXL3_MOE_COOP_DBG): 1 skip A epilogue, 2 skip B reduction
+    bool m34;                   // sm_60: runs of 2..4 rows take the one-output-per-lane tile (EXL3_MOE_COOP_M34, default on)
     int* runs;                  // run table (bsz > 1): [n_runs, -, run_start[slots_max + 1], order[slots_max]]
     int slots_max;
     int rows_max;               // token rows the output scratch holds

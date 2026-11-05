@@ -209,6 +209,11 @@ struct MoeCoopPlan
 static MoeCoopPlan moe_coop_plan(MoeCoopParams& p, int device)
 {
     { static int dbg = std::getenv("EXL3_MOE_COOP_DBG") ? atoi(std::getenv("EXL3_MOE_COOP_DBG")) : 0; p.dbg = dbg; }
+    {
+        // Per call: tests compare both forms in one process
+        const char* env = std::getenv("EXL3_MOE_COOP_M34");
+        p.m34 = !env || std::atoi(env) != 0;
+    }
     MoeCoopPlan pl;
     const int slots = p.bsz * p.topk;
     const int nproj = p.gated ? 2 : 1;
@@ -288,7 +293,15 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int 
 static MoeCoopKernel moe_coop_kernel_d(float K_r, float K_s, int cb, int Hi)
 {
     const BitsK br = bits_from_K(K_r), bs = bits_from_K(K_s);
-    if (br.half || bs.half) return { nullptr, 0 };
+    if (bs.half) return { nullptr, 0 };
+    // Half-integer routed rate (e.g. Qwen3.8-Flash-Next's 1.5 bpw experts with a 5 bpw shared expert).
+    // EXL3_MOE_COOP_DUAL_H=0 keeps the separate launches (per call: tests compare both forms in one process)
+    if (br.half)
+    {
+        const char* env = std::getenv("EXL3_MOE_COOP_DUAL_H");
+        if (env && std::atoi(env) == 0) return { nullptr, 0 };
+        return exl3_moe_coop_kernel_d_h(br.bits, bs.bits, cb, Hi);
+    }
     switch (br.bits)
     {
         case 2: return exl3_moe_coop_kernel_d_r2(bs.bits, cb, Hi);

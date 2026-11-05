@@ -16,6 +16,10 @@ import math
 # TP, see hc_mix_tiled.cu); 0 falls back to the cuBLAS GEMM path
 _gr_mix_tiled_enable = os.environ.get("EXL3_GR_MIX_TILED", "1") != "0"
 
+# Decode row counts (R <= 4, D 2560 / rank 320): ext.gr_mix kernel pair. 1 = gr_*_kernel3 (one stream per
+# dots block from shared memory, bit-identical), 0 = the older gr_*_kernel2 pair, unset = 1 on cc < 8 only
+_gr_mix3 = int(os.environ.get("EXL3_GR_MIX3", "-1"))
+
 # Decode row counts: launch-count folds for the mHC sites (hc_mix_fused, hc_fuse.cuh). apply_ defers its
 # residual update into the next site's mix, and the RMSNorm a block runs after a mix executes inside its
 # finalize. Bit-identical to the unfused launches; EXL3_HC_FOLD selects (per-backend default in util/backend.py)
@@ -597,7 +601,7 @@ class GatedResidual(Module):
             dots = ws(R * M * H, torch.float, "gr_mix_dots").view(R, M, H)
             post = ws(R * H, torch.float, "gr_mix_post").view(R, H) if self.use_combine else None
             mixed = ws(R * Dh, torch.half, "gr_mix_mixed").view(R, Dh)
-            ext.gr_mix(s3, xw, self.proj_h[: self.proj_m], self.upx_h, self.w_h, self.rms_eps, dots, post, mixed)
+            ext.gr_mix(s3, xw, self.proj_h[: self.proj_m], self.upx_h, self.w_h, self.rms_eps, dots, post, mixed, _gr_mix3)
         elif self.tiled:
             # Prefill-shaped workspaces are per-call (pow2-rounded so the caching allocator
             # reuses segments across chunk sizes), never statics

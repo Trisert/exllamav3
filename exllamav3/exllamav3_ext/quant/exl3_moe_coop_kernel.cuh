@@ -353,7 +353,8 @@ __device__ __forceinline__ void gemv_tile
     int ntiles,
     int group,                          // block column group of tile_cols<WIDE>() columns
     float* __restrict__ sh_red,         // [WKK][ROWS][TCOLS]
-    uint32_t* __restrict__ sh_stage     // [WK][STAGE_WORDS], staged widths only
+    uint32_t* __restrict__ sh_stage,    // [WK][STAGE_WORDS], staged widths only
+    bool m34                            // sm_60, 2..4 rows: one output per lane (p.m34)
 )
 {
     constexpr bool REG = HALF ? false : tile_reg<bits>();
@@ -384,6 +385,14 @@ __device__ __forceinline__ void gemv_tile
     // sm_60, single row (decode): direct dot product instead of the shuffle-emulated MMA. Block-uniform
     const bool direct = EXL3_SM60 && nrows == 1;
     const size_t a_row_direct = direct ? (size_t) rows[0] * a_stride2 : 0;
+    // sm_60, 2..4 rows (MTP verify): the emulated MMA's arithmetic with one output per lane and n8 fragment
+    // (row lane % 4, column lane / 4), as MMODE 4 of exl3_gemv_kernel: 8 shuffles + 8 HFMA2 per fragment
+    // instead of 16 + 32, no A gather. Bit-identical: same HFMA2 chain, pair sum and fp16 run sum, kept in
+    // the low half of ch[t][f][0] (high half stays zero) and folded into acc0[t][f].x. Block-uniform
+    const bool trans = EXL3_SM60 && m34 && nrows >= 2 && nrows <= 4;
+    const int rt = lane & 3;
+    const bool rt_ok = rt < nrows;
+    const size_t a_row_t = (trans && rt_ok) ? (size_t) rows[rt] * a_stride2 : 0;
 
     [[maybe_unused]] int x_src_a = 0, x_src_b = 0, x_s2 = 0;
     if constexpr (bits == 2)
@@ -475,6 +484,26 @@ __device__ __forceinline__ void gemv_tile
                 x01 = A2[a_row_direct + a_col];
                 x23 = A2[a_row_direct + a_col + 4];
             }
+#if EXL3_SM60
+            else if (trans)
+            {
+                // Row lane % 4, k pairs 0..7 of the slice (the a_rows[0] the gather would build for that row)
+                if (rt_ok)
+                {
+                    const uint4* ap = (const uint4*) (A2 + a_row_t + (size_t) (ks0 + i) * 8);
+                    const uint4 u0 = ap[0];
+                    const uint4 u1 = ap[1];
+                    const uint32_t uw[8] = {u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w};
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) a_rows[0][j] = *reinterpret_cast<const half2*>(&uw[j]);
+                }
+                else
+                {
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) a_rows[0][j] = hzero;
+                }
+            }
+#endif
             else
             {
                 a01[0] = r0_ok ? A2[a_row0 + a_col] : hzero;
@@ -519,6 +548,36 @@ __device__ __forceinline__ void gemv_tile
                     ch[t][0][0] = __hfma2(x23, f0[1], __hfma2(x01, f0[0], ch[t][0][0]));
                     ch[t][1][0] = __hfma2(x23, f1[1], __hfma2(x01, f1[0], ch[t][1][0]));
                 }
+#if EXL3_SM60
+                else if (trans)
+                {
+                    // Column lane / 4 of each n8 fragment lives in this lane's quad (lane 4n + j: k = 2j, 2j + 1 in
+                    // [0], 2j + 8, 2j + 9 in [1]); chain order of exl3_mma_m16n8k16_f16_pregathered
+                    const int qb = lane & ~3;
+                    #pragma unroll
+                    for (int f = 0; f < 2; ++f)
+                    {
+                        const FragB& fr = f ? f1 : f0;
+                        const uint32_t e0 = *reinterpret_cast<const uint32_t*>(&fr.elems[0]);
+                        const uint32_t e1 = *reinterpret_cast<const uint32_t*>(&fr.elems[1]);
+                        half2 dd = hzero;
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j)
+                        {
+                            const uint32_t u = __shfl_sync(0xffffffffu, e0, qb + j);
+                            dd = __hfma2(a_rows[0][j], *reinterpret_cast<const half2*>(&u), dd);
+                        }
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j)
+                        {
+                            const uint32_t u = __shfl_sync(0xffffffffu, e1, qb + j);
+                            dd = __hfma2(a_rows[0][4 + j], *reinterpret_cast<const half2*>(&u), dd);
+                        }
+                        const half s = __hadd(__low2half(dd), __high2half(dd));
+                        ch[t][f][0] = __hadd2(ch[t][f][0], __halves2half2(s, __ushort_as_half(0)));
+                    }
+                }
+#endif
                 else
                 {
 #if EXL3_SM60
@@ -563,6 +622,19 @@ __device__ __forceinline__ void gemv_tile
                 if ((lane & 3) == 0)
                     red[t * 16 + f * 8 + (lane >> 2)] = s;
             }
+    }
+    else if (trans)
+    {
+        // Lane holds row lane % 4, column t * 16 + f * 8 + lane / 4
+        if (rt_ok)
+        {
+            float* red = sh_red + (wk * ROWS + rt) * TCOLS + wn * COLS;
+            #pragma unroll
+            for (int t = 0; t < WNT; ++t)
+                #pragma unroll
+                for (int f = 0; f < 2; ++f)
+                    red[t * 16 + f * 8 + (lane >> 2)] = acc0[t][f].x;
+        }
     }
     else if (r0_ok)
     {
@@ -621,7 +693,9 @@ __device__ __forceinline__ int token_active_slots(const MoeCoopParams& p, int ro
 
 // A token with no active slot on this rank (expert-parallel sharding: every pick lives elsewhere)
 // gets no arrival in the down stage, so nobody would write its output row. Writes one 128-chunk of
-// that row: the shared-expert term when there is one, else zeros. Warp-level
+// that row: the shared-expert term when there is one, else zeros. Warp-level. In the dual kernel
+// (p.f_sh_wait) the shared output is produced by the same launch, so these rows are written by the
+// last shared down item (write_empty_rows) instead of the rotation pre-kernel / gate-up stage
 __device__ __forceinline__ void write_empty_row_chunk(const MoeCoopParams& p, int row, int chunk, int lane)
 {
     const int col = chunk * 128 + lane * 4;
@@ -645,10 +719,10 @@ __device__ __forceinline__ void write_empty_row_chunk(const MoeCoopParams& p, in
             gv = 1.0f / (1.0f + __expf(-dot));
         }
         const float* sh = p.sh_out + (size_t) row * p.H + col;
-        if (col + 0 < p.H) o0 = gv * sh[0];
-        if (col + 1 < p.H) o1 = gv * sh[1];
-        if (col + 2 < p.H) o2 = gv * sh[2];
-        if (col + 3 < p.H) o3 = gv * sh[3];
+        if (col + 0 < p.H) o0 = gv * __ldcg(sh + 0);
+        if (col + 1 < p.H) o1 = gv * __ldcg(sh + 1);
+        if (col + 2 < p.H) o2 = gv * __ldcg(sh + 2);
+        if (col + 3 < p.H) o3 = gv * __ldcg(sh + 3);
     }
     float* dst = p.out + (size_t) row * p.out_stride + col;
     if (col + 3 < p.H_out)
@@ -659,6 +733,17 @@ __device__ __forceinline__ void write_empty_row_chunk(const MoeCoopParams& p, in
         if (col + 1 < p.H_out) dst[1] = o1;
         if (col + 2 < p.H_out) dst[2] = o2;
     }
+}
+
+// Every empty token row of the call, one block (dual kernel, after the shared down stage)
+__device__ __forceinline__ void write_empty_rows(const MoeCoopParams& p)
+{
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    for (int row = 0; row < p.bsz; ++row)
+        if (token_active_slots(p, row) == 0)
+            for (int oc = warp; oc < p.Ho / 128; oc += THREADS / 32)
+                write_empty_row_chunk(p, row, oc, lane);
 }
 
 // Input rotation of one 128-chunk of a slot's x row: zero-padded from H to Hi, * suh, Hadamard
@@ -708,7 +793,7 @@ void moe_coop_rot_body(const MoeCoopParams& p, const int bidx)
     {
         // Empty token row (no active slot on this rank): its first slot's warps write the output
         // chunks c, c + chunks, ... (Hi chunks vs Ho chunks may differ)
-        if (rem % nproj == 0 && s % p.topk == 0 && token_active_slots(p, si.row) == 0)
+        if (!p.f_sh_wait && rem % nproj == 0 && s % p.topk == 0 && token_active_slots(p, si.row) == 0)
             for (int oc = c; oc < p.Ho / 128; oc += chunks)
                 write_empty_row_chunk(p, si.row, oc, lane);
         return;
@@ -787,7 +872,7 @@ __device__ __forceinline__ void a_item(const MoeCoopParams& p, const int item, u
     {
         // bsz 1: an inactive slot's blocks (up projection, split 0) write the output chunks of an
         // empty token row, one warp per chunk, strided by the number of gate/up groups
-        if (!p.a_global && run_idx < p.bsz * p.topk && !is_gate && ks == 0 && run_idx % p.topk == 0)
+        if (!p.a_global && !p.f_sh_wait && run_idx < p.bsz * p.topk && !is_gate && ks == 0 && run_idx % p.topk == 0)
         {
             const int row = run_idx / p.topk;
             if (token_active_slots(p, row) == 0)
@@ -826,7 +911,7 @@ __device__ __forceinline__ void a_item(const MoeCoopParams& p, const int item, u
         // Partial output rows of split ks live at slot + ks * slots (ksplit * slots <= slots_max)
         const size_t part = (size_t) ks * (p.bsz * p.topk) * p.I * (p.gu_f32 ? 4 : 2);
         void* C = (void*) (((char*) (is_gate ? p.gu_g : p.gu_u)) + part);
-        gemv_tile<bits, cb, WIDE, HALF>(B32, A2, a_stride2, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, sh_red, sh_stage);
+        gemv_tile<bits, cb, WIDE, HALF>(B32, A2, a_stride2, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, sh_red, sh_stage, p.m34);
     }
 
     for (int r = 0; r < nrows; ++r)
@@ -955,7 +1040,7 @@ __device__ __forceinline__ void b_item(const MoeCoopParams& p, const int item, u
         const uint32_t* B32 = (const uint32_t*) p.d_trellis[local];
         float* C = p.d_out + (size_t) ks * (p.bsz * p.topk) * p.Ho;
         gemv_tile<bits, cb, WIDE, HALF>(B32, (const half2*) p.act_out, (size_t) p.I / 2, sh_rows, nrows, C, p.Ho, true,
-                                  k_begin, k_end, p.Ho / 16, group, sh_red, sh_stage);
+                                  k_begin, k_end, p.Ho / 16, group, sh_red, sh_stage, p.m34);
     }
 
     for (int r = 0; r < nrows; ++r)
@@ -1134,7 +1219,8 @@ void exl3_moe_coop_f_kernel(const MoeCoopParams p)
 // epilogue waits for every shared down item before merging the shared output. Items are again
 // the two-launch blocks unchanged, so the result is bit-identical to the separate launches
 
-template <int bitsR, int bitsS, int cb>
+// HALF_R: routed experts at a half-integer rate (mul1); the shared expert is always an integer rate
+template <int bitsR, int bitsS, int cb, bool HALF_R = false>
 __global__ __launch_bounds__(THREADS)
 void exl3_moe_coop_d_kernel(const MoeCoopParams p, const MoeCoopParams ps)
 {
@@ -1151,18 +1237,26 @@ void exl3_moe_coop_d_kernel(const MoeCoopParams p, const MoeCoopParams ps)
         if (t >= n_items) break;
         if (t < n_sa) { a_item<bitsS, cb, true, false, true>(ps, t, smem_dyn, ss); continue; }
         t -= n_sa;
-        if (t < n_ra) { a_item<bitsR, cb, true, false, true>(p, t, smem_dyn, ss); continue; }
+        if (t < n_ra) { a_item<bitsR, cb, true, HALF_R, true>(p, t, smem_dyn, ss); continue; }
         t -= n_ra;
         if (t < n_sb)
         {
             b_item<bitsS, cb, true, false, true>(ps, t, smem_dyn, ss);
             __threadfence();
             __syncthreads();
-            if (threadIdx.x == 0) atomicAdd(p.f_sh_done, 1);
+            if (threadIdx.x == 0) ss.flag = atomicAdd(p.f_sh_done, 1) == n_sb - 1;
+            __syncthreads();
+            if (ss.flag)
+            {
+                // Last shared down item: the shared output is complete, write the empty token rows
+                __threadfence();
+                write_empty_rows(p);
+            }
+            __syncthreads();
             continue;
         }
         t -= n_sb;
-        b_item<bitsR, cb, true, false, true>(p, t, smem_dyn, ss);
+        b_item<bitsR, cb, true, HALF_R, true>(p, t, smem_dyn, ss);
     }
     if (threadIdx.x == 0)
     {

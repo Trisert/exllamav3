@@ -35,7 +35,9 @@ def smi(index):
 
 @torch.inference_mode()
 def main(args):
+    t_load = time.time()
     model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(args)
+    print(f"LOAD {time.time() - t_load:.1f} s (incl. warmup)", flush = True)
     generator = Generator(
         model = model, cache = cache, tokenizer = tokenizer,
         draft_model = draft_model, draft_cache = draft_cache,
@@ -66,6 +68,9 @@ def main(args):
                 if r.get("eos"):
                     last = r
         context[-1] = (user, out)
+        if args.save_text:
+            with open(args.save_text, "a" if i else "w") as f:
+                f.write(out + "\n")
         post = smi(args.smi_index)
         new_tokens = last.get("new_tokens", 0)
         tps = new_tokens / (last.get("time_generate", 1e-6) or 1e-6)
@@ -75,8 +80,12 @@ def main(args):
         if "accepted_draft_tokens" in last:
             a = last["accepted_draft_tokens"]
             d = a + last["rejected_draft_tokens"]
-            line += f" | draft {a}/{d} ({100 * a / max(d, 1):.1f}%)"
+            # the prefill emits the first token; every step after it its accepted drafts plus one of its own
+            line += f" | draft {a}/{d} ({100 * a / max(d, 1):.1f}%) | {(new_tokens - 1) / max(new_tokens - 1 - a, 1):.2f} tok/step"
             accept.append(a / max(d, 1))
+        sh = generator.sparse_head
+        if sh is not None:
+            line += f" | sdh miss {100 * sh.miss_rate:.1f}% {'on' if sh.mode_sparse else 'off'} ({sh.mode_switches} sw)"
         line += f" | P100 {pre} -> {post}"
         print(line, flush = True)
         gen_rates.append(tps)
@@ -90,9 +99,12 @@ if __name__ == "__main__":
     parser.add_argument("-mode", "--mode", type = str, default = "qwen35")
     parser.add_argument("-prompts", "--prompts", nargs = "+",
                         default = ["Implement a quicksort in go", "Implement quicksort in rust"])
-    parser.add_argument("-max_new", "--max_new", type = int, default = 1000)
+    parser.add_argument("-max_new", "--max_new", type = int, default = 1000,
+                        help = "Max new tokens per turn; chat.py runs to EOS, so compare its acceptance with a value that does too (a short cap measures only the code part of a reply, which drafts better)")
     parser.add_argument("-smi_index", "--smi_index", type = int, default = 0, help = "nvidia-smi index of the P100")
     parser.add_argument("-tag", "--tag", type = str, default = "run")
+    parser.add_argument("-save_text", "--save_text", type = str, default = None,
+                        help = "Write the generated text of every turn to this file (compare builds/kernels byte for byte)")
     parser.add_argument("-sample", "--sample", action = "store_true",
                         help = "Use the sampler of chat.py (temperature, min-p, ...) instead of greedy; the draft acceptance then drops")
     main(parser.parse_args())
