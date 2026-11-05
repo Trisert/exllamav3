@@ -44,6 +44,7 @@ def nvcc_has_compress_mode(nvcc: list[str] | None) -> bool:
 # them missing through its HAS_* attributes (bindings.cpp), which the Python side checks before using them
 HIP_EXCLUDED_SOURCES = {
     "hgemm_f16acc.cu",      # fp16-accumulator hgemm (hgemm_f16acc): GeForce tensor-core PTX; RDNA uses rocm/wmma_gemm.cu
+    "hgemv_f16.cu",         # decode fp16 GEMV (sm_60 / sm_75); RDNA has rocm/hgemm_narrow_rdna.cuh
     # Replaced on ROCm by an implementation of the same interface under rocm/
     "exl3_gemv.cu",         # -> rocm/quant/exl3_gemv_rdna.cu (exl3_gemv.cuh)
     # The GEMM kernel map, MoE host, comp units and MoE instance units are shared: the kernel headers select

@@ -96,9 +96,14 @@ void BC_BlockSparseMLP::run_bszN
     {
         // One-expert fused launch at the shared expert's own bit width (expert 0, weight 1);
         // the sigmoid gate, if any, is applied by the routed launch when it merges the result
+        // One persistent launch for both where the dual kernel applies (exl3_moe_coop_launch_pair)
         at::Tensor out_d_sh_n = out_d_sh.value().slice(1, 0, num_tokens);
-        exl3_moe_coop_run(sh_coop_p, sh_K_gu, sh_K_d, sh_cb, y, sh_sel.slice(0, 0, num_tokens), sh_rw.slice(0, 0, num_tokens), c10::nullopt);
-        sh_o = out_d_sh_n;
+        MoeCoopParams ps = sh_coop_p, pr = coop_p;
+        exl3_moe_coop_bind(ps, y, sh_sel.slice(0, 0, num_tokens), sh_rw.slice(0, 0, num_tokens), c10::nullopt);
+        exl3_moe_coop_bind(pr, y, selected_experts, routing_weights, out_d_sh_n);
+        exl3_moe_coop_launch_pair(pr, coop_K_gu, coop_K_d, coop_cb, ps, sh_K_gu, sh_K_d, sh_cb,
+                                  y.device().index(), at::cuda::getCurrentCUDAStream().stream());
+        return;
     }
     else if (shared_experts)
     {
@@ -401,7 +406,7 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
             at::Tensor gu_g_sh = at::empty({MAX_BSZN, I_sh}, gopt), gu_u_sh = at::empty({MAX_BSZN, I_sh}, gopt);
             at::Tensor act_out_sh = at::empty({MAX_BSZN, I_sh}, hopt);
             at::Tensor d_out_sh = at::empty({MAX_BSZN, Ho_sh}, at::TensorOptions().dtype(at::kFloat).device(dev));
-            at::Tensor ctr_sh = at::zeros({exl3_moe_coop_ctr_len(MAX_BSZN, MAX_BSZN, I_sh, Ho_sh)}, at::TensorOptions().dtype(at::kInt).device(dev));
+            at::Tensor ctr_sh = at::zeros({exl3_moe_coop_ctr_len_fused(MAX_BSZN, MAX_BSZN, I_sh, Ho_sh)}, at::TensorOptions().dtype(at::kInt).device(dev));
             int act_sh = se->act_gelu ? MOE_COOP_ACT_GELU : se->act_relu2 ? MOE_COOP_ACT_RELU2 : MOE_COOP_ACT_SILU;
             sh_coop_p = exl3_moe_coop_prepare
             (

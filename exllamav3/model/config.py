@@ -15,6 +15,10 @@ class InferParams:
     Runtime inference parameters. Configure before loading model/modules
     """
 
+    # Conversion only: keep block-scaled fp4/fp8 checkpoint linears packed as stored and dequantize to fp16 per
+    # use (LinearFP16Packed), so a layer of hundreds of fp4 experts costs a quarter of its fp16 footprint
+    packed_fp16_source: bool = False
+
     # Avoid reconstruct path during GEMM. Forces use of low-bsz GEMM/GEMV kernels. Also disables MGEMM path
     no_reconstruct: bool = False
 
@@ -75,6 +79,20 @@ class InferParams:
         self.embed_stream_from_disk = os.environ.get("EXL3_EMBED_STREAM", "0") != "0"
 
     def use_mgemm(self, K: int, out_features: int, mul1: bool = False, device = None) -> bool:
+        # Pre-Volta CUDA parts (Pascal) have no multi-matrix GEMV: the fused MGEMM runs the block-pipelined tile
+        # kernel, which is far below the memory roofline there, while separate calls take the GEMV path
+        # (the GEMV covers K <= 5; wider tensors keep the fused kernel). Same on Turing sm_75 for mul1, where every
+        # K <= 4 shape takes the GEMV (measured on the RTX 2060; EXL3_GEMV_SM75=0 keeps the tile kernel and the MGEMM)
+        # (EXL3_GEMV=0 turns the GEMV off, so there is nothing to unfuse for and the MGEMM stays)
+        if device is not None and K <= 5 and os.environ.get("EXL3_GEMV", "1") != "0":
+            import torch
+            device = torch.device(device)
+            if device.type == "cuda" and device.index is not None and not torch.version.hip:
+                cap = torch.cuda.get_device_capability(device.index)
+                if cap[0] < 7:
+                    return False
+                if cap == (7, 5) and K <= 4 and mul1 and os.environ.get("EXL3_GEMV_SM75", "1") != "0":
+                    return False
         # Unfusing only pays when the separate GEMV calls can actually take the int8 path, which
         # requires the mul1 codebook; other tensors always keep the fused MGEMM
         if not mul1:

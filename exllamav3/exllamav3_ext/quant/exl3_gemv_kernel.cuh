@@ -82,6 +82,9 @@ __device__ __forceinline__ void mma_ab_h(const FragB& a01, const FragB& a23, con
 // mul1 codebook pair decode via dp4a byte sum (bit-identical to the vabsdiff4 form)
 __device__ __forceinline__ half2 decode_pair_cb2_dp4a_(uint32_t x0, uint32_t x1)
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610 && !defined(USE_ROCM)
+    return decode_3inst_2<2>(x0, x1);   // no dp4a: vabsdiff4 byte sum (codebook.cuh), same result
+#else
     x0 *= 0x83DCD12Du;
     x1 *= 0x83DCD12Du;
     uint32_t sum0 = __dp4a(x0, 0x01010101u, 0x6400u);
@@ -91,6 +94,7 @@ __device__ __forceinline__ half2 decode_pair_cb2_dp4a_(uint32_t x0, uint32_t x1)
     half_uint16 h0((uint16_t) sum0);
     half_uint16 h1((uint16_t) sum1);
     return __hfma2(__halves2half2(h0.as_half, h1.as_half), k_inv_h2, k_bias_h2);
+#endif
 }
 
 template <int cb>
@@ -117,6 +121,22 @@ __device__ __forceinline__ void decode8(uint32_t w0, uint32_t w1, uint32_t w2, u
 template <int cb>
 __device__ __forceinline__ void dq8_regs_4bits(uint32_t a, uint32_t b, FragB& f0, FragB& f1)
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610 && !defined(USE_ROCM)
+    if constexpr (cb == 2)
+    {
+        // sm_60, mul1: the eight windows (bit offsets 0, 4, .., 28 of the 64-bit a:b) are the low and high halves of
+        // b and of the funnel shifts by 4, 8 and 12, and the products read their index from the half register
+        // (mul1_product_h16): three half-rate SHF instead of SHF + 6 BFE + 2 AND. Bit-identical to the form below
+        const uint32_t f4 = __funnelshift_r(b, a, 4);
+        const uint32_t f8 = __funnelshift_r(b, a, 8);
+        const uint32_t f12 = __funnelshift_r(b, a, 12);
+        f0[0] = decode_mul1_product_2(mul1_product_h16<true>(f12), mul1_product_h16<true>(f8));    // w0, w1
+        f0[1] = decode_mul1_product_2(mul1_product_h16<true>(f4), mul1_product_h16<true>(b));      // w2, w3
+        f1[0] = decode_mul1_product_2(mul1_product_h16<false>(f12), mul1_product_h16<false>(f8));  // w4, w5
+        f1[1] = decode_mul1_product_2(mul1_product_h16<false>(f4), mul1_product_h16<false>(b));    // w6, w7
+        return;
+    }
+#endif
     uint32_t s, w0, w1, w2, w3, w4, w5, w6, w7;
     FSHF_IMM(s, b, a, 20);
     w7 = b & 0xffff;
@@ -196,20 +216,30 @@ template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bo
 __global__ __launch_bounds__(CFG == 0 ? 512 : 256, HALF && CFG == 0 ? 2 : 1)
 void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 {
-    static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2) : (bits == 2 || bits == 3 || bits == 4),
-                  "exl3_gemv_kernel supports 2, 3 and 4 bpw, and 1.5, 2.5 and 3.5 bpw with mul1");
+    static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2) : (bits >= 2 && bits <= 6),
+                  "exl3_gemv_kernel supports 2..6 bpw, and 1.5, 2.5 and 3.5 bpw with mul1");
+    static_assert(bits < 5 || (SMEM_STAGE && !HALF), "5 and 6 bpw run through the staged tile words only");
     constexpr int WK   = CFG == 0 ? 16 : 8;     // k-split (warps per block)
     constexpr int WNT  = CFG == 0 ? 2 : 4;      // adjacent n-tiles per warp
     constexpr int PF   = CFG == 0 ? 4 : 2;      // prefetch ring depth
     constexpr int FOLD = CFG == 0 ? 4 : 2;      // fp16->fp32 fold cadence (divides PF)
     constexpr int THREADS = WK * 32;
-    constexpr int ROWS = MMODE == 0 ? 1 : EXL3_GEMV_MAX_M;
+    // MMODE 0: m = 1, MMODE 1: 2 <= m <= 8 (MMA path), MMODE 2: m = 2 and MMODE 3: m = 3..4 on sm_60 (direct dot
+    // products, 2 / 4 rows)
+    constexpr int ROWS = MMODE == 0 ? 1 : (MMODE == 2 ? 2 : (MMODE == 3 ? 4 : EXL3_GEMV_MAX_M));
     constexpr int COLS = WNT * 16;
+    // sm_60 has no tensor cores and the shuffle-emulated MMA wastes 15 of 16 A rows at m = 1: take the dot product
+    // directly instead (see the A fragment loads and the quad reduction below)
+    constexpr bool DIRECT = (EXL3_SM60 != 0) && (MMODE == 0 || MMODE == 2 || MMODE == 3);
+    constexpr int NR = MMODE == 2 ? 2 : (MMODE == 3 ? 4 : 1);   // rows handled by the direct path
 
     constexpr int TWORDS = HALF ? 4 * (2 * bits + 1) : 8 * bits;              // uint32 per 16x16 tile
     constexpr bool TWO_PER_LOAD = HALF ? bits == 1 : bits == 2;               // two tiles per warp load
-    constexpr int LOADS = TWO_PER_LOAD ? WNT / 2 : WNT;                       // warp loads per k-slice
-    constexpr int LSTRIDE = TWO_PER_LOAD ? 2 * TWORDS : (TWORDS < 32 ? TWORDS : 32);   // uint32 per load (lanes < LSTRIDE load)
+    // 5 / 6 bpw: a tile is 40 / 48 words, more than a warp load. The WNT tiles of a k-slice are contiguous, so the
+    // slice is loaded as CEIL(WNT * TWORDS / 32) full-width warp loads (the last one partial for 5 bpw at WNT = 2)
+    // and staged in shared memory
+    constexpr int LOADS = bits >= 5 ? CEIL_DIVIDE(WNT * TWORDS, 32) : (TWO_PER_LOAD ? WNT / 2 : WNT);   // warp loads per k-slice
+    constexpr int LSTRIDE = TWO_PER_LOAD ? 2 * TWORDS : (TWORDS < 32 || bits >= 5 ? (bits >= 5 ? 32 : TWORDS) : 32);   // uint32 per load (lanes < LSTRIDE load)
     static_assert(!TWO_PER_LOAD || WNT % 2 == 0, "two tiles per warp load needs an even tile count per warp");
 
     auto grid = cooperative_groups::this_grid();
@@ -297,13 +327,20 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
         const uint32_t* bp = B32 + (size_t) ks0 * slice_stride + group * WNT * TWORDS + lane;
 
         // Prefetch ring (indices must be compile-time or pf lands in local memory)
-        auto ld_b = [&] (int i, int l) -> uint32_t
+        // off: uint32 offset of the k-slice from bp
+        auto ld_b_off = [&] (size_t off, int l) -> uint32_t
         {
-            if constexpr (LSTRIDE < 32)
-                return lane < LSTRIDE ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
+            if constexpr (bits >= 5)
+                return l * 32 + lane < WNT * TWORDS ? __ldcs(bp + off + l * 32) : 0;
+            else if constexpr (LSTRIDE < 32)
+                return lane < LSTRIDE ? __ldcs(bp + off + l * LSTRIDE) : 0;
             else
-                return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
+                return __ldcs(bp + off + l * LSTRIDE);
         };
+        auto ld_b = [&] (int i, int l) -> uint32_t { return ld_b_off((size_t) i * slice_stride, l); };
+        // sm_60: offset of the next prefetch slice, advanced by one slice per step. Without it ptxas rebuilds the
+        // 64-bit (i + PF) * slice_stride product from XMADs at every step (no wide IMAD before Volta)
+        [[maybe_unused]] size_t pf_off = (size_t) PF * slice_stride;
 
         uint32_t pf[PF][LOADS];
         #pragma unroll
@@ -315,6 +352,22 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
         FragC_h ch[WNT][2] = {};
         float2 acc0[WNT][2] = {};
+        // Direct path: one half2 partial sum (even / odd k) per tile, fragment and row
+        [[maybe_unused]] half2 dh[WNT][2][NR];
+        [[maybe_unused]] float2 da[WNT][2][NR];
+        if constexpr (DIRECT)
+        {
+            #pragma unroll
+            for (int t = 0; t < WNT; ++t)
+                #pragma unroll
+                for (int f = 0; f < 2; ++f)
+                    #pragma unroll
+                    for (int r = 0; r < NR; ++r)
+                    {
+                        dh[t][f][r] = hzero;
+                        da[t][f][r] = make_float2(0.0f, 0.0f);
+                    }
+        }
 
         for (int ib = 0; ib < myn; ib += PF)
         {
@@ -333,8 +386,9 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             {
                 #pragma unroll
                 for (int l = 0; l < LOADS; ++l)
-                    pf[d][l] = ld_b(i + PF, l);
+                    pf[d][l] = EXL3_SM60 ? ld_b_off(pf_off, l) : ld_b(i + PF, l);
             }
+            if constexpr (EXL3_SM60) pf_off += slice_stride;
 
             if constexpr (SMEM_STAGE)
             {
@@ -348,16 +402,31 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
             // A fragment: lane covers row lane/4, k pairs (2(lane%4), +1) and (+8, +9)
             const size_t a_col = (size_t) (ks0 + i) * 8 + (lane & 3);
-            FragB a01, a23;
-            a01[0] = r0_ok ? A2[a_row0 + a_col] : hzero;
-            a23[0] = r0_ok ? A2[a_row0 + a_col + 4] : hzero;
-            a01[1] = hzero;
-            a23[1] = hzero;
-
+            [[maybe_unused]] half2 x01[NR], x23[NR];
+            [[maybe_unused]] FragB a01, a23;
+            [[maybe_unused]] half2 a_rows[2][8];
+            if constexpr (DIRECT)
+            {
+                // Lane (g, t) holds B column g at k = 2t, 2t + 1 and 2t + 8, 2t + 9, so it pairs with the same k of
+                // the single A row directly: no gather, every lane loads row 0 (four distinct addresses per warp)
+                #pragma unroll
+                for (int r = 0; r < NR; ++r)
+                {
+                    const bool ok = NR == 1 || r < size_m;
+                    x01[r] = ok ? A2[(size_t) r * (size_k / 2) + a_col] : hzero;
+                    x23[r] = ok ? A2[(size_t) r * (size_k / 2) + a_col + 4] : hzero;
+                }
+            }
+            else
+            {
+                a01[0] = r0_ok ? A2[a_row0 + a_col] : hzero;
+                a23[0] = r0_ok ? A2[a_row0 + a_col + 4] : hzero;
+                a01[1] = hzero;
+                a23[1] = hzero;
 #if EXL3_SM60
-            half2 a_rows[2][8];
-            exl3_gather_a_row0(a01, a23, a_rows);
+                exl3_gather_a_row0(a01, a23, a_rows);
 #endif
+            }
 
             #pragma unroll
             for (int t = 0; t < WNT; ++t)
@@ -368,6 +437,8 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                     const uint32_t* tp = &sh_stage[warp][t * TWORDS];
                     if constexpr (HALF)
                         exl3_gemv_ns::dq8_regs_half<bits, cb>(tp[XP(0)], tp[XP(1)], XP(2), tp[XP(3)], tp[XP(4)], XP(5), f0, f1);
+                    else if constexpr (bits >= 5)
+                        dq_dispatch<bits, cb>(tp, lane << 3, f0, f1);
                     else if constexpr (bits == 4)
                         exl3_gemv_ns::dq8_regs_4bits<cb>(tp[(lane + 31) & 31], tp[lane], f0, f1);
                     else if constexpr (bits == 2)
@@ -407,32 +478,80 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                     exl3_gemv_ns::dq8_regs_3bits<cb>(awv, bwv, x_s2, f0, f1);
                 }
 
+                if constexpr (DIRECT)
+                {
+                    // Even / odd k partial sums of column g stay in the low / high half until the final quad reduction
+                    #pragma unroll
+                    for (int r = 0; r < NR; ++r)
+                    {
+                        dh[t][0][r] = __hfma2(x23[r], f0[1], __hfma2(x01[r], f0[0], dh[t][0][r]));
+                        dh[t][1][r] = __hfma2(x23[r], f1[1], __hfma2(x01[r], f1[0], dh[t][1][r]));
+                    }
+                }
+                else
+                {
 #if EXL3_SM60
-                exl3_mma_m16n8k16_f16_with_a(a_rows, f0, ch[t][0]);
-                exl3_mma_m16n8k16_f16_with_a(a_rows, f1, ch[t][1]);
+                    exl3_mma_m16n8k16_f16_with_a(a_rows, f0, ch[t][0]);
+                    exl3_mma_m16n8k16_f16_with_a(a_rows, f1, ch[t][1]);
 #else
-                exl3_gemv_ns::mma_ab_h(a01, a23, f0, ch[t][0]);
-                exl3_gemv_ns::mma_ab_h(a01, a23, f1, ch[t][1]);
+                    exl3_gemv_ns::mma_ab_h(a01, a23, f0, ch[t][0]);
+                    exl3_gemv_ns::mma_ab_h(a01, a23, f1, ch[t][1]);
 #endif
+                }
             }
 
             if ((d + 1) % FOLD == 0 || i + 1 == myn)
             {
-                #pragma unroll
-                for (int t = 0; t < WNT; ++t)
+                if constexpr (DIRECT)
+                {
                     #pragma unroll
-                    for (int f = 0; f < 2; ++f)
-                    {
-                        acc0[t][f].x += __low2float(ch[t][f][0]);
-                        acc0[t][f].y += __high2float(ch[t][f][0]);
-                        ch[t][f][0] = hzero;
-                    }
+                    for (int t = 0; t < WNT; ++t)
+                        #pragma unroll
+                        for (int f = 0; f < 2; ++f)
+                            #pragma unroll
+                            for (int r = 0; r < NR; ++r)
+                            {
+                                da[t][f][r].x += __low2float(dh[t][f][r]);
+                                da[t][f][r].y += __high2float(dh[t][f][r]);
+                                dh[t][f][r] = hzero;
+                            }
+                }
+                else
+                {
+                    #pragma unroll
+                    for (int t = 0; t < WNT; ++t)
+                        #pragma unroll
+                        for (int f = 0; f < 2; ++f)
+                        {
+                            acc0[t][f].x += __low2float(ch[t][f][0]);
+                            acc0[t][f].y += __high2float(ch[t][f][0]);
+                            ch[t][f][0] = hzero;
+                        }
+                }
             }
         }
         }
 
         // Cross-warp reduction over the k splits. Lane l holds row l/4, cols
         // tile*16 + frag*8 + 2*(l%4) (+1)
+        if constexpr (DIRECT)
+        {
+            // Every lane of a quad holds partial sums of the same column g: reduce over t, one lane stores
+            #pragma unroll
+            for (int t = 0; t < WNT; ++t)
+                #pragma unroll
+                for (int f = 0; f < 2; ++f)
+                    #pragma unroll
+                    for (int r = 0; r < NR; ++r)
+                    {
+                        float s = da[t][f][r].x + da[t][f][r].y;
+                        s += __shfl_xor_sync(0xffffffffu, s, 1);
+                        s += __shfl_xor_sync(0xffffffffu, s, 2);
+                        if ((lane & 3) == 0)
+                            sh_red[warp][r][t * 16 + f * 8 + (lane >> 2)] = s;
+                    }
+        }
+        else
         {
             const int c0 = 2 * (lane & 3);
             const bool store0 = MMODE == 0 ? lane < 4 : r0 < ROWS;

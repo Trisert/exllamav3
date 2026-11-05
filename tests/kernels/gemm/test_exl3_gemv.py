@@ -5,7 +5,7 @@ that Config.use_mgemm keys its fuse/unfuse decision on.
 
 exl3_gemv contract: C (..., n) = A (..., k) @ W for W = diag(suh) H W_hat H diag(svh) (the EXL3 linear), every
 leading dim of A flattened into m <= 8 rows, C fp16 or fp32; A is not modified, nothing outside C is written, and
-repeat launches are bit-identical. Eligible: k, n multiples of 128; K = 2..4 with mcg / mul1, K = 4 with 3INST,
+repeat launches are bit-identical. Eligible: k, n multiples of 128; K = 2..6 with mcg / mul1 (5 and 6 bpw run through staged tile words), K = 4 with 3INST,
 K = 1.5 / 2.5 / 3.5 with mul1; suh, A_had (scratch) and svh all given. Everything else is rejected with an error.
 Both kernel configurations are exercised (n <= 8192 narrow, n > 8192 wide), and m = 1 (MMODE 0) and 2..8.
 
@@ -43,7 +43,15 @@ CASES = [
     (2, "mcg", 1, 512, 8320, False),        # wide config
     (2, "mul1", 3, 1024, 640, True),
     (3, "mcg", 5, 384, 512, False),
+    (5, "mcg", 1, 512, 1024, False),
+    (5, "mul1", 3, 384, 640, True),
+    (5, "mcg", 8, 256, 8320, False),        # wide config
     (3, "mul1", 7, 512, 8448, True),        # wide config
+    (6, "mul1", 1, 512, 1024, False),
+    (6, "mul1", 2, 384, 640, True),
+    (6, "mcg", 1, 256, 8320, True),         # wide config
+    (6, "mul1", 2, 512, 8448, False),       # wide config (MTP verify shape class of a 6 bpw lm_head)
+    (6, "mul1", 5, 256, 768, False),
     (1.5, "mul1", 1, 1024, 1024, False),
     (2.5, "mul1", 4, 512, 768, True),
     (3.5, "mul1", 8, 256, 8320, False),     # wide config
@@ -134,7 +142,7 @@ def test_gemv_rejects_ineligible(device):
     else:
         cases = [
             ((9, 256, 256, 3, False, True), "not eligible"),        # m > 8
-            ((1, 256, 256, 5, False, True), "not eligible"),        # K = 5
+            ((1, 256, 256, 7, False, True), "not eligible"),        # K = 7
             ((1, 256, 256, 1, False, True), "not eligible"),        # K = 1
             ((1, 256, 256, 3, False, False), "not eligible"),       # 3INST below K = 4
             ((1, 272, 256, 3, False, True), "not eligible"),        # k % 128
@@ -180,6 +188,8 @@ def test_int8_max_k_gates_int8_path(device):
     against the exact product, while every fp16 path stays at a few fp16 roundoffs (< 2.5e-3, see above)"""
     if is_rocm():
         pytest.skip("exl3_gemm takes the RDNA GEMVs for m <= 8, so the int8 GEMV is never reached on ROCm")
+    if torch.cuda.get_device_properties(torch.device(device)).shared_memory_per_block_optin < 80 * 1024:
+        pytest.skip("the int8 GEMV needs 80 KB of shared memory per block and declines on smaller devices")
     max_k = ext.exl3_gemv_int8_max_k(torch.device(device).index)
     k, n = 1024, 1024
     for K, expect_int8 in ((max_k, True), (max_k + 1, False)):

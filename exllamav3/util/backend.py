@@ -50,6 +50,17 @@ MOE_FUSED_ROWS = int(_env("EXL3_MOE_FUSED_ROWS", 128, 512))
 MOE_BATCH_RECON = _env("EXL3_MOE_BATCH_RECON", 1, 0) != "0"
 MOE_MTILE = _env("EXL3_MOE_MTILE", 1, 0) != "0"
 
+# Fused MoE prefill kernel on Pascal sm_60 (emulated MMA, 16-row tiles): one launch per layer instead of the
+# per-expert graph loop (<= 32 rows per expert) and the batched reconstruct tier up to EXL3_MOE_FUSED_ROWS rows.
+# Other pre-Volta parts keep the reconstruct paths
+MOE_FUSED_SM60 = os.environ.get("EXL3_MOE_FUSED_SM60", "1") != "0"
+
+
+def moe_fused_cc_ok(cc: tuple[int, int]) -> bool:
+    """Compute capability check for the fused MoE prefill kernel: Volta and newer, plus sm_60 unless
+    EXL3_MOE_FUSED_SM60=0. The caller passes (0, 0) on ROCm, which this leaves as it was (not allowed)"""
+    return cc >= (7, 0) or (cc == (6, 0) and MOE_FUSED_SM60)
+
 # mHC launch-count folds at decode row counts (hc_mix_fused, hc_fuse.cuh): apply_ deferred into the next
 # site's mix, the following RMSNorm run inside its finalize. Bit-identical to the unfused launches; on by
 # default where the per-launch cost dominates these small kernels (RDNA)
@@ -68,7 +79,19 @@ def attn_decode_config(device, hd_pad: int) -> tuple[int, int, int]:
     kv tile, the top of the shared-memory ladder on devices that cannot hold it"""
     if hd_pad <= 128 and gfx_arch(device) == "gfx1100":
         return 32, 2, 2
+    if attn_live_split(device) and not ROCM and torch.cuda.get_device_capability(device) in ((6, 0), (7, 5)):
+        # With the live split, 16-key tiles: sm_60 / sm_75 run tl.dot on scalar FMAs, and the smaller tile halves
+        # the per-program latency at short contexts (microbenchmark, head_dim 256, q_len 2, 16 q / 2 kv heads,
+        # 4-bit cache: P100 63 -> 30 us, RTX 2060 90 -> 29 us at 500 keys; 98 -> 62 / 127 -> 83 us at 3500)
+        return 16, *ATTN_SPLIT_WARPS_STAGES
     return max(16, 8192 // hd_pad), *ATTN_SPLIT_WARPS_STAGES
+
+
+def attn_live_split(device) -> bool:
+    """EXL3_ATTN_LIVE_SPLIT (default on, 0 disables): the decode split kernel divides the live kv length (read from cache_seqlens on the
+    device) over its splits instead of the block-table bound the host derives split_len from. The generator pads
+    the table to 16 pages, so at short contexts most splits idled while a few walked several tiles each"""
+    return os.environ.get("EXL3_ATTN_LIVE_SPLIT", "1") == "1"
 
 
 # --- Turing (sm_75) prefill ---------------------------------------------------------------------------------
@@ -116,6 +139,14 @@ def sdpa_prefill(device) -> bool:
 def fa75_prefill(device) -> bool:
     """The fa75 kernel for head_dim 256 on that path (sm_75 default; EXL3_FA75)"""
     return _sm75_switch("EXL3_FA75", device)
+
+
+def fa60_prefill(device) -> bool:
+    """The fa60 HFMA2 kernel for head_dim 256 on that path (sm_60 default; EXL3_FA60)"""
+    env = os.environ.get("EXL3_FA60")
+    if env is not None:
+        return env.strip().lower() not in ("0", "", "false", "off", "no")
+    return compute_capability(device) == (6, 0)
 
 
 def qc_prefill_two_pass_min_q(device) -> int:

@@ -5,12 +5,19 @@
 #include <torch/extension.h>
 #include "../util.h"
 #include "../hgemm.cuh"
+#include "../hgemv_f16.cuh"
 #include "../quant/exl3_gemm.cuh"
 #include "../add.cuh"
 
 void BC_LinearFP16::run_gr(const at::Tensor& x, at::Tensor& y, Graph* graph)
 {
-    if (x.dtype() == y.dtype() && !graph)
+    // Decode-class row counts go through hgemm, which takes the fp16 GEMV (hgemv_f16.cu) where it applies
+#if defined(USE_ROCM)
+    const bool small_m = false;
+#else
+    const bool small_m = x.numel() <= HGEMV_MAX_M * x.size(-1);
+#endif
+    if (x.dtype() == y.dtype() && !graph && !small_m)
         at::matmul_out(y, x, weight);
     else
         hgemm_gr(x, weight, y, graph);

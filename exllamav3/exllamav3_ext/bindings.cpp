@@ -10,7 +10,11 @@
 
 #include "norm.cuh"
 #include "hgemm.cuh"
+#if !defined(USE_ROCM)
+#include "hgemv_f16.cuh"
+#endif
 #include "turing/fa75.cuh"
+#include "pascal/fa60.cuh"
 #include "rope.cuh"
 #include "activation.cuh"
 #include "softcap.cuh"
@@ -71,6 +75,7 @@
 #include "dsv4_pool_quant.cuh"
 #include "dsa_topk.cuh"
 #include "hc_mix.cuh"
+#include "dequant_blocks.cuh"
 #include "ple.cuh"
 #include "ngram.cuh"
 
@@ -91,6 +96,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.attr("HAS_GR_MIX_TILED") = true;          // gr_mix_tiled, gr_mix_tiled_slices
     m.attr("HAS_DET_GEMM") = true;              // routing_gemm_det, det_quant_weight, det_math_test
     m.attr("HAS_HGEMM_F16ACC") = cuda_only;     // hgemm_f16acc, hgemm_f16acc_status
+    m.attr("HAS_HGEMV_F16") = cuda_only;        // hgemv_f16
     m.attr("HAS_DFLASH2") = true;               // dflash2_dynconv, dflash2_selector_walk, dflash2_topk
 
     m.def("stloader_read", &stloader_read, "stloader_read");
@@ -133,13 +139,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("dsa_topk_tile", &dsa_topk_tile, "dsa_topk_tile");
     m.def("dsa_topk_merge_tiles", &dsa_topk_merge_tiles, "dsa_topk_merge_tiles");
     m.def("hc_mix", &hc_mix, "hc_mix");
+    m.def("hc_mix_carry", &hc_mix_carry, "hc_mix_carry");
     m.def("ple_gate", &ple_gate, "ple_gate");
     m.def("ple_forward_streams", &ple_forward_streams, "ple_forward_streams");
+    m.def("ple_forward_streams_fused", &ple_forward_streams_fused, "ple_forward_streams_fused");
     m.def("ngram_hash_cpu", &ngram_hash_cpu, "ngram_hash_cpu");
     m.def("ngram_gather_cpu", &ngram_gather_cpu, "ngram_gather_cpu");
     m.def("ngram_dequant", &ngram_dequant, "ngram_dequant");
     m.def("hc_head", &hc_head, "hc_head");
     m.def("hc_mix_fused", &hc_mix_fused, "hc_mix_fused");
+    m.def("dequant_blocks", &dequant_blocks, "dequant_blocks");
     m.def("hc_mix_num_chunks", &hc_mix_num_chunks, "hc_mix_num_chunks");
     m.def("hc_apply", &hc_apply, "hc_apply");
     m.def("gr_mix", &gr_mix, "gr_mix");
@@ -226,8 +235,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 #if !defined(USE_ROCM)
     m.def("hgemm_f16acc", &hgemm_f16acc, "hgemm_f16acc");
     m.def("hgemm_f16acc_status", &hgemm_f16acc_status, "hgemm_f16acc_status");
+    m.def("hgemm_hfma2", &hgemm_hfma2, "hgemm_hfma2", py::arg("a"), py::arg("b"), py::arg("c"), py::arg("bm") = 128);
+    m.def("hgemv_f16", &hgemv_f16, "hgemv_f16", py::arg("a"), py::arg("b"), py::arg("c"), py::arg("ksplit") = 0);
     m.def("fa75_fwd", &fa75_fwd, "fa75_fwd");
     m.def("fa75_fwd_slice", &fa75_fwd_slice, "fa75_fwd_slice");
+    m.def("fa60_fwd", &fa60_fwd, "fa60_fwd");
 #endif
     m.def("rope", &rope, "rope");
     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
@@ -316,6 +328,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe", &exl3_moe, "exl3_moe");
     m.def("exl3_moe_gather", &exl3_moe_gather, "exl3_moe_gather");
     m.def("exl3_moe_coop", &exl3_moe_coop, "exl3_moe_coop");
+    m.def("exl3_moe_coop_pair", &exl3_moe_coop_pair, "exl3_moe_coop_pair");
 
     m.def("bighead_attn", &bighead_attn, "bighead_attn");
     m.def("bighead_attn_paged", &bighead_attn_paged, "bighead_attn_paged");

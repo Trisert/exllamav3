@@ -12,7 +12,7 @@ from ..util.backend import QKV_SLICE
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 import os
-from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_attn, MAX_BSZ as _bc_max_bsz, MAX_QLEN as _bc_max_qlen
+from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_attn, BCKernelTooLarge, MAX_BSZ as _bc_max_bsz, MAX_QLEN as _bc_max_qlen
 
 # Sliced Q/K/V(/G) projection bundle at decode (one mgemm over equal-width column slices);
 # EXL3_QKV_SLICE=0 falls back to the pairwise K/V and Q/G bundles
@@ -1034,11 +1034,16 @@ class Attention(Module):
         if bca is None:
             bca = self.bc_attn[key] = (build_bc_attn(self, layer) or False)
         if bca:
-            for b, q in ((1, 1), (_bc_max_bsz, _bc_max_qlen)):
-                bca._configure(b, q, True, 0)
-            if bca.qsa:
-                for q in (1, _bc_max_qlen):
-                    bca._configure(1, q, True, 1)
+            try:
+                for b, q in ((1, 1), (_bc_max_bsz, _bc_max_qlen)):
+                    bca._configure(b, q, True, 0)
+                if bca.qsa:
+                    for q in (1, _bc_max_qlen):
+                        bca._configure(1, q, True, 1)
+            except BCKernelTooLarge:
+                # A kernel needs more shared memory than the device has (e.g. the QSA indexer's 64 KB on a
+                # 48 KB part): the same decline as the runtime path, which falls back to the eager attention
+                pass
 
 
     def autosplit_extra_measure(self, params):

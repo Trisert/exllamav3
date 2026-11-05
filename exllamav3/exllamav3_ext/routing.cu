@@ -7,14 +7,12 @@
 #include "util.cuh"
 #include "reduction.cuh"
 #include "hgemm.cuh"
+#include "hgemv_f16.cuh"
 #if defined(USE_ROCM)
     #include "rocm/routing_gemv_rdna.cuh"
 #endif
 
-#define MAX_NUM_EXPERTS 512
-#define MAX_K 32
-
-using bfloat16 = __nv_bfloat16;
+#include "routing_topk.cuh"
 
 // Deterministic (FMA-only exp, correctly rounded division): the selection scores must agree
 // bit for bit across tensor-parallel ranks of different architectures
@@ -42,97 +40,6 @@ float routing_act(float xf)
     }
     else
         return sigmoid_stable_hf(xf);
-}
-
-
-__device__ __forceinline__
-void warp_reduce_best_f32(float& key, float& payload, int& idx)
-{
-    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(USE_ROCM)
-        // Monotonic unsigned encoding of the float key, hardware max-reduce, then fetch the
-        // winner's values from the lowest tied lane
-        unsigned int ku = __float_as_uint(key);
-        ku = (ku & 0x80000000u) ? ~ku : (ku | 0x80000000u);
-        unsigned int m = __reduce_max_sync(0xffffffffu, ku);
-        int src = __ffs(__ballot_sync(0xffffffffu, ku == m)) - 1;
-        key = __shfl_sync(0xffffffffu, key, src);
-        payload = __shfl_sync(0xffffffffu, payload, src);
-        idx = __shfl_sync(0xffffffffu, idx, src);
-    #else
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1)
-        {
-            float other_key = __shfl_down_sync(0xffffffffu, key, offset);
-            float other_payload = __shfl_down_sync(0xffffffffu, payload, offset);
-            int other_idx = __shfl_down_sync(0xffffffffu, idx, offset);
-            if (other_key > key)
-            {
-                key = other_key;
-                payload = other_payload;
-                idx = other_idx;
-            }
-        }
-
-        key = __shfl_sync(0xffffffffu, key, 0);
-        payload = __shfl_sync(0xffffffffu, payload, 0);
-        idx = __shfl_sync(0xffffffffu, idx, 0);
-    #endif
-}
-
-
-// Top-K selection by one warp over num_candidates (<= MAX_NUM_EXPERTS) keys in shared memory.
-// Each lane keeps its strided share of the keys in registers (at most MAX_NUM_EXPERTS / 32),
-// every round picks the lane-local best, the warp reduces the round's winner and the owning
-// lane retires it. Lane k ends up holding the round-k winner (payload, position). Ties: lowest
-// position within a lane, lowest lane across the warp. One pass of K rounds replaces the
-// per-warp pre-selection plus multi-warp merge stages: each stage cost K block-wide rounds, and
-// for K > 16 a stage that keeps K of every 32 candidates could not shrink the field at all
-__device__ __forceinline__
-void warp_topk_shared
-(
-    const float* sh_key,
-    const float* sh_payload,
-    const int num_candidates,
-    const int K,
-    float& out_payload,
-    int& out_idx
-)
-{
-    constexpr int MAXC = MAX_NUM_EXPERTS / 32;
-    int lane_id = threadIdx.x % 32;
-    float ck[MAXC];
-    #pragma unroll
-    for (int j = 0; j < MAXC; ++j)
-    {
-        int pos = lane_id + 32 * j;
-        ck[j] = pos < num_candidates ? sh_key[pos] : -1.0e30f;
-    }
-    out_payload = 0.0f;
-    out_idx = -1;
-    for (int k = 0; k < K; ++k)
-    {
-        float best_key = -1.0e30f;
-        int best_j = -1;
-        #pragma unroll
-        for (int j = 0; j < MAXC; ++j)
-            if (ck[j] > best_key) { best_key = ck[j]; best_j = j; }
-        int my_pos = best_j >= 0 ? lane_id + 32 * best_j : -1;
-        float best_payload = my_pos >= 0 ? (sh_payload ? sh_payload[my_pos] : best_key) : 0.0f;
-        int best_idx = my_pos;
-        warp_reduce_best_f32(best_key, best_payload, best_idx);
-        if (my_pos >= 0 && my_pos == best_idx)
-        {
-            // Retire the winner (unrolled select: no dynamic register indexing)
-            #pragma unroll
-            for (int j = 0; j < MAXC; ++j)
-                if (j == best_j) ck[j] = -1.0e30f;
-        }
-        if (lane_id == k)
-        {
-            out_payload = best_payload;
-            out_idx = best_idx;
-        }
-    }
 }
 
 
@@ -487,58 +394,9 @@ __global__ void routing_std_topk_kernel
 )
 {
     int row = blockIdx.x;
-    int t = threadIdx.x;
-    int lane_id = t % 32;
-    int warp_id = t / 32;
-    int num_warps = CEIL_DIVIDE(num_experts, 32);
-
-    scores += num_experts * row;
-    topk_indices += K * row;
-    topk_weights += K * row;
-
     extern __shared__ unsigned char sh[];
-    float* sh_key = reinterpret_cast<float*>(sh);
-    float* max_red = sh_key + num_experts;
-
-    bool mask = t < num_experts;
-    float logit = mask ? __half2float(scores[t]) : -1.0e30f;
-    // Router bias (gpt-oss): biased logits drive both the top-k selection and the softmax
-    if (bias && mask)
-        logit += __half2float(bias[t]);
-    if (mask)
-        sh_key[t] = logit;
-
-    // Max logit for a stable softmax
-    float max_logit = logit;
-    max_logit = warp_reduce_max_f(max_logit);
-    max_logit = __shfl_sync(0xffffffffu, max_logit, 0);
-    if (num_warps > 1)
-    {
-        if (lane_id == 0) max_red[warp_id] = max_logit;
-        __syncthreads();
-        max_logit = lane_id < num_warps ? max_red[lane_id] : -1.0e30f;
-        max_logit = warp_reduce_max_f(max_logit);
-        max_logit = __shfl_sync(0xffffffffu, max_logit, 0);
-    }
-    __syncthreads();
-
-    if (warp_id == 0)
-    {
-        float e;
-        int out_idx;
-        warp_topk_shared(sh_key, nullptr, num_experts, K, e, out_idx);
-        e = lane_id < K ? exp_det(e - max_logit) : 0.0f;
-        float sum = warp_reduce_sum_first_k(e, K) + 1e-20f;
-        e /= sum;
-
-        if (lane_id < K)
-        {
-            if (per_expert_scale)
-                e *= __bfloat162float(per_expert_scale[out_idx]);
-            topk_indices[lane_id] = (int64_t) out_idx;
-            topk_weights[lane_id] = __float2half_rn(e);
-        }
-    }
+    std_topk_row(scores + num_experts * row, topk_indices + K * row, topk_weights + K * row,
+                 per_expert_scale, bias, num_experts, K, reinterpret_cast<float*>(sh));
 }
 
 
@@ -1481,6 +1339,22 @@ void routing_std
     TORCH_CHECK(K > 0, "routing_std: K = 0 (the weights normalize over an empty selection)");
     TORCH_CHECK(hidden.numel() == (int64_t) bsz * hidden.size(-1), "routing_std: hidden and scores row counts differ");
     if (bsz == 0) return;
+
+    // Fused router GEMV + top-k (EXL3_ROUTER_FUSED=1) where routing_gemv would take hgemm: same kernels' arithmetic
+    #if !defined(USE_ROCM)
+    {
+        int k = hidden.size(-1);
+        bool bsz1 = hidden.numel() == k;
+        bool det = !bsz1 && gate_i8.has_value() && gate_sb.has_value() &&
+                   routing_gemm_det_fits(hidden, gate_i8.value(), gate_sb.value(), scores);
+        bool rgemv = bsz1 && gate_t.has_value() && !(k & 1) &&
+                     !(((uintptr_t) hidden.data_ptr() | (uintptr_t) gate_t.value().data_ptr()) & 3);
+        if (k > 0 && !det && !rgemv &&
+            hgemv_router_topk_try(hidden, gate, scores, topk_indices, topk_weights,
+                                  OPTPTR(per_expert_scale), OPTPTR(bias), stream))
+            return;
+    }
+    #endif
 
     routing_gemv(hidden, gate, gate_t, gate_i8, gate_sb, scores, stream);
 

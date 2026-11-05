@@ -448,7 +448,7 @@ static bool covered(const at::Tensor& a, const at::Tensor& b, const at::Tensor& 
     if (M > std::numeric_limits<int>::max() || N > std::numeric_limits<int>::max() ||
         K > std::numeric_limits<int>::max()) return false;
     // CUDA grid.y and grid.z are limited to 65535. Keep every narrowing conversion checked.
-    if ((M + BM - 1) / BM > 65535) return false;
+    if ((M + 63) / 64 > 65535) return false;
     if (a.stride(-1) != 1 || b.stride(-1) != 1 || c.stride(-1) != 1) return false;
     if (a.stride(-2) != K || b.stride(-2) != N) return false;
     if (c.stride(-2) < N || c.stride(-2) > std::numeric_limits<int>::max() ||
@@ -540,9 +540,327 @@ static void launch(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c
 
 } // namespace f16acc
 
+// Pascal sm_60 (GP100) form of the same contract: no tensor cores, but HFMA2 runs at twice the fp32 FMA rate,
+// which cuBLAS only uses with an fp16 compute type (fp16 accumulation across all of K). This kernel keeps
+// fp16 partials over KSLICE = 32 elements of K and adds them into fp32 registers, like the f16acc kernel
+// above. BM x 128 x 32 block tile (BM = 64 or 128, 2 * BM threads), 8 x 8 outputs per thread (rows ty*4 + {0..3}
+// and BM/2 + ty*4 + {0..3}, columns tx*4 + {0..3} and 64 + tx*4 + {0..3}). A is staged transposed in shared
+// memory with each element duplicated into a half2 so one LDS.128 feeds four broadcast operands; B rows are
+// staged as loaded. Global loads for the next K tile are issued before the current tile's math (register double
+// buffering, two shared stages). Every output element sees the same arithmetic whatever BM is. Requires
+// K % 32 == 0, N % 128 == 0, 16-byte aligned packed A / B rows.
+namespace hfma2
+{
+
+constexpr int BN = 128, BK = 32;
+// Smallest 64-row-tile grid the dispatching entry points take (see pick_tile)
+constexpr int64_t MIN_BLOCKS_64 = 96;
+
+// BM = 128 (256 threads, one block per SM) or 64 (128 threads, two per SM) rows per block; the 64-row tile
+// halves the grid granularity for narrow outputs (N = 512 projections, small expert groups)
+template <bool OUT_F32, int BM>
+__global__ void __launch_bounds__(BM * 2, 128 / BM)
+gemm_kernel
+(
+    const half* __restrict__ A,
+    const half* __restrict__ B,
+    void* __restrict__ C,
+    const int M,
+    const int N,
+    const int K,
+    const int ldc,
+    const int64_t a_bstride,
+    const int64_t b_bstride,
+    const int64_t c_bstride
+)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 600
+    __shared__ __align__(16) half2 As[2][BK][BM];
+    __shared__ __align__(16) half Bs[2][BK][BN];
+
+    A += blockIdx.z * a_bstride;
+    B += blockIdx.z * b_bstride;
+
+    constexpr int THREADS = BM * 2;
+    constexpr int LB = BK * BN / 8 / THREADS;      // 16-byte B loads per thread per K tile
+    const int tid = threadIdx.x;
+    const int tx = tid & 15, ty = tid >> 4;
+    const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
+
+    // Global load mapping, two 16-deep halves of the K tile: A row tid / 2, k (tid & 1) * 8 + {0, 16};
+    // B rows tid / 16 + l * THREADS / 16, columns (tid & 15) * 8
+    const int a_row = tid >> 1, a_k = (tid & 1) * 8;
+    const bool a_ok = m0 + a_row < M;
+    const half* a_ptr = A + (size_t) (a_ok ? m0 + a_row : 0) * K + a_k;
+    const int b_k = tid >> 4, b_n = (tid & 15) * 8;
+    const half* b_ptr = B + (size_t) b_k * N + n0 + b_n;
+
+    half2 acc[8][4];
+    float accf[8][8];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i)
+    {
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) accf[i][j] = 0.0f;
+    }
+
+    uint4 ra[2], rb[LB];
+    auto gload = [&] (int kt)
+    {
+        #pragma unroll
+        for (int l = 0; l < 2; ++l)
+            ra[l] = a_ok ? *reinterpret_cast<const uint4*>(a_ptr + kt * BK + l * 16) : make_uint4(0, 0, 0, 0);
+        #pragma unroll
+        for (int l = 0; l < LB; ++l)
+            rb[l] = *reinterpret_cast<const uint4*>(b_ptr + (size_t) (kt * BK + l * (THREADS / 16)) * N);
+    };
+    auto sstore = [&] (int buf)
+    {
+        #pragma unroll
+        for (int l = 0; l < 2; ++l)
+        {
+            const half* ha = reinterpret_cast<const half*>(&ra[l]);
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) As[buf][l * 16 + a_k + i][a_row] = __half2half2(ha[i]);
+        }
+        #pragma unroll
+        for (int l = 0; l < LB; ++l)
+            *reinterpret_cast<uint4*>(&Bs[buf][l * (THREADS / 16) + b_k][b_n]) = rb[l];
+    };
+
+    const int KT = K / BK;
+    gload(0);
+    sstore(0);
+    __syncthreads();
+
+    for (int kt = 0; kt < KT; ++kt)
+    {
+        const int buf = kt & 1;
+        if (kt + 1 < KT) gload(kt + 1);
+
+        // One fp16 partial per K tile (KSLICE = BK = 32 terms)
+        #pragma unroll
+        for (int i = 0; i < 8; ++i)
+        {
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) acc[i][j] = __float2half2_rn(0.0f);
+        }
+
+        #pragma unroll
+        for (int k = 0; k < BK; ++k)
+        {
+            const uint4 a0 = *reinterpret_cast<const uint4*>(&As[buf][k][ty * 4]);
+            const uint4 a1 = *reinterpret_cast<const uint4*>(&As[buf][k][BM / 2 + ty * 4]);
+            const uint2 b0 = *reinterpret_cast<const uint2*>(&Bs[buf][k][tx * 4]);
+            const uint2 b1 = *reinterpret_cast<const uint2*>(&Bs[buf][k][64 + tx * 4]);
+            const half2* av0 = reinterpret_cast<const half2*>(&a0);
+            const half2* av1 = reinterpret_cast<const half2*>(&a1);
+            const half2* bv0 = reinterpret_cast<const half2*>(&b0);
+            const half2* bv1 = reinterpret_cast<const half2*>(&b1);
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+            {
+                acc[i][0] = __hfma2(av0[i], bv0[0], acc[i][0]);
+                acc[i][1] = __hfma2(av0[i], bv0[1], acc[i][1]);
+                acc[i][2] = __hfma2(av0[i], bv1[0], acc[i][2]);
+                acc[i][3] = __hfma2(av0[i], bv1[1], acc[i][3]);
+                acc[4 + i][0] = __hfma2(av1[i], bv0[0], acc[4 + i][0]);
+                acc[4 + i][1] = __hfma2(av1[i], bv0[1], acc[4 + i][1]);
+                acc[4 + i][2] = __hfma2(av1[i], bv1[0], acc[4 + i][2]);
+                acc[4 + i][3] = __hfma2(av1[i], bv1[1], acc[4 + i][3]);
+            }
+        }
+
+        #pragma unroll
+        for (int i = 0; i < 8; ++i)
+        {
+            #pragma unroll
+            for (int j = 0; j < 4; ++j)
+            {
+                const float2 f = __half22float2(acc[i][j]);
+                accf[i][2 * j] += f.x;
+                accf[i][2 * j + 1] += f.y;
+            }
+        }
+
+        if (kt + 1 < KT) sstore(buf ^ 1);
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 8; ++i)
+    {
+        const int m = m0 + (i < 4 ? ty * 4 + i : BM / 2 + ty * 4 + i - 4);
+        if (m >= M) continue;
+        if constexpr (OUT_F32)
+        {
+            float* c = reinterpret_cast<float*>(C) + blockIdx.z * c_bstride + (size_t) m * ldc + n0;
+            *reinterpret_cast<float4*>(c + tx * 4) = make_float4(accf[i][0], accf[i][1], accf[i][2], accf[i][3]);
+            *reinterpret_cast<float4*>(c + 64 + tx * 4) = make_float4(accf[i][4], accf[i][5], accf[i][6], accf[i][7]);
+        }
+        else
+        {
+            half* c = reinterpret_cast<half*>(C) + blockIdx.z * c_bstride + (size_t) m * ldc + n0;
+            half2 h[4];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) h[j] = __floats2half2_rn(accf[i][2 * j], accf[i][2 * j + 1]);
+            *reinterpret_cast<uint2*>(c + tx * 4) = *reinterpret_cast<const uint2*>(&h[0]);
+            *reinterpret_cast<uint2*>(c + 64 + tx * 4) = *reinterpret_cast<const uint2*>(&h[2]);
+        }
+    }
+#endif
+}
+
+static int g_enabled[MAX_DEVICES];
+static bool g_init = false;
+static std::mutex g_mutex;
+
+// sm_60 only; EXL3_HGEMM_HFMA2=0 keeps cuBLAS
+static bool enabled(int device)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_init)
+    {
+        for (int i = 0; i < MAX_DEVICES; ++i) g_enabled[i] = -1;
+        g_init = true;
+    }
+    if (device < 0 || device >= MAX_DEVICES) return false;
+    if (g_enabled[device] >= 0) return g_enabled[device] == 1;
+    const auto* props = at::cuda::getDeviceProperties(device);
+    const char* env = std::getenv("EXL3_HGEMM_HFMA2");
+    int on = (props->major == 6 && props->minor == 0) ? 1 : 0;
+    if (env && std::strcmp(env, "0") == 0) on = 0;
+    g_enabled[device] = on;
+    return on == 1;
+}
+
+// Shapes, strides and alignment the kernel handles
+static bool covered(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c)
+{
+    if (!a.is_cuda() || a.device() != b.device() || a.device() != c.device()) return false;
+    if (a.dtype() != at::kHalf || b.dtype() != at::kHalf) return false;
+    if (c.dtype() != at::kHalf && c.dtype() != at::kFloat) return false;
+    if (b.dim() != 2 && b.dim() != 3) return false;
+    const bool batched = b.dim() == 3;
+    if (batched && (a.dim() != 3 || c.dim() != 3 || a.size(0) != b.size(0) || a.size(0) != c.size(0))) return false;
+    if (batched && (a.size(0) < 1 || a.size(0) > 65535)) return false;
+    if (!batched && (a.dim() < 2 || c.dim() < 2)) return false;
+    const int64_t K = a.size(-1), N = b.size(-1);
+    int64_t M = 1;
+    if (batched) M = a.size(1);
+    else for (int d = 0; d < a.dim() - 1; ++d) M *= a.size(d);
+    if (M < 1 || K < BK || K % BK || N < BN || N % BN) return false;
+    if (b.size(-2) != K || c.size(-1) != N) return false;
+    if (M > std::numeric_limits<int>::max() || K > std::numeric_limits<int>::max() ||
+        N > std::numeric_limits<int>::max()) return false;
+    if ((M + 63) / 64 > 65535) return false;
+    // Packed A rows (all leading dims flattened), packed B rows, contiguous C columns
+    if (!batched && !a.is_contiguous()) return false;
+    if (batched && (a.stride(2) != 1 || a.stride(1) != K)) return false;
+    if (b.stride(-1) != 1 || b.stride(-2) != N || c.stride(-1) != 1) return false;
+    int64_t c_rows = 1;
+    if (batched) c_rows = c.size(1);
+    else for (int d = 0; d < c.dim() - 1; ++d) c_rows *= c.size(d);
+    if (c_rows != M) return false;
+    // Rows of C: one stride (flattened leading dims must be uniform)
+    const int64_t ldc = c.stride(-2);
+    if (!batched)
+    {
+        int64_t expect = ldc;
+        for (int d = c.dim() - 2; d >= 0; --d)
+        {
+            if (c.size(d) > 1 && c.stride(d) != expect) return false;
+            expect *= c.size(d);
+        }
+    }
+    if (ldc < N || ldc > std::numeric_limits<int>::max()) return false;
+    const int vec = c.dtype() == at::kFloat ? 4 : 4;   // float4 / 4-half stores
+    if (ldc % vec) return false;
+    const uintptr_t c_align = c.dtype() == at::kFloat ? 16 : 8;
+    if (((uintptr_t) a.data_ptr() & 15) || ((uintptr_t) b.data_ptr() & 15) || ((uintptr_t) c.data_ptr() & (c_align - 1)))
+        return false;
+    if (batched && (a.stride(0) % 8 || b.stride(0) % 8 || c.stride(0) % 4)) return false;
+    return true;
+}
+
+static int64_t rows_of(const at::Tensor& a, bool batched)
+{
+    if (batched) return a.size(1);
+    int64_t M = 1;
+    for (int d = 0; d < a.dim() - 1; ++d) M *= a.size(d);
+    return M;
+}
+
+// Row tile for the dispatching entry points, 0 = keep cuBLAS. Measured on the P100 against cuBLAS (fp32
+// compute): the 64-row tile (two 128-thread blocks per SM) is 1.2-2.1x faster from about 96 blocks up
+// (2048 x 2048 x 512: 1.19x, 132 x 2048 x 8192: 1.28x, 645 x 4096 x 2048: 1.27x, 8 x [150 x 2048 x 512]: 2.1x)
+// and within 2% of the 128-row tile on the large shapes (2048 x 2048 x 8192: 1.41x vs 1.44x), while grids of
+// 32-48 blocks lose (512 x 2048 x 512: 0.64x, 132 x 4096 x 2048: 0.80x)
+static int pick_tile(const at::Tensor& a, const at::Tensor& b)
+{
+    const bool batched = b.dim() == 3;
+    const int64_t M = rows_of(a, batched);
+    const int64_t blocks = ((M + 63) / 64) * (b.size(-1) / BN) * (batched ? a.size(0) : 1);
+    return blocks >= MIN_BLOCKS_64 ? 64 : 0;
+}
+
+static void launch(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, cudaStream_t stream, int bm)
+{
+    const bool batched = b.dim() == 3;
+    const int batch = batched ? a.size(0) : 1;
+    const int K = a.size(-1), N = b.size(-1);
+    const int64_t M = rows_of(a, batched);
+    dim3 grid(N / BN, (M + bm - 1) / bm, batch);
+    const int ldc = (int) c.stride(-2);
+    const int64_t as = batched ? a.stride(0) : 0, bs = batched ? b.stride(0) : 0, cs = batched ? c.stride(0) : 0;
+    const half* ap = (const half*) a.data_ptr();
+    const half* bp = (const half*) b.data_ptr();
+    const bool f32 = c.dtype() == at::kFloat;
+    if (bm == 64)
+    {
+        if (f32) gemm_kernel<true, 64><<<grid, 128, 0, stream>>>(ap, bp, c.data_ptr(), (int) M, N, K, ldc, as, bs, cs);
+        else gemm_kernel<false, 64><<<grid, 128, 0, stream>>>(ap, bp, c.data_ptr(), (int) M, N, K, ldc, as, bs, cs);
+    }
+    else
+    {
+        if (f32) gemm_kernel<true, 128><<<grid, 256, 0, stream>>>(ap, bp, c.data_ptr(), (int) M, N, K, ldc, as, bs, cs);
+        else gemm_kernel<false, 128><<<grid, 256, 0, stream>>>(ap, bp, c.data_ptr(), (int) M, N, K, ldc, as, bs, cs);
+    }
+    cuda_check(cudaPeekAtLastError());
+}
+
+} // namespace hfma2
+
+// Pascal HFMA2 kernel for the reconstruct-path GEMMs; false = not sm_60, disabled or shape not covered
+bool hgemm_hfma2_try(const at::Tensor& a, const at::Tensor& b, at::Tensor& c)
+{
+    if (!a.is_cuda() || !hfma2::enabled(a.device().index())) return false;
+    if (!hfma2::covered(a, b, c)) return false;
+    const int bm = hfma2::pick_tile(a, b);
+    if (!bm) return false;
+    const at::cuda::OptionalCUDAGuard device_guard(a.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    hfma2::launch(a, b, c, stream, bm);
+    return true;
+}
+
+// Force the kernel (tests / benchmarks): errors on other devices or uncovered shapes. bm: row tile, 128 or 64
+void hgemm_hfma2(at::Tensor a, at::Tensor b, at::Tensor c, int64_t bm)
+{
+    TORCH_CHECK(bm == 128 || bm == 64, "hgemm_hfma2: row tile must be 128 or 64");
+    TORCH_CHECK(a.is_cuda(), "hgemm_hfma2: CUDA tensors required");
+    const auto* props = at::cuda::getDeviceProperties(a.device().index());
+    TORCH_CHECK(props->major == 6 && props->minor == 0, "hgemm_hfma2: sm_60 only");
+    TORCH_CHECK(hfma2::covered(a, b, c), "hgemm_hfma2: unsupported shape, strides or alignment (K % 32, N % 128, packed rows)");
+    const at::cuda::OptionalCUDAGuard device_guard(a.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    hfma2::launch(a, b, c, stream, (int) bm);
+}
+
 // Try the fp16-accumulator kernel; false = caller should use cuBLAS
 bool hgemm_f16acc_try(const at::Tensor& a, const at::Tensor& b, at::Tensor& c)
 {
+    if (hgemm_hfma2_try(a, b, c)) return true;
     if (!f16acc::covered(a, b, c) || !f16acc::worthwhile(a, b)) return false;
     if (!f16acc::enabled(a.device().index())) return false;
     const at::cuda::OptionalCUDAGuard device_guard(a.device());

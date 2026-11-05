@@ -45,7 +45,7 @@ import os
 import torch
 
 from ...util.tensor import g_tensor_cache
-from .smem import pick_config, shared_bytes, halving_ladder
+from .smem import pick_config, shared_bytes, halving_ladder, smem_limit, NoFittingConfig
 
 # Debug aid: synchronize and error-check after every MLA kernel launch, so an async illegal
 # memory access is attributed to the kernel that caused it instead of a later sync point
@@ -1044,6 +1044,28 @@ def mla_attn_triton_decode(
     return out
 
 
+def mla_absorb_tiles(device, n_q_heads: int, qk_dim: int, qk_nope_head_dim: int, D_c: int, block_m: int) -> tuple[int, int]:
+    """Finds (block_m, block_n) for _mla_absorb_kernel that fits device shared memory."""
+    nope_pad = triton.next_power_of_2(qk_nope_head_dim)
+    def probe(cfg):
+        bm, bn = cfg
+        R = bm
+        q = torch.empty((R, n_q_heads, qk_dim), dtype = torch.half, device = device)
+        w = torch.empty((D_c, n_q_heads * qk_nope_head_dim), dtype = torch.half, device = device)
+        out = torch.empty((n_q_heads, R, D_c), dtype = torch.half, device = device)
+        return shared_bytes(
+            _mla_absorb_kernel,
+            (q, w, out, R, n_q_heads, qk_dim, n_q_heads * qk_dim, qk_nope_head_dim, nope_pad, D_c, bm, bn),
+            num_warps = 4, num_stages = 2
+        )
+    candidates = []
+    for bm in halving_ladder(block_m, 16):
+        for bn in halving_ladder(128, 32):
+            if D_c % bn == 0:
+                candidates.append((bm, bn))
+    return pick_config(device, "mla_absorb", (n_q_heads, qk_dim, qk_nope_head_dim, D_c, block_m), candidates, probe)
+
+
 def mla_absorb(q: torch.Tensor, w_uk_flat: torch.Tensor, n_q_heads: int, qk_nope_head_dim: int):
     """(R, H, qk_head_dim) token-major queries -> (H, R, kv_lora_rank) head-major absorbed
     queries, W_UK read from the flat layout."""
@@ -1051,15 +1073,21 @@ def mla_absorb(q: torch.Tensor, w_uk_flat: torch.Tensor, n_q_heads: int, qk_nope
     D_c = w_uk_flat.shape[0]
     out = torch.empty((H, R, D_c), dtype = torch.half, device = q.device)
     block_m = min(64, triton.next_power_of_2(max(R, 16)))
-    with torch.cuda.device(q.device):
-        _mla_absorb_kernel[(triton.cdiv(R, block_m), D_c // 128, H)](
-            q, w_uk_flat, out, R,
-            H, qk_dim, H * qk_dim, qk_nope_head_dim, triton.next_power_of_2(qk_nope_head_dim), D_c,
-            block_m, 128,
-            num_warps = 4, num_stages = 2,
-        )
-    _dbg_sync("mla_absorb", q.device)
-    return out
+    try:
+        bm, bn = mla_absorb_tiles(q.device, H, qk_dim, qk_nope_head_dim, D_c, block_m)
+        with torch.cuda.device(q.device):
+            _mla_absorb_kernel[(triton.cdiv(R, bm), D_c // bn, H)](
+                q, w_uk_flat, out, R,
+                H, qk_dim, H * qk_dim, qk_nope_head_dim, triton.next_power_of_2(qk_nope_head_dim), D_c,
+                bm, bn,
+                num_warps = 4, num_stages = 2,
+            )
+        _dbg_sync("mla_absorb", q.device)
+        return out
+    except NoFittingConfig:
+        q_nope = q[:, :, :qk_nope_head_dim].permute(1, 0, 2)
+        w_uk = w_uk_flat.view(D_c, H, qk_nope_head_dim).permute(1, 2, 0).contiguous()
+        return torch.bmm(q_nope, w_uk)
 
 
 def mla_unfold_block_k(device, n_q_heads: int, D_c: int, v_head_dim: int, block_m: int) -> int:
@@ -1172,10 +1200,11 @@ def mla_attn_triton_prefill_mha(
             tiles = [(a, min(a + ts, total)) for a in range(0, total, ts)]
             for ti, (a, e) in enumerate(tiles):
                 tl_len = e - a
-                _mla_gather_tile_kernel[(triton.cdiv(tl_len, 64),)](
+                gather_br = 32 if smem_limit(dev) < 64 * 1024 else 64
+                _mla_gather_tile_kernel[(triton.cdiv(tl_len, gather_br),)](
                     ckv_cache, kpe_cache, ckv_scales, h32, block_table,
                     ckv_t, kpe_t, a, tl_len, npps, b,
-                    qc_bits, page_size, D_c, D_r, 64,
+                    qc_bits, page_size, D_c, D_r, gather_br,
                     num_warps = 4, num_stages = 2,
                 )
                 # Up-projection as two plain contiguous GEMMs (never the strided-batched form)
@@ -1197,13 +1226,15 @@ def mla_attn_triton_prefill_mha(
                         break
                     except triton.runtime.errors.OutOfResources:
                         # Launch failed before running anything, so smaller tiles are safe: the q tile
-                        # down to 32 rows first, then the kv tile and its pipeline depth
+                        # down to 16 rows first, then the kv tile and its pipeline depth
                         if block_m > 32:
                             block_m //= 2
                         elif num_stages > 1:
                             num_stages = 1
                         elif block_n > 16:
                             block_n //= 2
+                        elif block_m > 16:
+                            block_m //= 2
                         else:
                             raise AssertionError("MHA prefill kernel does not fit in shared memory")
     _dbg_sync("mla_prefill_mha", dev)

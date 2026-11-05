@@ -6,6 +6,9 @@
 #include "util.cuh"
 #include "quant/exl3_devctx.cuh"
 #include "cublas_handle.cuh"
+#if !defined(USE_ROCM)
+    #include "hgemv_f16.cuh"
+#endif
 #include <limits>
 #if defined(USE_ROCM)
     #include "rocm/wmma_gemm.cuh"
@@ -81,6 +84,12 @@ static void hgemm_gemmex_impl
         cuda_check(cudaPeekAtLastError());
         return;
     }
+#endif
+
+#if !defined(USE_ROCM)
+    // Decode-class row counts: the fp16 GEMV (hgemv_f16.cu) where it is enabled and the shape is covered
+    if (size_m <= HGEMV_MAX_M && hgemv_f16_try(a, b, c, stream))
+        return;
 #endif
 
     // Set cuBLAS modes and workspace

@@ -208,7 +208,7 @@ this keep the direct path, which reads less global memory (relevant for short tr
 over long contexts at low cache bitrates). Where the staged window feeds SDPA (`EXL3_SDPA_PREFILL`
 below) every prefill chunk stages. Tuning/testing knob.
 
-### `EXL3_SDPA_PREFILL` (default: on for sm_75, off elsewhere)
+### `EXL3_SDPA_PREFILL` (default: on for sm_75 and sm_60, off elsewhere)
 
 Prefill chunks (more than 8 query rows, causal, no sliding window, softcap or sinks) attend over a
 dense fp16 copy of their window instead of running the Triton paged prefill kernel: the staged
@@ -218,13 +218,39 @@ cutlass kernel refuses `enable_gqa`). Triton emits no tensor-core instructions f
 Triton kernel runs on scalar FMA there and prefill time grows steeply with context; the SDPA
 kernel keeps Turing's HMMA units busy. Decode and draft verification stay on the Triton kernels.
 `1` forces the path on any CUDA device (it is exact, so this is a testing switch), `0` forces it
-off on Turing.
+off on Turing. On sm_60 it is on because the Triton prefill kernel hits an illegal memory access
+there; head_dim 256 then runs `fa60` (below), other head sizes SDPA.
 
 ### `EXL3_FA75` (default: on for sm_75, off elsewhere)
 
 On the path above, head_dim 256 attention runs the `fa75` kernel (`exllamav3_ext/turing/fa75.cu`,
 `mma.sync.m16n8k8`) instead of SDPA, whose cutlass kernel handles 256-wide heads at a fraction of
 its 128-wide rate. Plain PTX for sm_75 and later; `1` forces it on any CUDA device.
+
+### `EXL3_FA60` (default: on for sm_60, off elsewhere)
+
+On the path above, head_dim 256 attention runs the `fa60` kernel (`exllamav3_ext/pascal/fa60.cu`)
+instead of SDPA when `EXL3_FA75` does not apply. PyTorch's memory-efficient SDPA runs a SIMT fp32
+cutlass kernel on Pascal (`fmha_cutlassF_f16_aligned_32x128_gmem_sm50`, 3.3-3.5 TFLOPS on the P100
+at ~1190 MHz); fa60 is a flash-attention forward on HFMA2 (Q K^T from 8-term fp16 partials summed in
+fp32, fp32 online softmax, P V from 16-key fp16 partials into fp32 O) at 7.2-7.3 TFLOPS: 2.15-2.45x
+on a 2048-row chunk over 2048-30000 keys, both for 24/4 and 16/2 heads. Its output error on real
+Qwen3.6-27B activations is 3-12x SDPA's (max abs 1.4e-2..7.4e-2 on outputs up to |45|, SDPA 2e-3..2e-2);
+the model-level KL against SDPA is ~1e-3, below the 0.8e-3..5.4e-3 between the fp16 and the `-cq 4`
+cache. The switch is read per call. `1` forces it on any CUDA device (it is HFMA2 / fp32 SIMT code and
+runs from sm_60 up), `0` keeps SDPA.
+
+### `EXL3_ATTN_LIVE_SPLIT` (default: `1`)
+
+Flash-decoding split of the paged decode attention (`_paged_attn_decode_split_kernel`, also inside the
+graphed BC attention). By default the host sizes the splits from the block-table bound, and the generator
+pads the table to 16 pages (4096 tokens), so at short contexts a few splits walk several key tiles while
+the rest idle. `1` (default since Nov 3; `0` restores the old split) makes the kernel divide the live length (read from `cache_seqlens` on the device, so
+graph replay stays valid) over the same splits, and on sm_60 / sm_75 uses 16-key tiles. Only the split
+boundaries move; the result equals the bound split up to the reduction order
+(`tests/kernels/attention/test_decode_live_split.py`). Microbenchmark (head_dim 256, 16 q / 2 kv heads,
+q_len 2, 4-bit cache): P100 63 -> 30 us at 500 keys, 98 -> 62 us at 3500; RTX 2060 90 -> 29 us and
+127 -> 83 us.
 
 ### `EXL3_QC_PREFILL_NS` (default: `0` = measure)
 
@@ -267,12 +293,45 @@ attention sinks); this switch exists for A/B comparison.
 
 QTIP-style small-m fp16 GEMV path, dispatched from the main GEMM entry point when the shape
 heuristic applies. `0` disables, `1` uses the measured heuristic envelope (default), `2` forces
-the path wherever its hard constraints allow (testing).
+the path wherever its hard constraints allow (testing). Covers 2, 3, 4 bpw (and 1.5/2.5/3.5 with
+mul1) everywhere, and 5 and 6 bpw on Pascal only (always through staged tile words; the 6 bpw
+lm_head of the dense Qwen3.5 27B quants went from 16.6 to 3.3 ms per decode step on the P100).
+On Pascal every eligible shape (m <= 8, k and n multiples of 128) takes the GEMV, since the tile
+kernel is far off the memory roofline there. On Turing sm_75 every eligible 2..4 bpw shape takes
+it as well, see `EXL3_GEMV_SM75`.
+
+### `EXL3_GEMV_SM75` (default: `1`)
+
+Turing (sm_75) shape envelope of the GEMV above. On the RTX 2060 the GEMV beat the autotuned tile
+kernel at every measured shape (mul1, K = 2..4, m = 1..8, k and n from 512 to 17408; 1.04-1.70x,
+1.18-1.68x at K = 4), so with `1` every eligible K <= 4 mul1 shape takes it, and same-input mul1
+projections (gate/up, q/k/v, the GatedDeltaNet input projections) are unfused so that each one does
+(mcg and 3INST are unmeasured there and keep the general heuristic). Qwen3.6-27B 4.00bpw decode, the
+2060's 16 layers: 26.8 -> 18.0 ms GPU time per token. `0` keeps the general heuristic (tile kernel
+for most of these shapes) and the fused MGEMM.
 
 ### `EXL3_GEMV_SMEM` (default: `-1`)
 
 Weight-extraction strategy inside the fp16 GEMV kernel: `-1` picks per bitrate (default), `0`
 forces shuffle extraction, `1` forces shared-memory staging. Testing only.
+
+### `EXL3_HGEMV` (default: on for sm_60 and sm_75, off elsewhere)
+
+Dense fp16 GEMV (`hgemv_f16.cu`) for unquantized linears (`LinearFP16`: projections and lm_head of
+checkpoints that keep them in 16 bits) at 1..4 rows, dispatched from `hgemm`, `BC_LinearFP16` and
+`LinearFP16.forward`. fp32 accumulation, deterministic split-K, N % 8 == 0. cuBLAS ran these shapes
+at 110-330 GB/s on the P100 (gemv2N at m = 1, sgemm at m = 2: 119 GB/s on a 248320-wide lm_head);
+the GEMV reaches 440-490 GB/s on 2048 x 4096..8192 projections and 588 GB/s on the lm_head (a 1 GB
+fp16 read runs at 593 GB/s on this card), and 280-300 GB/s of 317 on the RTX 2060.
+`0` keeps cuBLAS, `1` forces it on any CUDA device.
+
+### `EXL3_FP16_LINEAR_HFMA2` (default: `1`, sm_60 only)
+
+On sm_60, `LinearFP16` calls with more than 4 rows (prefill) go through `hgemm_recon`, the HFMA2 GEMM of
+the reconstruct path (32-term fp16 partials added into fp32; shapes it does not cover or does not gain
+on fall back to cuBLAS), instead of `torch.matmul`, which runs fp16 GEMMs at the fp32 FMA rate on the P100.
+Ornith-1.5-35B-A3B (all projections 16-bit): prefill 512 / 2048 / 8192 tokens 408 / 672 / 681 -> 420 / 731
+/ 752 t/s, KL against an fp32 reference 1.34e-2 (cuBLAS) vs 1.31e-2. `0` keeps `torch.matmul`.
 
 ### `EXL3_INT8_GEMV` (default: `2`)
 
@@ -374,7 +433,9 @@ thread configuration, and the knobs below for tuning the split.
 
 These knobs are collected in `exllamav3/model/moe_cpu_host.py`'s `MoeCpuTuning` class (read once
 from the environment at import); for a same-process sweep, mutate fields on the module-level
-`TUNING` singleton before constructing a model instead of setting env vars.
+`TUNING` singleton before constructing a model instead of setting env vars. Layout policy is an
+exception: set its environment flags before starting the parent and worker, and reload the model
+in fresh processes to change it.
 
 ### `EXL3_MOE_CPU_OFFLOAD` (default: `0`)
 
@@ -456,7 +517,7 @@ throughput on a Xeon Gold 6148. The `vbmi` tier
 without VBMI and stay on the `vnni` tier) is 15-70% faster than the dword scheme depending on
 bitrate. Never upgrades past what the CPU actually supports; unrecognized values are ignored.
 Read once per process (parent and worker independently), so it must be set before either is
-started. Note that capping below `bw` also disables the swizzled weight layout (see
+started. The `scalar` tier disables packed weight layouts; `avx2` has its own layout rules (see
 `EXL3_MOE_CPU_SWIZZLE`).
 
 ### `EXL3_MOE_CPU_WIDE` (default: `1`)
@@ -484,10 +545,33 @@ bands integer rates in groups of 2 and additionally repacks each tile's 32-bit w
 permutation a half-row's 8 source words then live in one AVX2 register, so every weight gather
 collapses to a single `vpermd` instead of walking the tile's registers, which removes the
 rate-proportional extraction cost of the native layout. Half-integer rates stay native on this
-tier. The `scalar` tier reads the native layout. The GPU-streaming prefill path restores the native
-tile and word order after each DMA, into a second VRAM ring allocated only when a layer's
+tier unless `EXL3_MOE_CPU_FRACTIONAL_SWIZZLE=1`. The `scalar` tier reads the native layout.
+The GPU-streaming prefill path restores native tile and word order after each DMA, into a
+second VRAM ring allocated only when a layer's
 experts arrive packed, so staged bytes reaching the GPU dequant are unaffected. Set to `0` to
 keep the native layout.
+
+Native AVX2 fractional kernels (1.5, 2.5 and 3.5 bpw) specialize batches of one, two or three
+prepared activation rows, including high/low pairs for wide activations. These kernels remain
+active with fractional packing off and need no new weight storage or allocation.
+
+### `EXL3_MOE_CPU_FRACTIONAL_SWIZZLE` (default: `0`)
+
+Only the literal value `1` enables this flag; all other values leave it disabled.
+
+Opt in to same-size group-2 packing with chronological 16-bit halfword planes for AVX2
+fractional experts (1.5, 2.5 and 3.5 bpw). Requires an active AVX2 tier;
+`EXL3_MOE_CPU_SWIZZLE=0` disables it even when this flag is `1`. Integer, scalar and AVX-512
+layout policy is unchanged. This lossless byte permutation does not change weight size,
+quantization or model quality, or retain an additional persistent expert copy.
+
+It can nevertheless increase VRAM use: the first packed layer on a device needs the existing
+native-order/inverse weight ring, `EXL3_MOE_CPU_WSLOTS * EXL3_MOE_CPU_WSLOT_MB` MiB
+(default **64 MiB per host/device**). A ring already allocated for packed integer experts is
+reused, not duplicated. Autosplit's measured load accounts for this allocation; otherwise it
+can first occur when packed experts stream to the GPU. This is why fractional packing is
+explicit and default-off. Set the flag before starting both parent and worker; changing this
+load-time policy requires fresh processes and a model reload.
 
 ### `EXL3_MOE_MEMOPS` (default: `1`)
 
@@ -567,11 +651,72 @@ unsupported strides/alignment) use cuBLAS regardless. Compute capability 12.x us
 128x128 or 128x64 tiles selected by shape, and a native mixed-precision add when folding
 each 32-term FP16 partial into FP32.
 
+### `EXL3_HGEMM_HFMA2` (default: on for sm_60)
+
+Pascal sm_60 (Tesla P100) counterpart of `EXL3_HGEMM_F16ACC`: no tensor cores, but HFMA2 runs at
+twice the fp32 FMA rate, which cuBLAS only uses with an fp16 compute type. The reconstruct GEMMs
+(the same paths as above) run through an HFMA2 kernel (`hgemm_f16acc.cu`, namespace `hfma2`)
+that keeps 32-term fp16 partials and adds them into fp32 registers, 1.2-2.1x cuBLAS for grids of
+at least 96 64-row blocks; smaller grids keep cuBLAS. `0` keeps cuBLAS everywhere.
+
+### `EXL3_RECON_THRESHOLD_SM60` (default: `64`)
+
+Row count up to which EXL3 linears on sm_60 use the tile GEMM instead of reconstruct + GEMM (the
+other devices keep 144). With the HFMA2 GEMM behind the reconstruct path the emulated-MMA tile
+GEMM loses from about 64 rows on the P100.
+
+### `EXL3_MOE_FUSED_SM60` (default: `1`)
+
+Run MoE prefill on sm_60 through the fused `exl3_moe` kernel (16-row tiles, emulated MMA, experts
+up to `EXL3_MOE_FUSED_ROWS` rows; larger experts take the batched reconstruct tier) instead of
+the per-expert loop. `0` restores the per-expert loop and batched reconstruct tier.
+
 ### `EXL3_MOE_COOP_KSPLIT` (default: unset)
 
 Split-k factor of the fused decode MoE kernels: `n` runs every column chunk as `n` blocks over
 disjoint k ranges whose partial sums the last-arriving block adds. Measured as neutral to harmful
 on every GPU here, so the default is no split. Testing knob only.
+
+### `EXL3_MOE_COOP_FUSED` (default: unset = auto on sm_60 / sm_75)
+
+Persistent single-launch form of the fused decode MoE kernels (`exl3_moe_coop_f_kernel`, and
+`exl3_moe_coop_d_kernel` for a layer with an EXL3 shared expert). A grid of one block per resident
+slot pulls the two-launch path's blocks as work items from an atomic queue (shared gate/up, routed
+gate/up, shared down, routed down); a down item waits on per-slot ready counters that the gate/up
+epilogues set, and the routed down epilogue waits for the shared expert's output. The items are the
+same blocks, so the result is bit-identical to the separate launches (`tests/kernels/moe/test_moe_coop_fused.py`).
+It fixes the wave tails on sm_60, where the coop kernels hold one 512-thread block per SM (107-114
+registers): 64 gate/up blocks on 56 SMs ran as a full wave plus 8 lone blocks, 128 down blocks as 3
+waves, and the shared expert's 16-block launches ran alone on 16 SMs. Auto: on sm_60 and sm_75 when
+the gate/up stage alone fills the device (the 16 + 16 block shared-expert launch on its own got
+slower in the persistent form); needs the counter scratch's tail (`exl3_moe_coop_ctr_len_fused`, the
+module allocates it), gate/up and down at one width and the wide tile. The dual kernel is compiled for
+routed K 2..4 with shared K = K, K + 1, K + 2 (mcg, mul1); other pairs launch the shared expert first,
+as before. `1` forces the persistent kernel wherever it applies (testing), `0` keeps the separate
+launches.
+
+### `EXL3_ROUTER_FUSED` (default: `0`)
+
+`routing_std` (softmax top-k router) at 2..4 rows on the devices where the fp16 GEMV (`EXL3_HGEMV`) is on:
+the router projection and the top-k run as one launch. The hgemv kernel is unchanged (same split, same
+summation order); the block that holds the final logits (the last k-slice block of the single column
+tile, router widths up to 256 experts) runs the `routing_std_topk_kernel` code on them in its epilogue.
+Logits, indices and weights are bit-identical to the two launches (`tests/kernels/routing/test_router_fused.py`).
+Single rows keep `routing_gemv_kernel`. Read per call.
+
+### `EXL3_MOE_ROT_PAIR` (default: `1`)
+
+For the dual persistent MoE launch (shared + routed experts, more than one row, e.g. an MTP verify step):
+the two input-rotation pre-kernels run as one launch, the blocks of the shared expert's rotation first.
+Same per-warp work, bit-identical (`tests/kernels/moe/test_moe_coop_fused.py::test_dual_shared_routed`).
+Read per call.
+
+### `EXL3_MTP_DEFER_CONF` (default: `1`)
+
+Generator, MTP drafting with `-dds` and a one-token draft window: the window can never be cut, so the draft
+confidence is kept on the device and read once after verification (for the calibration labels) instead of a
+blocking readback in the draft step. Same tokens and calibration. The draft ids still come back to the
+host before verification (the embedding lookup needs them), so the gain is small.
 
 ### `EXL3_MOE_COOP_WIDE` (default: unset)
 

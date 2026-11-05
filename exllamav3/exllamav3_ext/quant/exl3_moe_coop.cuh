@@ -4,6 +4,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <vector>
 
 // Fused decode-shaped MoE path (bsz <= MAX_BSZN): two launches per layer run every (token, expert)
 // slot through gate/up, activation and down, replacing the per-projection mgemm CUDA graphs of
@@ -68,6 +69,15 @@ struct MoeCoopParams
     int n_local;                // entries in the pointer tables
     int sh_gate_n;              // shared gate weight length (checked against H per call)
 
+    // Persistent single-launch path (exl3_moe_coop_f_kernel), when the counter scratch has room
+    bool f_ok;                  // ctr holds the queue and ready counters (exl3_moe_coop_ctr_len_fused)
+    int* f_queue;               // [ticket, blocks done]
+    int* f_ready;               // (slots_max) activation chunks stored per slot
+    int f_items_a;              // queue items of the gate/up stage (its two-launch grid)
+    int f_items_b;
+    int* f_sh_done;             // dual kernel: shared-expert down items finished (routed params only)
+    int f_sh_wait;              // dual kernel: down items of the shared expert to wait for, else 0
+
     // Output
     float* out;                 // (bsz, H_out), row stride out_stride
     int out_stride;
@@ -119,6 +129,24 @@ void exl3_moe_coop_run
     const c10::optional<at::Tensor>& sh_out
 );
 
+// Per-call fields of p (input rows, routing, optional shared-expert output) without launching
+void exl3_moe_coop_bind
+(
+    MoeCoopParams& p,
+    const at::Tensor& x, const at::Tensor& sel, const at::Tensor& rw,
+    const c10::optional<at::Tensor>& sh_out
+);
+
+// A layer's shared expert (ps, one slot per token, its output = p's sh_out) and routed experts (p):
+// one persistent launch where the dual kernel covers both widths (EXL3_MOE_COOP_FUSED), else the
+// shared launch(es) followed by the routed one(s)
+void exl3_moe_coop_launch_pair
+(
+    const MoeCoopParams& p, float K_gu, float K_d, int cb,
+    const MoeCoopParams& ps, float Ks_gu, float Ks_d, int cbs,
+    int device, cudaStream_t stream
+);
+
 // Tensor front end (prepare + run; the test entry point)
 void exl3_moe_coop
 (
@@ -151,9 +179,29 @@ void exl3_moe_coop
     const c10::optional<at::Tensor>& sh_gate_w
 );
 
+// Test entry point of exl3_moe_coop_launch_pair: gated SiLU experts without biases. tabs: the nine
+// pointer tables (gate, up, down x trellis, suh, svh); scratch: had_g, had_u, gu_g, gu_u, act_out,
+// d_out, ctr. The shared expert runs as expert 0 of its tables with weight 1 into sh_buf (bsz, H),
+// merged into out through sigmoid(x . sh_gate_w)
+void exl3_moe_coop_pair
+(
+    const at::Tensor& x, const at::Tensor& sel, const at::Tensor& rw, int Hi,
+    const std::vector<at::Tensor>& tabs, float K, const std::vector<at::Tensor>& scratch,
+    const std::vector<at::Tensor>& tabs_sh, float K_sh, const std::vector<at::Tensor>& scratch_sh,
+    bool mcg, bool mul1,
+    at::Tensor& out, at::Tensor& sh_buf, const at::Tensor& sh_gate_w
+);
+
 // Length of the int32 scratch for a module: completion counters + run table (slots_max =
 // MAX_BSZN * top_k)
 inline int64_t exl3_moe_coop_ctr_len(int64_t slots_max, int64_t bsz_max, int64_t I, int64_t Ho)
 {
     return slots_max * (I / 128) + bsz_max * (Ho / 128) + 2 + (slots_max + 1) + slots_max;
+}
+
+// Same plus the persistent kernel's queue and per-slot ready counters (a scratch of the base
+// length keeps the two-launch path)
+inline int64_t exl3_moe_coop_ctr_len_fused(int64_t slots_max, int64_t bsz_max, int64_t I, int64_t Ho)
+{
+    return exl3_moe_coop_ctr_len(slots_max, bsz_max, I, Ho) + 2 + slots_max;
 }

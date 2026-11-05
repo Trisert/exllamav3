@@ -32,6 +32,8 @@ int DevCtx::get_num_sms(int device)
 int DevCtx::get_cc(int device)
 {
     std::lock_guard<std::mutex> lock(mtx);
+    // Stored as value + 1: CC_PASCAL is 0, which would read as "not yet queried" and send every call
+    // (one per GEMM launch) back through cudaGetDeviceProperties
     if (!cc[device])
     {
 #if defined(USE_ROCM)
@@ -39,19 +41,19 @@ int DevCtx::get_cc(int device)
         // below would read as Blackwell. Until RDNA devices get classes of their own, they take the
         // conservative host-side choices of the oldest class (the device code is unaffected: the
         // EXL3_SM75 gate in arch.cuh is compile-time and off for HIP)
-        cc[device] = CC_OLD;
+        cc[device] = CC_OLD + 1;
 #else
         cudaDeviceProp prop;
         cuda_check(cudaGetDeviceProperties(&prop, device));
-        if (prop.major >= 10) cc[device] = CC_BLACKWELL;
-        else if (prop.major >= 9) cc[device] = CC_HOPPER;
-        else if (prop.major >= 8 && prop.minor >= 9) cc[device] = CC_ADA;
-        else if (prop.major >= 8) cc[device] = CC_AMPERE;
-        else if (prop.major >= 7) cc[device] = CC_OLD;
-        else cc[device] = CC_PASCAL;
+        if (prop.major >= 10) cc[device] = CC_BLACKWELL + 1;
+        else if (prop.major >= 9) cc[device] = CC_HOPPER + 1;
+        else if (prop.major >= 8 && prop.minor >= 9) cc[device] = CC_ADA + 1;
+        else if (prop.major >= 8) cc[device] = CC_AMPERE + 1;
+        else if (prop.major >= 7) cc[device] = CC_OLD + 1;
+        else cc[device] = CC_PASCAL + 1;
 #endif
     }
-    return cc[device];
+    return cc[device] - 1;
 }
 
 int DevCtx::get_smem_max(int device)
