@@ -27,6 +27,22 @@ that every sm_60 kernel writes every slot). Verified on the P100 (+2060 for the 
   lm_head (vocab x hidden, 6 bpw); `convert.py -w <work> -r -d 0` resumed it on the P100 in 4 minutes. `chat.py` has no LFM
   prompt mode, `-mode chatml` is the closest (`<|im_start|>`), untested.
 
+## Qwen3.8-Flash-Next (Nov 5, baseline)
+
+`turboderp/Qwen3.8-Flash-Next-exl3`, revision `1.66bpw_h4_ng3` (`models/Qwen3.8-Flash-Next-exl3-1.66bpw`, 46.8 GiB on disk:
+28.1 GiB weights in 4 shards + 18.5 GiB n-gram embedding table). `Qwen4Exp`: 125B params / 6B active, 48 layers (36 gated delta
+net + 12 Qwen Sparse Attention), 512 experts (10 routed + 1 shared, intermediate 640), gated residual (hc_count 4), n-gram embedding
+(streamed from disk by default, `-ngr` loads it in RAM), MTP head. The weights do not fit the 19 GiB of the two GPUs, so routed
+experts of the first N layers run on the CPU (`-mcl N`, 31 GB RAM machine).
+
+- Blocker fixed: the QSA indexer kernel (`_dsa_indexer_fewq_kernel`) needs 64 KB of shared memory, the P100 has 48 KB, and
+  `autosplit_prepare` did not catch `BCKernelTooLarge` (the runtime path does and falls back to the eager attention). Commit c2993f8d.
+- `-mcl 16`: "Insufficient VRAM in split for model and cache"; `-mcl 30` loads and answers correctly.
+- Baseline, `-gs 4.0,15.0 -cs 8192 -cq 4 -mcl 24`, `bench_chat.py` code prompt, 300 new tokens, greedy: **17.77 t/s** without MTP;
+  **23.43 t/s** with `-mtp -ndt 1 -dds` (96.1% accepted). Load plus 300 tokens takes under 3 minutes.
+- Not yet known: where the decode time goes (CPU expert worker vs GPU), the smallest `-mcl` that fits, `-mcs` (tail split) vs `-mcl`,
+  cost of the n-gram table, prefill speed, behaviour of the eager QSA path on sm_60 at long context.
+
 ## Target (set Nov 3 by the user)
 
 **100 t/s** with MTP (`-mtp -ndt 1 -dds`, `-gs 4.0,15.0 -cq 4`) on Qwen3.6-35B-A3B and on Ornith-1.5-35B-A3B, measured with
