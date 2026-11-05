@@ -99,6 +99,21 @@ void gr_mix
     int64_t variant = -1
 );
 
+bool gr_mix_q8
+(
+    const at::Tensor& streams,
+    const c10::optional<at::Tensor>& wstreams,
+    const at::Tensor& fn8,
+    const at::Tensor& fn_s,
+    const at::Tensor& upt8,
+    const at::Tensor& up_s,
+    const at::Tensor& w,
+    double rms_eps,
+    at::Tensor dots,
+    c10::optional<at::Tensor> post,
+    at::Tensor mixed
+);
+
 // Tiled deterministic GatedResidual mix for prefill row counts (hc_mix_tiled.cu)
 
 int gr_mix_tiled_slices(int R, int D, int Mpad);

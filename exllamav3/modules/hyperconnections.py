@@ -20,6 +20,11 @@ _gr_mix_tiled_enable = os.environ.get("EXL3_GR_MIX_TILED", "1") != "0"
 # dots block from shared memory, bit-identical), 0 = the older gr_*_kernel2 pair, unset = 1 on cc < 8 only
 _gr_mix3 = int(os.environ.get("EXL3_GR_MIX3", "-1"))
 
+# Decode row counts R <= 4 on cc < 8 (D 2560 / rank 320): 1 = the gr_*_kernel3 pair on 8-bit copies of the
+# projection and up tables (per-row absmax int8 + fp32 scale, ext.gr_mix_q8; half the table bytes, not
+# bit-identical). The repacked fp16 up table is then dropped (same VRAM), so 5 <= R <= 8 take the cuBLAS path
+_gr_q8 = os.environ.get("EXL3_GR_Q8", "0") != "0"
+
 # Decode row counts: launch-count folds for the mHC sites (hc_mix_fused, hc_fuse.cuh). apply_ defers its
 # residual update into the next site's mix, and the RMSNorm a block runs after a mix executes inside its
 # finalize. Bit-identical to the unfused launches; EXL3_HC_FOLD selects (per-backend default in util/backend.py)
@@ -412,6 +417,7 @@ class GatedResidual(Module):
         self.rank = 0
         self.tiled = False          # prefill mixes take the tiled deterministic kernel
         self.next_site = None       # GatedResidual whose mix follows this site's apply_ (link_sites)
+        self.q8 = None              # (fn8, fn_s, upt8, up_s) with EXL3_GR_Q8, else None
 
     @override
     def load(self, device: torch.device, keep_source_weights: bool = False, **kwargs):
@@ -464,14 +470,35 @@ class GatedResidual(Module):
         # up repacked (H, D/4, rank, 4) so the fused kernel's rank loop reads lane-contiguous
         self.upx_h = self.up_h.view(H, Dh // 4, 4, self.rank) \
             .permute(0, 1, 3, 2).contiguous()
+        self.q8 = None
+        if _gr_q8 and not self.tiled and dev.type == "cuda" and H == 4 and Dh == 2560 and self.rank == 320 \
+                and torch.cuda.get_device_capability(dev)[0] < 8:
+            self.q8 = self._quant_q8()
+            self.upx_h = None
         if self.tiled and not keep_source_weights:
             # Every inference consumer reads proj_h directly or the repacked up (the tiled path
             # derives its int8 tables per call, _tiled_tables): release the checkpoint-layout up
             self.up_h = None
 
+    def _quant_q8(self):
+        """int8 copies of proj_h[:proj_m] (scale per row and stream, (M, H)) and of the repacked up table (scale
+        per up row, (H * D)): symmetric absmax / 127, round to nearest"""
+        H, Dh = self.hc_mult, self.hidden_size
+        fn = self.proj_h[: self.proj_m].float().view(self.proj_m, H, Dh)
+        fn_s = (fn.abs().amax(-1) / 127.0).clamp_min(1e-30)
+        fn8 = torch.round(fn / fn_s.unsqueeze(-1)).clamp_(-127, 127).to(torch.int8).view(self.proj_m, H * Dh)
+        del fn
+        up = self.up_h.float()                                  # (H * D, rank)
+        up_s = (up.abs().amax(-1) / 127.0).clamp_min(1e-30)
+        up8 = torch.round(up / up_s.unsqueeze(-1)).clamp_(-127, 127).to(torch.int8)
+        del up
+        upt8 = up8.view(H, Dh // 4, 4, self.rank).permute(0, 1, 3, 2).contiguous()
+        return fn8.contiguous(), fn_s.contiguous(), upt8, up_s.contiguous()
+
     @override
     def unload(self):
         super().unload()
+        self.q8 = None
         self.norm_w_raw = self.norm_w = self.w_h = None
         self.down_h = self.up_h = self.upx_h = self.inject_h = self.proj_h = None
 
@@ -586,7 +613,7 @@ class GatedResidual(Module):
         dev = s3.device
         xw = self._weighted_copy(s3, params)
 
-        if R <= self.FUSED_MAX_R:
+        if R <= self.FUSED_MAX_R and (self.q8 is None or R <= 4):
             # Decode/MTP-class row counts (the fused path's whole domain) take bucketed
             # workspaces from the per-device static cache, shared by every GatedResidual site
             # on the device: a site's outputs are consumed (block input, apply_) before the
@@ -601,7 +628,12 @@ class GatedResidual(Module):
             dots = ws(R * M * H, torch.float, "gr_mix_dots").view(R, M, H)
             post = ws(R * H, torch.float, "gr_mix_post").view(R, H) if self.use_combine else None
             mixed = ws(R * Dh, torch.half, "gr_mix_mixed").view(R, Dh)
-            ext.gr_mix(s3, xw, self.proj_h[: self.proj_m], self.upx_h, self.w_h, self.rms_eps, dots, post, mixed, _gr_mix3)
+            if self.q8 is not None:
+                fn8, fn_s, upt8, up_s = self.q8
+                assert ext.gr_mix_q8(s3, xw, fn8, fn_s, upt8, up_s, self.w_h, self.rms_eps, dots, post, mixed), \
+                    "gr_mix_q8: shape not covered"
+            else:
+                ext.gr_mix(s3, xw, self.proj_h[: self.proj_m], self.upx_h, self.w_h, self.rms_eps, dots, post, mixed, _gr_mix3)
         elif self.tiled:
             # Prefill-shaped workspaces are per-call (pow2-rounded so the caching allocator
             # reuses segments across chunk sizes), never statics

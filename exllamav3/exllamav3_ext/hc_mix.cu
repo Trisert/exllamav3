@@ -1419,3 +1419,57 @@ void gr_mix
     #undef ARGS
     cuda_check(cudaPeekAtLastError());
 }
+
+// gr_mix with 8-bit tables (EXL3_GR_Q8): the gr_*_kernel3 pair on int8 fn / upt with fp32 scales per fn (row,
+// stream) and per up row. Shape coverage as gr_mix3_launch (R <= 4, D 2560, LR 320); false when not covered
+bool gr_mix_q8
+(
+    const at::Tensor& streams,           // (R, H, D) float
+    const c10::optional<at::Tensor>& wstreams,
+    const at::Tensor& fn8,               // (M, H * D) int8
+    const at::Tensor& fn_s,              // (M, H) float
+    const at::Tensor& upt8,              // (H, D / 4, LR, 4) int8
+    const at::Tensor& up_s,              // (H * D) float
+    const at::Tensor& w,                 // (H * D) half
+    double rms_eps,
+    at::Tensor dots,
+    c10::optional<at::Tensor> post,
+    at::Tensor mixed
+)
+{
+#if defined(USE_ROCM)
+    return false;
+#else
+    const at::cuda::OptionalCUDAGuard device_guard(streams.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK_DTYPE(streams, kFloat);
+    TORCH_CHECK_DTYPE(fn8, kChar);
+    TORCH_CHECK_DTYPE(upt8, kChar);
+    TORCH_CHECK_DTYPE(fn_s, kFloat);
+    TORCH_CHECK_DTYPE(up_s, kFloat);
+    TORCH_CHECK_DTYPE(w, kHalf);
+    TORCH_CHECK_DTYPE(dots, kFloat);
+    TORCH_CHECK(streams.is_contiguous() && fn8.is_contiguous() && upt8.is_contiguous() && fn_s.is_contiguous() &&
+                up_s.is_contiguous() && w.is_contiguous() && dots.is_contiguous(), "gr_mix_q8: contiguous inputs required");
+    int R = streams.size(0), H = streams.size(1), D = streams.size(2), M = fn8.size(0);
+    TORCH_CHECK(H == 4 && upt8.dim() == 4 && upt8.size(0) == H && upt8.size(1) == D / 4 && upt8.size(3) == 4, "gr_mix_q8: dims");
+    int LR = upt8.size(2);
+    TORCH_CHECK(M == LR + (post ? H : 0) && fn8.size(1) == H * D && fn_s.numel() == M * H && up_s.numel() == H * D, "gr_mix_q8: dims");
+    TORCH_CHECK(dots.size(0) == R && dots.size(1) == M + 1 && dots.size(2) == H, "gr_mix_q8: dots shape");
+    const float* ws_p = nullptr;
+    if (wstreams)
+    {
+        TORCH_CHECK(wstreams.value().is_contiguous() && wstreams.value().sizes() == streams.sizes(), "gr_mix_q8: wstreams shape");
+        ws_p = (const float*) wstreams.value().data_ptr();
+    }
+    if (!R) return true;
+    if (((uintptr_t) dots.data_ptr()) % 16) return false;
+    bool ok = gr_mix3_launch((const float*) streams.data_ptr(), ws_p, nullptr, (const half*) w.data_ptr(), nullptr,
+                             (float*) dots.data_ptr(), post ? (float*) post.value().data_ptr() : nullptr, mixed.data_ptr(),
+                             mixed.dtype() == at::kHalf, M, D, LR, R, (float) rms_eps, stream, 3,
+                             (const int8_t*) fn8.data_ptr(), (const float*) fn_s.data_ptr(),
+                             (const int8_t*) upt8.data_ptr(), (const float*) up_s.data_ptr());
+    if (ok) cuda_check(cudaPeekAtLastError());
+    return ok;
+#endif
+}
