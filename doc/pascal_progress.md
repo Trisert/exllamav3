@@ -281,6 +281,19 @@ step above the unprofiled one, mostly host-side). ms per step, real kernels only
   restore, runs differ in text and acceptance from load to load (profiles are rewritten at unload), so A/B across loads
   must restore them.
 
+### Qwen3.8-Flash-Next: 8-bit gated-residual tables (Nov 5, re-ranked #3, ruled out)
+
+Branch `flash-gr-q8` (not merged): `EXL3_GR_Q8=1` runs `gr_*_kernel3` on int8 fn / up tables (absmax per row and stream / per
+up row, fp32 scales), same VRAM (the fp16 repacked up table is dropped, R 5..8 go to cuBLAS); plus a one-wave dots grid with
+a next-row prefetch (bit-identical, kept on that branch only).
+- Microbenchmark per site, P100, R = 1 / 4: fp16 35.5 / 56 us, q8 25.8 / 44 us. At R = 4 (the ndt 3 verify) both
+  kernels are latency-bound, not byte-bound: dots stages 40 KB of streams (one 8-warp block per SM; 16-warp blocks were
+  slower), finalize uses 168 registers (128 with int8). 
+- Accuracy (one load, 4-token decode chunks, 302 positions): KL(fp16 || q8) mean 7.5e-4, max 0.029, top-1 agreement
+  99.34%; greedy text diverges at ~token 240 of 300 on a near-tie.
+- `bench_chat` best config, 8 loads ABAB + BABA, profiles restored: fp16 42.48 / 38.52 / 39.80 / 41.54, q8 43.73 / 42.28 /
+  37.63 / 39.39 t/s, means 40.59 vs 40.76: **no gain** inside the ~5% load-to-load spread. Not worth the changed text.
+
 ## Target (set Nov 3 by the user)
 
 **100 t/s** with MTP (`-mtp -ndt 1 -dds`, `-gs 4.0,15.0 -cq 4`) on Qwen3.6-35B-A3B and on Ornith-1.5-35B-A3B, measured with
