@@ -95,7 +95,8 @@ if __name__ == "__main__":
     parser.add_argument("-mode", "--mode", type = str, default = "qwen35")
     parser.add_argument("-prompts", "--prompts", nargs = "+",
                         default = ["Implement a quicksort in go", "Implement quicksort in rust"])
-    parser.add_argument("-max_new", "--max_new", type = int, default = 1000)
+    parser.add_argument("-max_new", "--max_new", type = int, default = 1000,
+                        help = "Max new tokens per turn; chat.py runs to EOS, so compare its acceptance with a value that does too (a short cap measures only the code part of a reply, which drafts better)")
     parser.add_argument("-smi_index", "--smi_index", type = int, default = 0, help = "nvidia-smi index of the P100")
     parser.add_argument("-tag", "--tag", type = str, default = "run")
     parser.add_argument("-save_text", "--save_text", type = str, default = None,

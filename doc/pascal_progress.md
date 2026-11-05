@@ -418,6 +418,17 @@ MTP settings (35B, two prompts, 160 W): `-ndt 1` is the safe choice (57.3 t/s); 
 - (Nov 3) Deferring the `-dds` draft-confidence readback (`EXL3_MTP_DEFER_CONF`): within noise, because the drafted ids must
   reach the host anyway before verification (CPU embedding table).
 - (Nov 3) All layers on the P100 and an expert split across the two GPUs (see Stage 0).
+- (Nov 5) "chat.py drafts worse than bench_chat.py" on Qwen3.8-Flash-Next (`-mtp -ndt 3 -sdh 16384`, quicksort in go):
+  a length confound, not a bug in the chat path. bench_chat `-max_new 300` measures only the code part of the reply;
+  chat.py runs to EOS (`-maxr` capped to 4096 by `-cs 8192`, ~900 tokens) and the prose tail drafts worse. Profiles
+  (`expert_stats`, `token_stats`) restored before every run, matched lengths:
+  300 tokens: bench 214/258 (82.9%) 40.4 t/s, chat.py `-prompt` 213/261 (81.6%) 40.2 / 35.3 t/s, chat.py interactive
+  in a pty (Rich streaming, token healing off, `stop_on_loop`) 214/258 (82.95%) 37.2 t/s;
+  to EOS: bench 626/846 (74.0%) 34.3 t/s, chat.py `-prompt` 589/774 (76.1%) 35.6 t/s, interactive 625/861 (72.6%)
+  31.6 t/s. Job options and the generator setup of chat.py do not change acceptance; text diverges after ~35 lines
+  between runs (verification batch width, CPU MoE), so +-3 points is noise. The interactive path is ~3 t/s slower at
+  the same acceptance: Rich Markdown re-rendering on the host thread (open: lower `-ups` or `-basic` to check).
+  Compare with `bench_chat.py -max_new 4096` (runs to EOS) against chat.py.
 
 - Two-XMAD product for mul1 (ptxas rebuilds the 32-bit multiply from every PTX form tried), higher GEMV occupancy (the
   P100 GEMV is issue-bound, not memory-bound), cuBLAS `COMPUTE_16F`, fused-MoE row limits of 32 / 64, 32-row MoE tiles.
