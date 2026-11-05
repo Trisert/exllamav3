@@ -111,7 +111,9 @@ static void* exl3_gemv_select_kernel(int bits, int cb, bool c_fp32, int mmode, i
         SEL(bits_, cb_, true,  0, 0, sm_) SEL(bits_, cb_, true,  0, 1, sm_) \
         SEL(bits_, cb_, true,  1, 0, sm_) SEL(bits_, cb_, true,  1, 1, sm_) \
         SEL(bits_, cb_, false, 2, 0, sm_) SEL(bits_, cb_, false, 2, 1, sm_) \
-        SEL(bits_, cb_, true,  2, 0, sm_) SEL(bits_, cb_, true,  2, 1, sm_)
+        SEL(bits_, cb_, true,  2, 0, sm_) SEL(bits_, cb_, true,  2, 1, sm_) \
+        SEL(bits_, cb_, false, 4, 0, sm_) SEL(bits_, cb_, false, 4, 1, sm_) \
+        SEL(bits_, cb_, true,  4, 0, sm_) SEL(bits_, cb_, true,  4, 1, sm_)
     SEL_GRID(4, 0, false) SEL_GRID(4, 1, false) SEL_GRID(4, 2, false)
     SEL_GRID(2, 1, false) SEL_GRID(2, 2, false) SEL_GRID(2, 1, true) SEL_GRID(2, 2, true)
     SEL_GRID(3, 1, false) SEL_GRID(3, 2, false) SEL_GRID(3, 1, true) SEL_GRID(3, 2, true)
@@ -158,9 +160,15 @@ bool exl3_gemv_try_launch
     if (mode == 0) return false;
     int cc = DevCtx::instance().get_cc(device);
     // if (cc != CC_AMPERE) return false;
-    // Pascal, m = 2 (an MTP verify step): direct dot products with two rows (MMODE 2). Four-row direct products
-    // (MMODE 3) measured slower than the MMA path at m = 3..4, so every other m > 1 keeps the MMA path (MMODE 1)
+    // Pascal, m = 2 (an MTP verify step): direct dot products with two rows (MMODE 2). m = 3..4: the emulated MMA's
+    // arithmetic with one output per lane (MMODE 4, bit-identical to MMODE 1; EXL3_GEMV_M34=0 restores MMODE 1).
+    // Every other m > 1 keeps the MMA path (MMODE 1)
     int mmode = size_m == 1 ? 0 : ((cc == CC_PASCAL && size_m == 2 && !half_k) ? 2 : 1);
+    if (mmode == 1 && cc == CC_PASCAL && size_m <= 4 && !half_k)
+    {
+        const char* env = std::getenv("EXL3_GEMV_M34");
+        if (!env || atoi(env) != 0) mmode = 4;
+    }
     int num_sms = DevCtx::instance().get_num_sms(device);
 
     // Cooperative launch: grids are capped at full co-residency (cached per kernel), and the

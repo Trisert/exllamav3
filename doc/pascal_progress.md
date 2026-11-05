@@ -264,6 +264,23 @@ step above the unprofiled one, mostly host-side). ms per step, real kernels only
 
 #2 + #3 + #4 (~8 ms) would give ~76 ms per step, ~48 t/s; 55 t/s (66.5 ms) also needs #1.
 
+### Qwen3.8-Flash-Next: P100 GEMV at m = 3..4 (Nov 5, re-ranked #2, done)
+
+- MMODE 4 (`exl3_gemv_kernel.cuh`, default on Pascal at m = 3..4, `EXL3_GEMV_M34=0` restores MMODE 1): the same arithmetic
+  as the emulated MMA of MMODE 1 (same HFMA2 chain, pair sum, fp16 run sum, fold cadence), with one output (column
+  lane / 4, row lane % 4) per lane and n8 fragment: 8 shuffles + 8 HFMA2 per fragment instead of 16 + 32 (MMODE 1 also
+  computed the 8 zero rows g + 8). **Bit-identical** (`tests/kernels/gemm/test_exl3_gemv_m34.py`, 15 cases).
+- Why MMODE 1 was slow: besides the wasted work, the wide config (n > 8192, 256 threads) uses 172 registers on sm_60
+  (one block, 8 warps per SM); MMODE 4 uses 128 (two blocks). Narrow: 128 -> 108. MMODE 3 (four-row direct, not
+  instantiated) measures 120 registers in the narrow config, so its earlier loss was not occupancy there.
+- Microbenchmark, P100, us, m = 4 old / new (m = 2 for reference): 5 bpw 2560 x 4096 71 / 63 (56); 4096 x 2560 67 / 57
+  (50); 2560 x 8192 103 / 94 (80); 2560 x 12288 185 / 109 (102); 4 bpw 2560 x 16384 187 / 121 (111). m = 3 alike.
+- `bench_chat` best config, 8 loads (ABAB + BABA, expert and token profiles restored before each load so all runs
+  draft the same; 216/252 accepted): old 38.54 / 41.01 / 40.81 / 38.31, new 44.06 / 39.89 / 43.00 / 42.49 t/s, means
+  **39.67 -> 42.36 (+6.8%)**, ~90 -> ~84 ms per step; generated text byte-identical in all 8. Without the profile
+  restore, runs differ in text and acceptance from load to load (profiles are rewritten at unload), so A/B across loads
+  must restore them.
+
 ## Target (set Nov 3 by the user)
 
 **100 t/s** with MTP (`-mtp -ndt 1 -dds`, `-gs 4.0,15.0 -cq 4`) on Qwen3.6-35B-A3B and on Ornith-1.5-35B-A3B, measured with

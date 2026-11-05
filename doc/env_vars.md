@@ -322,6 +322,12 @@ projections (gate/up, q/k/v, the GatedDeltaNet input projections) are unfused so
 2060's 16 layers: 26.8 -> 18.0 ms GPU time per token. `0` keeps the general heuristic (tile kernel
 for most of these shapes) and the fused MGEMM.
 
+### `EXL3_GEMV_M34` (default: `1`)
+
+Pascal (sm_60), m = 3..4 rows (MTP verify at `-ndt 2/3`): the GEMV takes MMODE 4, the emulated-MMA arithmetic
+with one output per lane, bit-identical to the MMA path and 10-40% faster. `0` restores the MMA path (MMODE 1).
+Read per call.
+
 ### `EXL3_GEMV_SMEM` (default: `-1`)
 
 Weight-extraction strategy inside the fp16 GEMV kernel: `-1` picks per bitrate (default), `0`
