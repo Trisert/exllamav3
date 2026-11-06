@@ -450,6 +450,64 @@ tables, QSA, the K = 5 GEMV work (this model is 4 bpw with a 6 bpw head; the 6 b
 K <= 4 gate does not matter). Harness pitfalls: `prof_m.py` overwrites `trace_m*.json` per run (the greedy traces above
 were overwritten by the card-hot ones; the tables come from the greedy analysis made before).
 
+### 27B prefill profile
+
+Nov 6, branch `prefill27-profile` (= `dense27-stage0`, same Nov 5 `.so` with MMODE 4, no code change). `-gs 4.0,15.0 -cs
+32768 -cq 4`, no MTP. Cold prompt (repo-source corpus) through the `Generator` (`max_chunk_size` 2048, as chat/Tabby), one
+token out, greedy. torch.profiler CUDA kernel time per kernel group, % of the GPU span (both cards, which run serially).
+Harness `tmp/p27/`: `pf27.py` (timed and profiled generator prefill), `pfchunk.py` (one 2048-token chunk on a P-token prefix
+with the generator's paged params; attention cost depends only on lengths, GDN not on P), `an27.py` / `comb27.py` (tables).
+
+**24k could not run end to end within the 5-minute rule**: the P100 reaches 79 C within ~40 s of prefill and then sits in
+thermal slowdown (405 MHz in 86 of 162 samples of the 24k attempt, which hit the 330 s timeout). The 24k column is built
+from 12 chunks: per-chunk non-attention cost (constant) plus attention fitted linearly in the prefix. "cool" uses the 2k/8k
+generator traces (P100 65-78 C, ~1190-1300 MHz); "hot" uses chunks measured at P = 0, 0, 12288, 22528, 22528 with the P100
+at 78-79 C (every P100 kernel 2.3-2.6x slower than cool, the 2060 unchanged). Hot is the sustained state for long agent
+prompts on this box.
+
+| kernel group | 2k | 8k | 24k cool (est.) | 24k hot (meas. chunks) |
+| :--- | ---: | ---: | ---: | ---: |
+| GEMM hfma2 (P100, `hfma2::gemm_kernel<*, 64>`) | 72.2% | 72.5% | 63.2% | 76.7% |
+| GEMM cuBLAS (2060, tensor cores) | 10.7% | 9.8% | 9.4% | 4.6% |
+| GEMM reconstruct (`reconstruct(_had)_kernel`, both) | 6.3% | 5.0% | 5.5% | 3.9% |
+| attention core (fa60 P100 / fa75 2060) | 1.2% | 4.5% | 13.5% | 9.1% |
+| GDN h (`..._fwd_kernel_h_blockdim64`) | 2.2% | 2.1% | 1.9% | 1.6% |
+| GDN o (`chunk_fwd_kernel_o`) | 2.2% | 2.1% | 1.9% | 1.7% |
+| GDN kkt_solve / recompute_w_u / conv / gates+norm | 0.9 / 0.4 / 0.3 / 0.2% | 0.8 / 0.4 / 0.3 / 0.1% | 0.8 / 0.4 / 0.2 / 0.2% | 0.6 / 0.3 / 0.2 / 0.1% |
+| GDN l2norm / cumsum | < 0.05% | < 0.05% | < 0.05% | < 0.05% |
+| RMSNorm / act_mul / hadamard / rope | 0.4 / 0.3 / 0.3 / 0.1% | 0.3 / 0.3 / 0.1 / 0.1% | 0.3 / 0.3 / 0.3 / 0.1% | 0.2 / 0.3 / 0.0 / 0.1% |
+| GEMV, other elementwise, memcpy | 1.5% | 1.0% | 1.3% | 0.4% |
+| no GPU busy (gaps between kernels, host) | 0.7% | 0.5% | 0.6% | 0.2% |
+| **all GEMM** | **89.3%** | **87.4%** | **78.1%** | **85.1%** |
+| **GDN total / GDN h+o** | 6.2 / 4.4% | 5.9 / 4.3% | 5.4 / 3.8% | 4.6 / 3.4% |
+| **GDN + attention** | 7.3% | 10.4% | 18.9% | 13.7% |
+
+Prefill speed (unprofiled, `time_prefill`): **2k 228.4 t/s** (P100 65 -> 67 C), **8k 221.3 t/s** (68 -> 75 C);
+profiled 225.6 / 197.1 (8k profiled ran hotter, 75 -> 78 C). **24k: ~196 t/s cool (est., 125 s), ~88 t/s hot** (279 s,
+from the chunks; consistent with the 24k attempt not finishing in ~250 s of prefill). Single hot chunks: 94-98 t/s at P = 0,
+92 at P = 12288, 89 at P = 22528. 64k not measured (cool ~11 min end to end, beyond the run limit).
+
+Findings:
+- **Prefill is GEMM-bound on the P100.** At 2k cool the P100 is busy 7.65 s, the 2060 1.44 s (47 vs 17 layers: 163 vs
+  84 ms per layer per 2048 tokens). The hfma2 GEMM does ~73 TFLOP of P100 linears in 6.6 s = **~11 TFLOPs, ~64% of the
+  fp16 HFMA2 peak** (~17.2 TFLOPs at 1.2 GHz), consistent with the 50% HFMA2 instruction share in its SASS. `pick_tile`
+  only ever selects the 64-row tile (`MIN_BLOCKS_64` gate, else cuBLAS); the 128-row variant is not used on this path.
+- **GDN is small**: all FLA Triton kernels together 4.6-6.2% at every length, h + o 3.4-4.4%, below the 8% gate for
+  Triton launch tuning, so the register-spill fix (step 2) was not attempted: removing the spills completely would save at
+  most ~2-3% of prefill. kkt/recompute/conv/l2norm/cumsum are < 1% each.
+- **Attention grows to 9-14% at 24k** (fa60 on the P100, per 2048-token chunk: 96 ms at P = 0 + ~107 ms per 1000 prefix tokens cool; hot fit, both cards, 279 ms +
+  163 ms per 1000 prefix tokens per chunk). GDN + attention at 24k is 13.7% hot / 18.9% cool: at or under the 15% stop
+  line, so this round stopped after the profile.
+- Gaps between kernels are < 1% (host overhead is not a factor in prefill); reconstruct (weight dequant before every
+  GEMM, per 2048-token chunk) is 4-6%.
+- **Heat dominates long prompts**: the same work runs 2.2x slower once the P100 is at 79 C (24k 196 -> 88 t/s).
+
+Next steps (estimates, not measured): (1) P100 cooling / airflow is worth more than any kernel at >= 8k (up to 2.2x);
+(2) hfma2 GEMM efficiency: 64% -> ~80% of the HFMA2 peak would be ~-15-20% prefill time (the 72-77% group): raise the
+HFMA2 share of the inner loop (larger per-thread tile / fewer LDS per HFMA2, 128-row tile for M >= 2048), check the fp16
+partial / fp32 add overhead; (3) fewer reconstructs: a 4096 chunk halves reconstruct (~-2-3%), costs scratch memory;
+(4) fa60 at long prefix (9-14% at 24k); (5) GDN Triton tuning last (<= 3%).
+
 ## Target (set Nov 3 by the user)
 
 **100 t/s** with MTP (`-mtp -ndt 1 -dds`, `-gs 4.0,15.0 -cq 4`) on Qwen3.6-35B-A3B and on Ornith-1.5-35B-A3B, measured with
