@@ -48,7 +48,9 @@ def _check_command(fn, args):
         )
 
 cleanupper = Cleanupper()
-DISPATCH_TIMEOUT = 20
+# Seconds to wait for a TP worker call (EXL3_TP_TIMEOUT). 20 s was too short for a long-context warmup or a first
+# prefill chunk on a thermally throttled sm_60 card (P100 at 79 C / 400-700 MHz): "Timed out waiting for worker"
+DISPATCH_TIMEOUT = float(os.environ.get("EXL3_TP_TIMEOUT", "120"))
 
 class Model_TPMixin:
 
