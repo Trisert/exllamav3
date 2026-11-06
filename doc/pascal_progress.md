@@ -583,23 +583,52 @@ What was tried, in the task's order (each ABAB vs v0, gate/up + down + o at M = 
   shared stage (12 KB, a second barrier per tile, global loads still prefetched into registers) +
   `__launch_bounds__(128, 3)`: ~ +1-2% over v1.
 - **(c) address / loop overhead (v3/v4)**: K loop unrolled by two tiles, pointer-increment global loads: in-loop
-  non-HFMA2 ALU ops per tile ~82 -> ~40. v4 (= v2 + this) is the new kernel. +1-2% over v2.
-- **(d) double buffering**: was already there (two shared stages + register prefetch, one barrier per tile); the new
-  kernel goes back to one stage to fit three blocks per SM, which measured slightly better.
+  non-HFMA2 ALU ops per tile ~82 -> ~40. v4 (= v2 + this) is the new kernel's default (`STAGES = 1`). +1-2% over v2.
+- **(d) double buffering**: was already there (two shared stages + register prefetch, one barrier per tile). The new
+  kernel keeps both forms as a template: one stage / 3 blocks per SM by default, two stages / 2 blocks per SM (= v3)
+  when the grid fills its last wave clearly better at 112 resident blocks than at 168 (`pick_stages`: fill ratio >
+  1.3). Without it v4 lost on the 320-row tail chunk of the 27B down projection (200 blocks = 1.19 waves: 0.89x of the
+  old kernel; v3 1.10x).
 - **Grouped raster** (GROUP_M = 8 / 16, B stripes shared across row stripes in L2, as the f16acc kernel): no gain
   (-1 to +1%). Not kept.
 - **(e) instruction mix** (`cuobjdump -sass -arch sm_60` of the built `.so`, `loopmix.py`; fp16-out 64-row kernel):
 
 | | whole function | main loop | loop ALU ops besides HFMA2 per 1024 HFMA2 |
 | :--- | ---: | ---: | ---: |
-| old | 2022 instr, **HFMA2 50.6%** | 1387, 73.8% (LDS 128, HADD2.F32 64, FADD 64, XMAD 29, STS 20, ...) | ~209 |
-| new | 4368 instr, **HFMA2 70.3%** | 2567 per 2 tiles, 80.0% (LDS 128, HADD2.F32 128, FADD 128, ...) | ~165 |
+| old (JIT build, same flags as the extension) | 2022 instr, **HFMA2 50.6%** | 1387, 73.8% (LDS 128, HADD2.F32 64, FADD 64, XMAD 29, STS 20, ...) | ~209 |
+| new (extension `.so`, `STAGES = 1`) | 4368 instr, **HFMA2 70.3%** | 2567 per 2 tiles, 80.0% (LDS 128, HADD2.F32 128, FADD 128, ...) | ~165 |
 
   The whole-function share is mostly prologue / epilogue that runs once (the 2x unroll alone moves it past 65%); the
   loop share is what counts. LDS / STS / LDG go to the load-store unit; what competes with HFMA2 for issue is the
   32-term flush (HADD2.F32 + FADD per output element per 32 k: 128 per 1024 HFMA2, fixed by the contract) plus ~40
   integer ops: issue ceiling ~86% of calib, the new kernel reaches 79-82% on the large shapes. The rest of the headroom
   needs a shorter flush, i.e. a different numerical contract (KSLICE > 32), which was out of scope.
+
+Smaller grids and the `pick_tile` reference shapes (B x M x K x N; same method, card at 74-77 C / ~1300 MHz;
+`ext` = the built extension with `pick_stages`), ratio vs the old kernel:
+
+| shape | old | ext (stages) | v3 (2 st.) | v4 (1 st.) |
+| :--- | ---: | ---: | ---: | ---: |
+| 1 x 64 x 5120 x 17408 | 46.7% | 62.5% x1.35 (1) | x1.13 | x1.34 |
+| 1 x 320 x 5120 x 17408 | 68.7% | 71.9% x1.04 (1) | x1.06 | x1.05 |
+| 1 x 64 x 17408 x 5120 | 26.9% | 29.2% x1.09 (2) | x1.09 | x1.08 |
+| 1 x 192 x 17408 x 5120 | 40.7% | 58.0% x1.43 (1) | x1.21 | x1.42 |
+| 1 x 320 x 17408 x 5120 | 65.6% | 72.3% x1.10 (2) | x1.10 | x0.89 |
+| 1 x 832 x 5120 x 1024 | 66.9% | 71.8% x1.07 (2) | x1.07 | x1.05 |
+| 1 x 2048 x 512 x 2048 | 64.5% | 68.4% x1.06 (1) | x1.04 | x1.06 |
+| 1 x 645 x 2048 x 4096 | 57.4% | 57.6% x1.00 (1) | x1.06 | x1.01 |
+| 8 x 150 x 512 x 2048 (batched) | 47.3% | 51.0% x1.08 (1) | x1.05 | x1.07 |
+| 1 x 2048 x 5120 x 17408 | 75.0% | 80.8% x1.06 (1) | x1.05 | x1.07 |
+| 1 x 4096 x 5120 x 1024 | 68.7% | 69.3% x1.01 (1) | x1.06 | x1.02 |
+
+The new kernel is never slower than the old one; v3 would be 4-5% better on two 512/352-block grids where the fill
+rule keeps one stage (2048 x 512 x 2048, also 512 blocks, prefers one stage), left as is.
+
+**Sustained hot throughput** (`hot.py`: gate/up M = 2048, back-to-back launches, ABAB blocks, wall clock): the card
+power-caps at ~150-157 W at ~1050-1140 MHz, then thermal-throttles at 79 C. Cool / power-capped, 20 s blocks: old 11.53,
+new 12.22, old 11.08, new 11.70 TFLOP/s (+6%, both at ~150 W and similar clocks). In the 79 C steady state, 11 s blocks
+(blocks 2-11 of the second run): old 4.41 / 3.91 / 3.70 / 3.57 / 3.67, new 4.70 / 4.05 / 4.20 / 4.08 / 4.16 TFLOP/s:
+**new ahead in every pair, +11% on the mean** (the new kernel does not throttle harder; the per-clock gain survives).
 
 Correctness: every variant is **bit-identical** to the old kernel on all 7 shapes at M = 2048 (fp16 and fp32
 outputs, both tiles; `bench.py --check`), rel RMS vs fp32 `torch.matmul` 8.4-8.7e-4 (same as before, limit 1e-3).
@@ -613,12 +642,13 @@ two prefills per 3-minute run, and the P100 sat at 79 C in thermal slowdown for 
 loads the model once and routes `ext.hgemm_recon` (P100, covered shapes) to v0 or v4 per prompt. Runs: A1 (old `.so`,
 separate process) 219 / 202 / 168 t/s as it heated; in-process pair A then B: 192.4 (old, 1189 MHz) then 167.2 t/s
 (new, second and hotter, 1189 -> 974 MHz); four new-kernel runs (two separate-process with the new `.so`, two
-in-process B-first) started at 79 C / 405-1037 MHz and ran 95-105 t/s, timing out before a second prompt. These numbers track the clock, not the kernel. Expected from the microbenchmark: GEMM
+in-process B-first) started at 79 C / 405-1037 MHz and ran 95-105 t/s, timing out before a second prompt. These
+numbers track the clock, not the kernel (the hot ABAB above shows the kernel itself ahead at the same thermal state). Expected from the microbenchmark: GEMM
 hfma2 is ~72% of prefill, so +8% on it is ~ -5% prefill time (228 -> ~240 t/s cool at 2k). To measure: a cool card,
 `pf27ab.py -pairs 1 -start 0` and `-start 1` alternately.
 
-Recommendation: keep the new kernel (no numerical change, faster on every 27B shape and on both tiles, the 64-row tile
-remains the right pick). Further GEMM gains on the P100 need a contract change (longer fp16 partials, e.g. 64 terms:
+Recommendation: keep the new kernel (no numerical change, faster on every 27B shape, on the small / batched reference
+grids and on both tiles, also hot; the 64-row tile remains the right pick). Further GEMM gains on the P100 need a contract change (longer fp16 partials, e.g. 64 terms:
 halves the flush, ceiling ~91%) or better cooling, which is worth far more at >= 8k (2.2x).
 
 ## Target (set Nov 3 by the user)

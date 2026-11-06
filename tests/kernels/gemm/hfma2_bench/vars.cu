@@ -19,31 +19,34 @@ using ::BN; using ::BK;
 #include "v3_kernel.inc"
 
 template <int BM, bool F32>
-static void launch_one(int v, dim3 grid, cudaStream_t s, const half* a, const half* b, void* c, int M, int N, int K, int ldc)
+static void launch_one(int v, dim3 grid, cudaStream_t s, const half* a, const half* b, void* c, int M, int N, int K, int ldc, int64_t sa, int64_t sb, int64_t sc)
 {
-    if (v == 0) base::gemm_kernel<F32, BM><<<grid, BM * 2, 0, s>>>(a, b, c, M, N, K, ldc, 0, 0, 0);
-    else if (v == 1) gemm_kernel_v1<F32, BM><<<grid, BM * 2, 0, s>>>(a, b, c, M, N, K, ldc, 0, 0, 0);
-    else if (v == 2) gemm_kernel_v1<F32, BM, 1, 3 * 64 / BM><<<grid, BM * 2, 0, s>>>(a, b, c, M, N, K, ldc, 0, 0, 0);
-    else if (v == 3) gemm_kernel_v3<F32, BM><<<grid, BM * 2, 0, s>>>(a, b, c, M, N, K, ldc, 0, 0, 0);
-    else if (v == 4) gemm_kernel_v3<F32, BM, 1, 3 * 64 / BM><<<grid, BM * 2, 0, s>>>(a, b, c, M, N, K, ldc, 0, 0, 0);
-    else if (v == 5) gemm_kernel_v3<F32, BM, 1, 3 * 64 / BM, 8><<<grid, BM * 2, 0, s>>>(a, b, c, M, N, K, ldc, 0, 0, 0);
-    else if (v == 6) gemm_kernel_v3<F32, BM, 1, 3 * 64 / BM, 16><<<grid, BM * 2, 0, s>>>(a, b, c, M, N, K, ldc, 0, 0, 0);
-    else if (v == 7) gemm_kernel_v3<F32, BM, 2, 128 / BM, 8><<<grid, BM * 2, 0, s>>>(a, b, c, M, N, K, ldc, 0, 0, 0);
+    if (v == 0) base::gemm_kernel<F32, BM><<<grid, BM * 2, 0, s>>>(a, b, c, M, N, K, ldc, sa, sb, sc);
+    else if (v == 1) gemm_kernel_v1<F32, BM><<<grid, BM * 2, 0, s>>>(a, b, c, M, N, K, ldc, sa, sb, sc);
+    else if (v == 2) gemm_kernel_v1<F32, BM, 1, 3 * 64 / BM><<<grid, BM * 2, 0, s>>>(a, b, c, M, N, K, ldc, sa, sb, sc);
+    else if (v == 3) gemm_kernel_v3<F32, BM><<<grid, BM * 2, 0, s>>>(a, b, c, M, N, K, ldc, sa, sb, sc);
+    else if (v == 4) gemm_kernel_v3<F32, BM, 1, 3 * 64 / BM><<<grid, BM * 2, 0, s>>>(a, b, c, M, N, K, ldc, sa, sb, sc);
+    else if (v == 5) gemm_kernel_v3<F32, BM, 1, 3 * 64 / BM, 8><<<grid, BM * 2, 0, s>>>(a, b, c, M, N, K, ldc, sa, sb, sc);
+    else if (v == 6) gemm_kernel_v3<F32, BM, 1, 3 * 64 / BM, 16><<<grid, BM * 2, 0, s>>>(a, b, c, M, N, K, ldc, sa, sb, sc);
+    else if (v == 7) gemm_kernel_v3<F32, BM, 2, 128 / BM, 8><<<grid, BM * 2, 0, s>>>(a, b, c, M, N, K, ldc, sa, sb, sc);
     else TORCH_CHECK(false, "variant");
 }
 
 void run(int64_t v, at::Tensor a, at::Tensor b, at::Tensor c, int64_t bm)
 {
     const c10::cuda::OptionalCUDAGuard guard(a.device());
-    const int M = a.size(0), K = a.size(1), N = b.size(1);
+    const bool batched = a.dim() == 3;
+    const int batch = batched ? a.size(0) : 1;
+    const int M = a.size(-2), K = a.size(-1), N = b.size(-1);
     TORCH_CHECK(K % BK == 0 && N % BN == 0 && a.is_contiguous() && b.is_contiguous() && c.is_contiguous());
+    const int64_t sa = batched ? a.stride(0) : 0, sb = batched ? b.stride(0) : 0, sc = batched ? c.stride(0) : 0;
     cudaStream_t s = at::cuda::getCurrentCUDAStream().stream();
     const half* ap = (const half*) a.data_ptr();
     const half* bp = (const half*) b.data_ptr();
     const bool f32 = c.dtype() == at::kFloat;
-    dim3 grid(N / BN, (M + bm - 1) / bm, 1);
-    if (bm == 64) { if (f32) launch_one<64, true>(v, grid, s, ap, bp, c.data_ptr(), M, N, K, N); else launch_one<64, false>(v, grid, s, ap, bp, c.data_ptr(), M, N, K, N); }
-    else { if (f32) launch_one<128, true>(v, grid, s, ap, bp, c.data_ptr(), M, N, K, N); else launch_one<128, false>(v, grid, s, ap, bp, c.data_ptr(), M, N, K, N); }
+    dim3 grid(N / BN, (M + bm - 1) / bm, batch);
+    if (bm == 64) { if (f32) launch_one<64, true>(v, grid, s, ap, bp, c.data_ptr(), M, N, K, N, sa, sb, sc); else launch_one<64, false>(v, grid, s, ap, bp, c.data_ptr(), M, N, K, N, sa, sb, sc); }
+    else { if (f32) launch_one<128, true>(v, grid, s, ap, bp, c.data_ptr(), M, N, K, N, sa, sb, sc); else launch_one<128, false>(v, grid, s, ap, bp, c.data_ptr(), M, N, K, N, sa, sb, sc); }
     C10_CUDA_CHECK(cudaPeekAtLastError());
 }
 

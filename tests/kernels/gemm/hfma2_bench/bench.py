@@ -21,6 +21,7 @@ p.add_argument("--check", action = "store_true")
 p.add_argument("--vars", action = "store_true", help = "build/load the scratch variant module")
 p.add_argument("--defs", default = "")
 p.add_argument("--calib_iters", type = int, default = 3000)
+p.add_argument("--custom", default = "", help = "batch:M:K:N[:float],... instead of the 27B shapes / --M")
 args = p.parse_args()
 
 SHAPES = {
@@ -30,6 +31,14 @@ SHAPES = {
     "attn_kv": (5120, 1024, "half"),
 }
 shapes = SHAPES if args.shapes == "all" else {k: SHAPES[k] for k in args.shapes.split(",")}
+cases = []   # (name, batch, M, K, N, dtype)
+if args.custom:
+    for e in args.custom.split(","):
+        f = e.split(":")
+        cases.append((f"{f[0]}x{f[1]}x{f[2]}x{f[3]}", int(f[0]), int(f[1]), int(f[2]), int(f[3]), f[4] if len(f) > 4 else "half"))
+else:
+    for M in [int(x) for x in args.M.split(",")]:
+        for sname, (K, N, sdt) in shapes.items(): cases.append((sname, 1, M, K, N, sdt))
 
 dev = None
 for i in range(torch.cuda.device_count()):
@@ -78,15 +87,16 @@ for _ in range(4):
     t, clk, pw = smi()
     print(f"calib {e0.elapsed_time(e1):.2f} ms {r:.2f} TFLOP/s = {r / (56 * 256) * 1e6:.0f} MHz-equivalent; smi {clk} MHz {t} C")
 torch.manual_seed(0)
-for M in [int(x) for x in args.M.split(",")]:
-    for sname, (K, N, sdt) in shapes.items():
+for sname, bat, M, K, N, sdt in cases:
+    if True:
         odt = torch.half if (args.out if args.out != "model" else sdt) == "half" else torch.float
-        a = torch.empty((M, K), device = dev, dtype = torch.half).normal_(std = 0.5)
-        b = torch.empty((K, N), device = dev, dtype = torch.half).normal_(std = 0.5 / K ** 0.5 * 4)
-        c = torch.empty((M, N), device = dev, dtype = odt)
-        flop = 2.0 * M * N * K
+        lead = (bat,) if bat > 1 else ()
+        a = torch.empty(lead + (M, K), device = dev, dtype = torch.half).normal_(std = 0.5)
+        b = torch.empty(lead + (K, N), device = dev, dtype = torch.half).normal_(std = 0.5 / K ** 0.5 * 4)
+        c = torch.empty(lead + (M, N), device = dev, dtype = odt)
+        flop = 2.0 * bat * M * N * K
         if args.check:
-            ref = (a.float() @ b.float())
+            ref = torch.matmul(a.float(), b.float())
             outs = {}
             for var in variants:
                 c.fill_(float("nan"))
@@ -131,13 +141,12 @@ for M in [int(x) for x in args.M.split(",")]:
         del a, b, c
 
 print(f"\nsummary: efficiency vs calib HFMA2 peak (median), TFLOP/s at 1328 MHz equivalent, ratio = median per-rep ratio vs first")
-for M in [int(x) for x in args.M.split(",")]:
-    for sname in shapes:
-        line = f"M={M:5d} {sname:8s}"
-        r0 = res[(M, sname, variants[0])]
-        for var in variants:
-            r = res[(M, sname, var)]
-            ratio = statistics.median(x[0] / y[0] for x, y in zip(r, r0))
-            e = statistics.median(x[0] for x in r)
-            line += f" | {var} {e * 100:5.1f}% {e * PEAK:5.2f}T x{ratio:.3f}"
-        print(line)
+for sname, bat, M, K, N, sdt in cases:
+    line = f"M={M:5d} {sname:8s}"
+    r0 = res[(M, sname, variants[0])]
+    for var in variants:
+        r = res[(M, sname, var)]
+        ratio = statistics.median(x[0] / y[0] for x, y in zip(r, r0))
+        e = statistics.median(x[0] for x in r)
+        line += f" | {var} {e * 100:5.1f}% {e * PEAK:5.2f}T x{ratio:.3f}"
+    print(line)

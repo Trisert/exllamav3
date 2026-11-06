@@ -547,8 +547,10 @@ static void launch(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c
 // columns tx*8 + {0..7}). A is staged transposed in shared memory as plain halves (two rows packed per 32-bit store,
 // row pairs XOR-swizzled by k / 8 so the stores are conflict-free); per k one LDS.128 of A (8 rows) and one LDS.128
 // of B (8 columns) feed 32 HFMA2, the A broadcast being the HFMA2 operand selector (.H0_H0 / .H1_H1). Global loads
-// for the next K tile are issued into registers before the current tile's math (one shared stage, two barriers
-// per tile: 12 KB at BM = 64, so three 128-thread blocks fit per SM). The K loop runs two tiles per iteration.
+// for the next K tile are issued into registers before the current tile's math. STAGES = 1: one shared stage, two
+// barriers per tile, 12 KB at BM = 64, so three 128-thread blocks fit per SM; STAGES = 2: two stages, one barrier
+// per tile, two blocks per SM (better wave quantization for some grids, see pick_stages). The K loop runs two tiles
+// per iteration.
 // Inner loop SASS: ~80% HFMA2, the rest mostly the fixed 32-term fp16 -> fp32 flush (HADD2.F32 + FADD per
 // element). Every output element sees the same arithmetic whatever BM is, and the same as the earlier 4 + 4 row
 // layout with A duplicated into half2 (bit-identical, doc/pascal_progress.md "hfma2 prefill GEMM"). Requires
@@ -560,10 +562,11 @@ constexpr int BN = 128, BK = 32;
 // Smallest 64-row-tile grid the dispatching entry points take (see pick_tile)
 constexpr int64_t MIN_BLOCKS_64 = 96;
 
-// BM = 64 (128 threads, three blocks per SM) or 128 (256 threads, one block per SM) rows per block; the 64-row tile
-// halves the grid granularity for narrow outputs (N = 512 projections, small expert groups)
-template <bool OUT_F32, int BM>
-__global__ void __launch_bounds__(BM * 2, BM == 64 ? 3 : 1)
+// BM = 64 (128 threads, three blocks per SM with STAGES = 1, two with STAGES = 2) or 128 (256 threads, one block per
+// SM) rows per block; the 64-row tile halves the grid granularity for narrow outputs (N = 512 projections, small
+// expert groups)
+template <bool OUT_F32, int BM, int STAGES>
+__global__ void __launch_bounds__(BM * 2, BM == 64 ? (STAGES == 1 ? 3 : 2) : 1)
 gemm_kernel
 (
     const half* __restrict__ A,
@@ -579,8 +582,8 @@ gemm_kernel
 )
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 600
-    __shared__ __align__(16) half As[BK][BM];
-    __shared__ __align__(16) half Bs[BK][BN];
+    __shared__ __align__(16) half As[STAGES][BK][BM];
+    __shared__ __align__(16) half Bs[STAGES][BK][BN];
 
     A += blockIdx.z * a_bstride;
     B += blockIdx.z * b_bstride;
@@ -621,7 +624,7 @@ gemm_kernel
             rb[l] = *reinterpret_cast<const uint4*>(b_ptr + (size_t) l * (THREADS / 16) * N);
         a_ptr0 += BK; a_ptr1 += BK; b_ptr += b_step;
     };
-    auto sstore = [&] ()
+    auto sstore = [&] (const int buf)
     {
         const uint32_t* r0 = reinterpret_cast<const uint32_t*>(&ra[0]);
         const uint32_t* r1 = reinterpret_cast<const uint32_t*>(&ra[1]);
@@ -629,21 +632,21 @@ gemm_kernel
         for (int i = 0; i < 8; ++i)
         {
             const uint32_t w = __byte_perm(r0[i / 2], r1[i / 2], (i & 1) ? 0x7632 : 0x5410);
-            *reinterpret_cast<uint32_t*>(&As[a_c * 8 + i][a_sp]) = w;
+            *reinterpret_cast<uint32_t*>(&As[buf][a_c * 8 + i][a_sp]) = w;
         }
         #pragma unroll
         for (int l = 0; l < LB; ++l)
-            *reinterpret_cast<uint4*>(&Bs[l * (THREADS / 16) + b_k][b_n]) = rb[l];
+            *reinterpret_cast<uint4*>(&Bs[buf][l * (THREADS / 16) + b_k][b_n]) = rb[l];
     };
 
     const int KT = K / BK;
     gload();
-    sstore();
+    sstore(0);
     __syncthreads();
 
-    // One K tile; more: another tile follows (its global loads are in flight during this tile's math, its shared
-    // stores wait for every warp to finish reading this tile)
-    auto tile = [&] (const bool more)
+    // One K tile from stage buf (a constant after inlining); more: another tile follows (its global loads are in
+    // flight during this tile's math; with one stage its shared stores wait for every warp to finish this tile)
+    auto tile = [&] (const int buf, const bool more)
     {
         if (more) gload();
 
@@ -657,8 +660,8 @@ gemm_kernel
         #pragma unroll
         for (int k = 0; k < BK; ++k)
         {
-            const uint4 a = *reinterpret_cast<const uint4*>(&As[k][((ty * 4) ^ ((k >> 3) * 8)) * 2]);
-            const uint4 b = *reinterpret_cast<const uint4*>(&Bs[k][tx * 8]);
+            const uint4 a = *reinterpret_cast<const uint4*>(&As[buf][k][((ty * 4) ^ ((k >> 3) * 8)) * 2]);
+            const uint4 b = *reinterpret_cast<const uint4*>(&Bs[buf][k][tx * 8]);
             const half2* av = reinterpret_cast<const half2*>(&a);
             const half2* bv = reinterpret_cast<const half2*>(&b);
             #pragma unroll
@@ -682,8 +685,8 @@ gemm_kernel
             }
         }
 
-        __syncthreads();
-        if (more) sstore();
+        if constexpr (STAGES == 1) __syncthreads();
+        if (more) sstore(STAGES == 1 ? 0 : buf ^ 1);
         __syncthreads();
     };
 
@@ -691,10 +694,10 @@ gemm_kernel
     int kt = 0;
     for (; kt + 2 <= KT; kt += 2)
     {
-        tile(true);
-        tile(kt + 2 < KT);
+        tile(0, true);
+        tile(STAGES == 1 ? 0 : 1, kt + 2 < KT);
     }
-    if (kt < KT) tile(false);
+    if (kt < KT) tile(0, false);
 
     #pragma unroll
     for (int i = 0; i < 8; ++i)
@@ -814,6 +817,15 @@ static int pick_tile(const at::Tensor& a, const at::Tensor& b)
     return blocks >= MIN_BLOCKS_64 ? 64 : 0;
 }
 
+// Shared stages of the 64-row tile: three resident blocks per SM (one stage) is 2-5% faster per block on full waves,
+// two (two stages) wins when the grid fills its last wave clearly better at two per SM (27B, 320 x 5120 x 17408:
+// 200 blocks = 1.19 waves at 168 resident vs 1.79 at 112, measured 0.89x vs 1.10x of the old kernel)
+static int pick_stages(int64_t blocks, int sms)
+{
+    auto fill = [&] (int64_t cap) { return (double) blocks / (double) (((blocks + cap - 1) / cap) * cap); };
+    return fill(2 * sms) > 1.3 * fill(3 * sms) ? 2 : 1;
+}
+
 static void launch(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, cudaStream_t stream, int bm)
 {
     const bool batched = b.dim() == 3;
@@ -828,13 +840,22 @@ static void launch(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c
     const bool f32 = c.dtype() == at::kFloat;
     if (bm == 64)
     {
-        if (f32) gemm_kernel<true, 64><<<grid, 128, 0, stream>>>(ap, bp, c.data_ptr(), (int) M, N, K, ldc, as, bs, cs);
-        else gemm_kernel<false, 64><<<grid, 128, 0, stream>>>(ap, bp, c.data_ptr(), (int) M, N, K, ldc, as, bs, cs);
+        const int sms = at::cuda::getDeviceProperties(a.device().index())->multiProcessorCount;
+        if (pick_stages((int64_t) grid.x * grid.y * grid.z, sms) == 2)
+        {
+            if (f32) gemm_kernel<true, 64, 2><<<grid, 128, 0, stream>>>(ap, bp, c.data_ptr(), (int) M, N, K, ldc, as, bs, cs);
+            else gemm_kernel<false, 64, 2><<<grid, 128, 0, stream>>>(ap, bp, c.data_ptr(), (int) M, N, K, ldc, as, bs, cs);
+        }
+        else
+        {
+            if (f32) gemm_kernel<true, 64, 1><<<grid, 128, 0, stream>>>(ap, bp, c.data_ptr(), (int) M, N, K, ldc, as, bs, cs);
+            else gemm_kernel<false, 64, 1><<<grid, 128, 0, stream>>>(ap, bp, c.data_ptr(), (int) M, N, K, ldc, as, bs, cs);
+        }
     }
     else
     {
-        if (f32) gemm_kernel<true, 128><<<grid, 256, 0, stream>>>(ap, bp, c.data_ptr(), (int) M, N, K, ldc, as, bs, cs);
-        else gemm_kernel<false, 128><<<grid, 256, 0, stream>>>(ap, bp, c.data_ptr(), (int) M, N, K, ldc, as, bs, cs);
+        if (f32) gemm_kernel<true, 128, 1><<<grid, 256, 0, stream>>>(ap, bp, c.data_ptr(), (int) M, N, K, ldc, as, bs, cs);
+        else gemm_kernel<false, 128, 1><<<grid, 256, 0, stream>>>(ap, bp, c.data_ptr(), (int) M, N, K, ldc, as, bs, cs);
     }
     cuda_check(cudaPeekAtLastError());
 }
