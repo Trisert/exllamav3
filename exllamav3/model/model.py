@@ -420,6 +420,12 @@ class Model(Model_TPMixin, Model_LSMixin):
             return ids
         logits = lm.forward(lm.prepare_for_device(state, params), params)
         logits = logits[..., :self.config.vocab_size]
+        # Optional caller hook on the draft logits (the generator mirrors the sampler's presence / frequency
+        # penalty here so the proposal is the token the penalized target would pick). It only changes which
+        # token is proposed, never what is emitted: the target's own sampling decides that
+        logits_fn = params.get("draft_logits_fn")
+        if logits_fn is not None:
+            logits = logits_fn(logits)
         if flag == "probe":
             # Probe round: full head answers, the sparse pick is recorded alongside for the drift statistics
             full_ids = torch.argmax(logits, dim = -1)

@@ -749,6 +749,20 @@ confidence is kept on the device and read once after verification (for the calib
 blocking readback in the draft step. Same tokens and calibration. The draft ids still come back to the
 host before verification (the embedding lookup needs them), so the gain is small.
 
+### `EXL3_DRAFT_PENALTY` (default: `0`, experimental)
+
+Generator, MTP drafting, one active job, non-TP, full (not sparse) draft head: the sampler's presence / frequency
+penalty (`SS_PresFreqP`, same sustain / decay window, same kernel) is applied to the draft logits before the argmax,
+over the committed sequence plus the tokens drafted so far in the round. Code repeats identifiers; an unpenalized
+draft keeps proposing them and a presence-penalized target (model-card presence 1.5) keeps rejecting them. By
+construction this changes only which token is proposed (verification samples the target with its own sampler), but
+the byte-for-byte check did not confirm it: with the Qwen3.8-27B, card sampling, seed 1234, `-ndt 2`, text from turn 2
+onward differs between `0` and `1`, and so does the text when only the draft window changes with the penalty off
+(`-ndt 3` vs `-ndt 2` diverges at the same byte), so the output depends on the draft/verify row grouping numerically
+(a greedy target, top_k 1 + presence 1.5, also diverges at turn 2). Same-config repeats are identical. Measured gain is
+small: mean draft acceptance 77.9% -> 79.5% (sampled), 77.9% -> 79.2% (greedy), 4 turns (3 code, 1 prose) on a hot P100,
+so it is off by default. `1` enables it. Read per round. Repetition penalty (`SS_RepP`) is not mirrored.
+
 ### `EXL3_MOE_COOP_WIDE` (default: unset)
 
 Tile geometry of the fused decode MoE kernels (the bsz <= 8 path of `BlockSparseMLP`): `0` forces

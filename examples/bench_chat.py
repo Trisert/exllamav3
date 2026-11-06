@@ -70,7 +70,8 @@ def main(args):
                 time.sleep(3)
         pre = smi(args.smi_index)
         job = Job(input_ids = ids, max_new_tokens = args.max_new, stop_conditions = stop_conditions,
-                  sampler = model_init.get_arg_sampler(args) if args.sample else ArgmaxSampler())
+                  sampler = model_init.get_arg_sampler(args) if args.sample else ArgmaxSampler(),
+                  seed = (args.seed + i) if args.seed is not None else None)
         generator.enqueue(job)
         out, last = "", {}
         while generator.num_remaining_jobs():
@@ -118,6 +119,8 @@ if __name__ == "__main__":
                         help = "Before each turn, wait until the P100 (-smi_index) is at or below this temperature (C); 0 = off")
     parser.add_argument("-save_text", "--save_text", type = str, default = None,
                         help = "Write the generated text of every turn to this file (compare builds/kernels byte for byte)")
+    parser.add_argument("-seed", "--seed", type = int, default = None,
+                        help = "Sampler seed (turn i uses seed + i), to compare text between builds / env switches with -sample")
     parser.add_argument("-sample", "--sample", action = "store_true",
                         help = "Use the sampler of chat.py (temperature, min-p, ...) instead of greedy; the draft acceptance then drops")
     main(parser.parse_args())
