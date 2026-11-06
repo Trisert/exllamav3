@@ -530,6 +530,97 @@ partial / fp32 add overhead; (3) pipeline the two cards across chunks (2060 on c
 `-gs`; (4) fewer reconstructs: a 4096 chunk halves reconstruct (~-2-3%), costs scratch memory; (5) fa60 at long prefix
 (9-14% at 24k); (6) GDN Triton tuning last (<= 3%).
 
+### hfma2 prefill GEMM
+
+Nov 6, branch `hfma2-prefill-gemm` (from `prefill27-profile`). Goal: raise the efficiency of `hfma2::gemm_kernel`
+(63-77% of 27B prefill) without changing the numerics. Result: **new kernel, bit-identical output, +7-8% GEMM
+throughput on the 27B prefill shapes** (time-weighted over a 4-layer group: **+8.3% at M = 2048, +7.3% at M = 4096**).
+
+Harness `tests/kernels/gemm/hfma2_bench/`: `vars.cu` (variants side by side, JIT-built with the extension's nvcc
+flags; v0 = the old kernel verbatim), `bench.py` (P100 only, ABAB per launch, `--check` = rel RMS vs fp32 matmul and
+bit equality vs the first variant), `weigh.py` (time-weighted speedup), `loopmix.py` (SASS op mix of the whole
+function and of its main loop), `pf27ab.py` (end-to-end, see below). **Clock normalisation**: the P100 throttles
+within seconds (79 C, 405-1300 MHz from one sample to the next), so a post-hoc nvidia-smi clock does not describe a
+30-150 ms GEMM (it gave "101% of peak"). Each GEMM launch is bracketed by a register-only HFMA2 kernel (`calib`,
+~3.6 ms); efficiency = GEMM rate / mean calib rate. Calib reaches 18.4 TFLOP/s at 1328 MHz = 96.6% of the nominal
+HFMA2 peak (56 x 64 x 4 flop/clk); "TFLOP/s @1328" below = efficiency x 19.03 (nominal peak at 1328 MHz), i.e.
+what the kernel does on a cool card. Outputs in the module dtype (gate/up, q, k/v fp16; down, GDN qkv/z, o fp32).
+
+Final run (cool card: 62-66 C at M = 2048, median clock 1227 MHz; 65-70 C at M = 4096, 1189 MHz), 3 reps x 4 launches,
+efficiency vs calib (per-rep spread +-1%):
+
+| M | shape (K x N) | old 64-row | new 64-row | x | old 128-row | new 128-row |
+| ---: | :--- | ---: | ---: | ---: | ---: | ---: |
+| 2048 | gate/up 5120 x 17408 | 75.4% (14.4 T) | 80.6% (15.3 T) | 1.066 | 70.7% | 77.1% |
+| 2048 | down 17408 x 5120 | 72.1% (13.7 T) | 78.6% (15.0 T) | 1.091 | 69.9% | 75.6% |
+| 2048 | GDN qkv 5120 x 10240 | 72.5% (13.8 T) | 78.6% (15.0 T) | 1.084 | 71.4% | 77.7% |
+| 2048 | GDN z 5120 x 6144 | 71.8% (13.7 T) | 78.6% (15.0 T) | 1.089 | 71.3% | 76.8% |
+| 2048 | GDN out / attn o 6144 x 5120 | 70.6% (13.4 T) | 79.2% (15.1 T) | 1.121 | 69.9% | 75.1% |
+| 2048 | attn q 5120 x 12288 | 73.7% (14.0 T) | 79.4% (15.1 T) | 1.071 | 70.1% | 76.5% |
+| 2048 | attn k / v 5120 x 1024 | 57.8% (11.0 T) | 71.4% (13.6 T) | 1.234 | 54.5% | 58.7% |
+| 4096 | gate/up | 77.5% (14.8 T) | 82.0% (15.6 T) | 1.065 | 73.1% | 77.2% |
+| 4096 | down | 74.9% (14.3 T) | 81.6% (15.5 T) | 1.075 | 74.3% | 80.3% |
+| 4096 | GDN qkv | 74.2% (14.1 T) | 81.0% (15.4 T) | 1.092 | 72.1% | 77.6% |
+| 4096 | GDN z | 72.5% (13.8 T) | 78.9% (15.0 T) | 1.088 | 71.3% | 77.1% |
+| 4096 | GDN out / attn o | 73.0% (13.9 T) | 78.8% (15.0 T) | 1.081 | 71.5% | 77.8% |
+| 4096 | attn q | 75.6% (14.4 T) | 80.5% (15.3 T) | 1.066 | 72.1% | 76.9% |
+| 4096 | attn k / v | 68.7% (13.1 T) | 69.8% (13.3 T) | 1.016 | 65.4% | 70.6% |
+
+(T = TFLOP/s at 1328 MHz equivalent. Raw TFLOP/s at the run's 1100-1328 MHz, e.g. GDN out / attn o at M = 2048: old
+11.6-12.8, new 13.0-14.4; k / v: old 9.6-10.7, new 12.0-13.2.) The doc's earlier "64% of peak" assumed 1.2 GHz; per clock the old kernel was already at 72-78% of calib.
+
+What was tried, in the task's order (each ABAB vs v0, gate/up + down + o at M = 2048 first):
+- **(a) 128-row tile**: it is never picked by design (`pick_tile` returns 64 or 0; the 64-row tile was measured within
+  2% of it on large shapes). On the 27B shapes it is **3-6% slower** than the 64-row tile for both the old and the new
+  kernel (one 256-thread block per SM vs 2-3 128-thread blocks). Not enabled.
+- **(b) more HFMA2 per LDS (v1)**: the old kernel stored A duplicated into half2 and loaded per k two LDS.128 of A and
+  two LDS.64 of B for 32 HFMA2. v1 stores A transposed as plain halves (two rows packed per 32-bit STS, row pairs
+  XOR-swizzled by k / 8: conflict-free stores and aligned LDS.128 reads) and lets the HFMA2 operand selector
+  (`R.H0_H0` / `R.H1_H1`) do the broadcast: **one LDS.128 of A (8 rows) + one LDS.128 of B (8 columns) per 32 HFMA2**,
+  thread tile rows ty*8 + {0..7}, cols tx*8 + {0..7}. Same arithmetic per element. +4-10%. A larger per-thread tile
+  (8 x 16) does not fit: 64 half2 + 128 fp32 accumulators alone are 192 of the 255 registers.
+- **3 blocks per SM (v2)**: v1 has 156 registers (3 blocks fit at <= 168) but 24 KB of shared memory (2 stages); one
+  shared stage (12 KB, a second barrier per tile, global loads still prefetched into registers) +
+  `__launch_bounds__(128, 3)`: ~ +1-2% over v1.
+- **(c) address / loop overhead (v3/v4)**: K loop unrolled by two tiles, pointer-increment global loads: in-loop
+  non-HFMA2 ALU ops per tile ~82 -> ~40. v4 (= v2 + this) is the new kernel. +1-2% over v2.
+- **(d) double buffering**: was already there (two shared stages + register prefetch, one barrier per tile); the new
+  kernel goes back to one stage to fit three blocks per SM, which measured slightly better.
+- **Grouped raster** (GROUP_M = 8 / 16, B stripes shared across row stripes in L2, as the f16acc kernel): no gain
+  (-1 to +1%). Not kept.
+- **(e) instruction mix** (`cuobjdump -sass -arch sm_60` of the built `.so`, `loopmix.py`; fp16-out 64-row kernel):
+
+| | whole function | main loop | loop ALU ops besides HFMA2 per 1024 HFMA2 |
+| :--- | ---: | ---: | ---: |
+| old | 2022 instr, **HFMA2 50.6%** | 1387, 73.8% (LDS 128, HADD2.F32 64, FADD 64, XMAD 29, STS 20, ...) | ~209 |
+| new | 4368 instr, **HFMA2 70.3%** | 2567 per 2 tiles, 80.0% (LDS 128, HADD2.F32 128, FADD 128, ...) | ~165 |
+
+  The whole-function share is mostly prologue / epilogue that runs once (the 2x unroll alone moves it past 65%); the
+  loop share is what counts. LDS / STS / LDG go to the load-store unit; what competes with HFMA2 for issue is the
+  32-term flush (HADD2.F32 + FADD per output element per 32 k: 128 per 1024 HFMA2, fixed by the contract) plus ~40
+  integer ops: issue ceiling ~86% of calib, the new kernel reaches 79-82% on the large shapes. The rest of the headroom
+  needs a shorter flush, i.e. a different numerical contract (KSLICE > 32), which was out of scope.
+
+Correctness: every variant is **bit-identical** to the old kernel on all 7 shapes at M = 2048 (fp16 and fp32
+outputs, both tiles; `bench.py --check`), rel RMS vs fp32 `torch.matmul` 8.4-8.7e-4 (same as before, limit 1e-3).
+`tests/kernels/gemm/test_hgemm_hfma2.py`: new `test_hfma2_matches_fp32_matmul` (the seven 27B K x N at M = 130, plus odd
+K tile counts K = 96 / 160 and M = 3 / 67, both tiles, vs fp32 matmul at rel RMS 1e-3); 45 passed (test_hgemm_f16acc
+skipped: sm80+ only).
+
+End-to-end (Qwen3.8-27B 4 bpw, `-gs 4.0,15.0 -cs 32768 -cq 4`, 2048-token cold prompt through the Generator):
+**not conclusive**. Model load takes 75-123 s (its dummy forward runs on the throttled card), which leaves one or
+two prefills per 3-minute run, and the P100 sat at 79 C in thermal slowdown for the whole afternoon. `pf27ab.py`
+loads the model once and routes `ext.hgemm_recon` (P100, covered shapes) to v0 or v4 per prompt. Runs: A1 (old `.so`,
+separate process) 219 / 202 / 168 t/s as it heated; in-process pair A then B: 192.4 (old, 1189 MHz) then 167.2 t/s
+(new, second and hotter, 1189 -> 974 MHz); four new-kernel runs (two separate-process with the new `.so`, two
+in-process B-first) started at 79 C / 405-1037 MHz and ran 95-105 t/s, timing out before a second prompt. These numbers track the clock, not the kernel. Expected from the microbenchmark: GEMM
+hfma2 is ~72% of prefill, so +8% on it is ~ -5% prefill time (228 -> ~240 t/s cool at 2k). To measure: a cool card,
+`pf27ab.py -pairs 1 -start 0` and `-start 1` alternately.
+
+Recommendation: keep the new kernel (no numerical change, faster on every 27B shape and on both tiles, the 64-row tile
+remains the right pick). Further GEMM gains on the P100 need a contract change (longer fp16 partials, e.g. 64 terms:
+halves the flush, ceiling ~91%) or better cooling, which is worth far more at >= 8k (2.2x).
+
 ## Target (set Nov 3 by the user)
 
 **100 t/s** with MTP (`-mtp -ndt 1 -dds`, `-gs 4.0,15.0 -cq 4`) on Qwen3.6-35B-A3B and on Ornith-1.5-35B-A3B, measured with
