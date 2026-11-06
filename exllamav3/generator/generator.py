@@ -1209,6 +1209,52 @@ class Generator:
         return self.draft_ids_pinned[:, :window]
 
 
+    def _draft_penalty_fn(self, draft_cols: list):
+        """
+        Mirror the job's presence / frequency penalty on the MTP draft logits, so the drafted token is the one the
+        penalized target is likely to pick (code repeats identifiers, which an unpenalized argmax keeps proposing
+        and a presence-penalized target keeps rejecting). Speed only: verification still samples the target with its
+        own sampler, so the emitted tokens do not depend on what is drafted. Returns a function logits -> logits, or
+        None when it does not apply (EXL3_DRAFT_PENALTY=0, more than one job, no such penalty in the sampler).
+
+        past ids = the job's committed sequence + the tokens drafted so far in this round (draft_cols, filled by the
+        caller's loop). The window arguments are the sampler's own, so the fade matches
+        """
+        if os.environ.get("EXL3_DRAFT_PENALTY", "0") != "1":
+            return None
+        jobs = [j for j in self.active_jobs if j.is_prefill_done()]
+        if len(jobs) != 1:
+            return None
+        job = jobs[0]
+        steps = getattr(job.sampler, "steps", None)
+        if not steps:
+            return None
+        cfg = None
+        for st in steps:
+            if type(st).__name__ == "SS_PresFreqP" and (st.pres_p != 0.0 or st.freq_p != 0.0) \
+                    and st.sustain_range + st.decay_range > 0:
+                cfg = (float(st.pres_p), float(st.freq_p), int(st.sustain_range), int(st.decay_range))
+                break
+        if cfg is None or getattr(job, "current_device_ids", None) is None:
+            return None
+        pres, freq, sustain, decay = cfg
+
+        def penalize(logits: torch.Tensor) -> torch.Tensor:
+            flat = logits.reshape(-1, logits.shape[-1]).contiguous()
+            if flat.shape[0] != 1:
+                return logits
+            base = job.current_device_ids
+            if draft_cols:
+                past = torch.cat([base] + [c.to(base.device, dtype = torch.long) for c in draft_cols], dim = 1)
+            else:
+                past = base
+            out = torch.empty_like(flat, dtype = torch.float)
+            ext.apply_pres_freq_pens(flat, out, past.to(flat.device), pres, freq, sustain, decay)
+            return out.view(logits.shape)
+
+        return penalize
+
+
     def iterate_draftmodel_mtp_gen(self, results: list, window: int):
 
         self._draft_conf_round = None
@@ -1280,6 +1326,7 @@ class Generator:
             kv_seqlens = cache_seqlens.clone()
             target_states = [job.recurrent_state.target for job in self.active_jobs if job.is_prefill_done()] \
                 if self.target_recurrent else None
+        draft_pen_fn = self._draft_penalty_fn(draft_cols)
         for idx in range(window):
             params = {
                 "target_hidden": temp_hidden,
@@ -1290,6 +1337,8 @@ class Generator:
                 "draft_step": idx,   # heads specialized per depth pick their head from this
                 "sparse_head": self._sparse_flag,
             }
+            if draft_pen_fn is not None:
+                params["draft_logits_fn"] = draft_pen_fn
             if target_kv:
                 params["positions"] = kv_seqlens
                 if target_states is not None:
