@@ -59,6 +59,29 @@ def test_hfma2_matches_cublas(device, dtype, batch, M, N, K, bm):
     assert torch.equal(c.view(bits), before.view(bits)), "not bit-reproducible"
 
 
+@pytest.mark.parametrize("bm", [128, 64])
+@pytest.mark.parametrize("M,K,N,dtype", [
+    # Qwen3.8-27B prefill projections (K x N, module output dtype) at a ragged row count, plus odd K tile counts
+    (130, 5120, 17408, torch.float16), (130, 17408, 5120, torch.float32), (130, 5120, 10240, torch.float32),
+    (130, 5120, 6144, torch.float32), (130, 6144, 5120, torch.float32), (130, 5120, 12288, torch.float16),
+    (130, 5120, 1024, torch.float16), (67, 96, 256, torch.float32), (3, 160, 128, torch.float16),
+])
+@torch.inference_mode()
+def test_hfma2_matches_fp32_matmul(device, M, K, N, dtype, bm):
+    """Against fp32 torch.matmul of the same fp16 inputs: the documented 32-term fp16 partial error, rel RMS 1e-3"""
+    if not _sm60(device):
+        pytest.skip("sm_60 kernel")
+    torch.manual_seed(7)
+    a = torch.empty((M, K), device = device, dtype = torch.half).normal_(std = 0.5)
+    b = torch.empty((K, N), device = device, dtype = torch.half).normal_(std = 2.0 / K ** 0.5)
+    c = torch.full((M, N), float("nan"), device = device, dtype = dtype)
+    ext.hgemm_hfma2(a, b, c, bm)
+    ref = a.float() @ b.float()
+    assert not bool(c.isnan().any())
+    rel = ((c.float() - ref).square().mean() / ref.square().mean()).sqrt()
+    assert float(rel) < 1e-3
+
+
 @torch.inference_mode()
 def test_hfma2_exact_row_selection(device):
     if not _sm60(device):

@@ -543,11 +543,15 @@ static void launch(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c
 // Pascal sm_60 (GP100) form of the same contract: no tensor cores, but HFMA2 runs at twice the fp32 FMA rate,
 // which cuBLAS only uses with an fp16 compute type (fp16 accumulation across all of K). This kernel keeps
 // fp16 partials over KSLICE = 32 elements of K and adds them into fp32 registers, like the f16acc kernel
-// above. BM x 128 x 32 block tile (BM = 64 or 128, 2 * BM threads), 8 x 8 outputs per thread (rows ty*4 + {0..3}
-// and BM/2 + ty*4 + {0..3}, columns tx*4 + {0..3} and 64 + tx*4 + {0..3}). A is staged transposed in shared
-// memory with each element duplicated into a half2 so one LDS.128 feeds four broadcast operands; B rows are
-// staged as loaded. Global loads for the next K tile are issued before the current tile's math (register double
-// buffering, two shared stages). Every output element sees the same arithmetic whatever BM is. Requires
+// above. BM x 128 x 32 block tile (BM = 64 or 128, 2 * BM threads), 8 x 8 outputs per thread (rows ty*8 + {0..7},
+// columns tx*8 + {0..7}). A is staged transposed in shared memory as plain halves (two rows packed per 32-bit store,
+// row pairs XOR-swizzled by k / 8 so the stores are conflict-free); per k one LDS.128 of A (8 rows) and one LDS.128
+// of B (8 columns) feed 32 HFMA2, the A broadcast being the HFMA2 operand selector (.H0_H0 / .H1_H1). Global loads
+// for the next K tile are issued into registers before the current tile's math (one shared stage, two barriers
+// per tile: 12 KB at BM = 64, so three 128-thread blocks fit per SM). The K loop runs two tiles per iteration.
+// Inner loop SASS: ~80% HFMA2, the rest mostly the fixed 32-term fp16 -> fp32 flush (HADD2.F32 + FADD per
+// element). Every output element sees the same arithmetic whatever BM is, and the same as the earlier 4 + 4 row
+// layout with A duplicated into half2 (bit-identical, doc/pascal_progress.md "hfma2 prefill GEMM"). Requires
 // K % 32 == 0, N % 128 == 0, 16-byte aligned packed A / B rows.
 namespace hfma2
 {
@@ -556,10 +560,10 @@ constexpr int BN = 128, BK = 32;
 // Smallest 64-row-tile grid the dispatching entry points take (see pick_tile)
 constexpr int64_t MIN_BLOCKS_64 = 96;
 
-// BM = 128 (256 threads, one block per SM) or 64 (128 threads, two per SM) rows per block; the 64-row tile
+// BM = 64 (128 threads, three blocks per SM) or 128 (256 threads, one block per SM) rows per block; the 64-row tile
 // halves the grid granularity for narrow outputs (N = 512 projections, small expert groups)
 template <bool OUT_F32, int BM>
-__global__ void __launch_bounds__(BM * 2, 128 / BM)
+__global__ void __launch_bounds__(BM * 2, BM == 64 ? 3 : 1)
 gemm_kernel
 (
     const half* __restrict__ A,
@@ -575,8 +579,8 @@ gemm_kernel
 )
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 600
-    __shared__ __align__(16) half2 As[2][BK][BM];
-    __shared__ __align__(16) half Bs[2][BK][BN];
+    __shared__ __align__(16) half As[BK][BM];
+    __shared__ __align__(16) half Bs[BK][BN];
 
     A += blockIdx.z * a_bstride;
     B += blockIdx.z * b_bstride;
@@ -586,14 +590,16 @@ gemm_kernel
     const int tid = threadIdx.x;
     const int tx = tid & 15, ty = tid >> 4;
     const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
-
-    // Global load mapping, two 16-deep halves of the K tile: A row tid / 2, k (tid & 1) * 8 + {0, 16};
-    // B rows tid / 16 + l * THREADS / 16, columns (tid & 15) * 8
-    const int a_row = tid >> 1, a_k = (tid & 1) * 8;
-    const bool a_ok = m0 + a_row < M;
-    const half* a_ptr = A + (size_t) (a_ok ? m0 + a_row : 0) * K + a_k;
+    // A: row pair p = tid / 4 (rows 2p, 2p + 1), k chunk c = tid % 4 (k = 8c .. 8c + 7). Stored at pair p ^ 8c of
+    // row k so the eight k stores of a warp hit 32 distinct banks
+    const int a_p = tid >> 2, a_c = tid & 3;
+    const bool a_ok0 = m0 + 2 * a_p < M, a_ok1 = m0 + 2 * a_p + 1 < M;
+    const half* __restrict__ a_ptr0 = A + (size_t) (a_ok0 ? m0 + 2 * a_p : 0) * K + a_c * 8;
+    const half* __restrict__ a_ptr1 = A + (size_t) (a_ok1 ? m0 + 2 * a_p + 1 : 0) * K + a_c * 8;
+    const int a_sp = (a_p ^ (a_c * 8)) * 2;
     const int b_k = tid >> 4, b_n = (tid & 15) * 8;
     const half* b_ptr = B + (size_t) b_k * N + n0 + b_n;
+    const size_t b_step = (size_t) BK * N;
 
     half2 acc[8][4];
     float accf[8][8];
@@ -605,40 +611,42 @@ gemm_kernel
     }
 
     uint4 ra[2], rb[LB];
-    auto gload = [&] (int kt)
+    // Loads the next K tile and advances the pointers
+    auto gload = [&] ()
     {
-        #pragma unroll
-        for (int l = 0; l < 2; ++l)
-            ra[l] = a_ok ? *reinterpret_cast<const uint4*>(a_ptr + kt * BK + l * 16) : make_uint4(0, 0, 0, 0);
+        ra[0] = a_ok0 ? *reinterpret_cast<const uint4*>(a_ptr0) : make_uint4(0, 0, 0, 0);
+        ra[1] = a_ok1 ? *reinterpret_cast<const uint4*>(a_ptr1) : make_uint4(0, 0, 0, 0);
         #pragma unroll
         for (int l = 0; l < LB; ++l)
-            rb[l] = *reinterpret_cast<const uint4*>(b_ptr + (size_t) (kt * BK + l * (THREADS / 16)) * N);
+            rb[l] = *reinterpret_cast<const uint4*>(b_ptr + (size_t) l * (THREADS / 16) * N);
+        a_ptr0 += BK; a_ptr1 += BK; b_ptr += b_step;
     };
-    auto sstore = [&] (int buf)
+    auto sstore = [&] ()
     {
+        const uint32_t* r0 = reinterpret_cast<const uint32_t*>(&ra[0]);
+        const uint32_t* r1 = reinterpret_cast<const uint32_t*>(&ra[1]);
         #pragma unroll
-        for (int l = 0; l < 2; ++l)
+        for (int i = 0; i < 8; ++i)
         {
-            const half* ha = reinterpret_cast<const half*>(&ra[l]);
-            #pragma unroll
-            for (int i = 0; i < 8; ++i) As[buf][l * 16 + a_k + i][a_row] = __half2half2(ha[i]);
+            const uint32_t w = __byte_perm(r0[i / 2], r1[i / 2], (i & 1) ? 0x7632 : 0x5410);
+            *reinterpret_cast<uint32_t*>(&As[a_c * 8 + i][a_sp]) = w;
         }
         #pragma unroll
         for (int l = 0; l < LB; ++l)
-            *reinterpret_cast<uint4*>(&Bs[buf][l * (THREADS / 16) + b_k][b_n]) = rb[l];
+            *reinterpret_cast<uint4*>(&Bs[l * (THREADS / 16) + b_k][b_n]) = rb[l];
     };
 
     const int KT = K / BK;
-    gload(0);
-    sstore(0);
+    gload();
+    sstore();
     __syncthreads();
 
-    for (int kt = 0; kt < KT; ++kt)
+    // One K tile; more: another tile follows (its global loads are in flight during this tile's math, its shared
+    // stores wait for every warp to finish reading this tile)
+    auto tile = [&] (const bool more)
     {
-        const int buf = kt & 1;
-        if (kt + 1 < KT) gload(kt + 1);
+        if (more) gload();
 
-        // One fp16 partial per K tile (KSLICE = BK = 32 terms)
         #pragma unroll
         for (int i = 0; i < 8; ++i)
         {
@@ -649,25 +657,16 @@ gemm_kernel
         #pragma unroll
         for (int k = 0; k < BK; ++k)
         {
-            const uint4 a0 = *reinterpret_cast<const uint4*>(&As[buf][k][ty * 4]);
-            const uint4 a1 = *reinterpret_cast<const uint4*>(&As[buf][k][BM / 2 + ty * 4]);
-            const uint2 b0 = *reinterpret_cast<const uint2*>(&Bs[buf][k][tx * 4]);
-            const uint2 b1 = *reinterpret_cast<const uint2*>(&Bs[buf][k][64 + tx * 4]);
-            const half2* av0 = reinterpret_cast<const half2*>(&a0);
-            const half2* av1 = reinterpret_cast<const half2*>(&a1);
-            const half2* bv0 = reinterpret_cast<const half2*>(&b0);
-            const half2* bv1 = reinterpret_cast<const half2*>(&b1);
+            const uint4 a = *reinterpret_cast<const uint4*>(&As[k][((ty * 4) ^ ((k >> 3) * 8)) * 2]);
+            const uint4 b = *reinterpret_cast<const uint4*>(&Bs[k][tx * 8]);
+            const half2* av = reinterpret_cast<const half2*>(&a);
+            const half2* bv = reinterpret_cast<const half2*>(&b);
             #pragma unroll
-            for (int i = 0; i < 4; ++i)
+            for (int i = 0; i < 8; ++i)
             {
-                acc[i][0] = __hfma2(av0[i], bv0[0], acc[i][0]);
-                acc[i][1] = __hfma2(av0[i], bv0[1], acc[i][1]);
-                acc[i][2] = __hfma2(av0[i], bv1[0], acc[i][2]);
-                acc[i][3] = __hfma2(av0[i], bv1[1], acc[i][3]);
-                acc[4 + i][0] = __hfma2(av1[i], bv0[0], acc[4 + i][0]);
-                acc[4 + i][1] = __hfma2(av1[i], bv0[1], acc[4 + i][1]);
-                acc[4 + i][2] = __hfma2(av1[i], bv1[0], acc[4 + i][2]);
-                acc[4 + i][3] = __hfma2(av1[i], bv1[1], acc[4 + i][3]);
+                const half2 ai = (i & 1) ? __high2half2(av[i / 2]) : __low2half2(av[i / 2]);
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) acc[i][j] = __hfma2(ai, bv[j], acc[i][j]);
             }
         }
 
@@ -683,29 +682,39 @@ gemm_kernel
             }
         }
 
-        if (kt + 1 < KT) sstore(buf ^ 1);
         __syncthreads();
+        if (more) sstore();
+        __syncthreads();
+    };
+
+    // Two tiles per iteration: halves the loop and pointer bookkeeping per HFMA2
+    int kt = 0;
+    for (; kt + 2 <= KT; kt += 2)
+    {
+        tile(true);
+        tile(kt + 2 < KT);
     }
+    if (kt < KT) tile(false);
 
     #pragma unroll
     for (int i = 0; i < 8; ++i)
     {
-        const int m = m0 + (i < 4 ? ty * 4 + i : BM / 2 + ty * 4 + i - 4);
+        const int m = m0 + ty * 8 + i;
         if (m >= M) continue;
         if constexpr (OUT_F32)
         {
-            float* c = reinterpret_cast<float*>(C) + blockIdx.z * c_bstride + (size_t) m * ldc + n0;
-            *reinterpret_cast<float4*>(c + tx * 4) = make_float4(accf[i][0], accf[i][1], accf[i][2], accf[i][3]);
-            *reinterpret_cast<float4*>(c + 64 + tx * 4) = make_float4(accf[i][4], accf[i][5], accf[i][6], accf[i][7]);
+            float* c = reinterpret_cast<float*>(C) + blockIdx.z * c_bstride + (size_t) m * ldc + n0 + tx * 8;
+            *reinterpret_cast<float4*>(c) = make_float4(accf[i][0], accf[i][1], accf[i][2], accf[i][3]);
+            *reinterpret_cast<float4*>(c + 4) = make_float4(accf[i][4], accf[i][5], accf[i][6], accf[i][7]);
         }
         else
         {
-            half* c = reinterpret_cast<half*>(C) + blockIdx.z * c_bstride + (size_t) m * ldc + n0;
+            half* c = reinterpret_cast<half*>(C) + blockIdx.z * c_bstride + (size_t) m * ldc + n0 + tx * 8;
             half2 h[4];
             #pragma unroll
             for (int j = 0; j < 4; ++j) h[j] = __floats2half2_rn(accf[i][2 * j], accf[i][2 * j + 1]);
-            *reinterpret_cast<uint2*>(c + tx * 4) = *reinterpret_cast<const uint2*>(&h[0]);
-            *reinterpret_cast<uint2*>(c + 64 + tx * 4) = *reinterpret_cast<const uint2*>(&h[2]);
+            *reinterpret_cast<uint2*>(c) = *reinterpret_cast<const uint2*>(&h[0]);
+            *reinterpret_cast<uint2*>(c + 4) = *reinterpret_cast<const uint2*>(&h[2]);
         }
     }
 #endif
@@ -795,7 +804,8 @@ static int64_t rows_of(const at::Tensor& a, bool batched)
 // compute): the 64-row tile (two 128-thread blocks per SM) is 1.2-2.1x faster from about 96 blocks up
 // (2048 x 2048 x 512: 1.19x, 132 x 2048 x 8192: 1.28x, 645 x 4096 x 2048: 1.27x, 8 x [150 x 2048 x 512]: 2.1x)
 // and within 2% of the 128-row tile on the large shapes (2048 x 2048 x 8192: 1.41x vs 1.44x), while grids of
-// 32-48 blocks lose (512 x 2048 x 512: 0.64x, 132 x 4096 x 2048: 0.80x)
+// 32-48 blocks lose (512 x 2048 x 512: 0.64x, 132 x 4096 x 2048: 0.80x). On the 27B prefill shapes (M = 2048 / 4096)
+// the 128-row tile is 3-5% slower than the 64-row one (one 256-thread block per SM against three 128-thread blocks)
 static int pick_tile(const at::Tensor& a, const at::Tensor& b)
 {
     const bool batched = b.dim() == 3;
