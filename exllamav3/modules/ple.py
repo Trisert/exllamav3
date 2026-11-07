@@ -598,6 +598,19 @@ class PLELayer(Module):
             prev_ids, next_ids = nxt
             self.ple_embedding.prefetch(torch.cat((self._prepare_ids(prev_ids), self._prepare_ids(next_ids)), dim = 1))
 
+    def advise(self, ids: torch.Tensor):
+        """
+        Hint: ids (1, n) are the last tokens of a sequence, the final one being a token whose forward is
+        coming (a sampled or drafted token). Starts the read-ahead of its n-gram rows (see
+        NGramEmbedding.advise); shorter than the carried context is eos-padded, as a new sequence is.
+        """
+        ids = self._prepare_ids(ids)
+        need = self.ple_embedding.context_len + 1
+        if ids.shape[-1] < need:
+            pad = ids.new_full((ids.shape[0], need - ids.shape[-1]), self.ple_embedding.eos_token_id)
+            ids = torch.cat((pad, ids), dim = 1)
+        self.ple_embedding.advise(ids[:, -need:], 1)
+
     @override
     def prepare_for_device(self, x: torch.Tensor, params: dict) -> torch.Tensor:
         # A deferred mHC apply lands before its streams move to another device (as TransformerBlock)

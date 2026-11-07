@@ -33,6 +33,15 @@ INLINE_MAX_ROWS = 16        # rows of a table that gets read-ahead hints, below 
 # Before a large gather from disk, ask the kernel for every row at once (posix_fadvise WILLNEED) so the device
 # sees a deep queue of random reads instead of the gather threads' few outstanding ones (slow SATA/USB SSDs)
 FADVISE_ALL = os.environ.get("EXL3_NGRAM_FADVISE_ALL", "0") != "0"
+ADVISE_THREAD = os.environ.get("EXL3_ROW_ADVISE_THREAD", "1") != "0"   # issue advise() read-ahead hints on a worker
+
+
+def _advise_rows(work: list):
+    for fd, off, nbytes in work:
+        try:
+            os.posix_fadvise(fd, off, nbytes, os.POSIX_FADV_WILLNEED)
+        except OSError:
+            pass            # a hint; a closed handle (table unloaded meanwhile) or odd filesystem is not an error
 
 
 class _PinSet:
@@ -76,6 +85,7 @@ class RowTable:
         self._pins = []             # pinned staging sets (see _PinSet)
         self._pending = []          # queued prefetches, oldest first: {"ids", "pin", "future"}
         self._executor = None
+        self._advise_exec = None    # worker for advise()'s fadvise syscalls
         self.prefetch_stats = {"hit": 0, "miss": 0, "retired": 0}
         self.hinted = False         # the owner announces rows ahead of their lookup (advise())
 
@@ -219,13 +229,24 @@ class RowTable:
         if not self.on_disk or not hasattr(os, "posix_fadvise"):
             return
         self.hinted = True
+        # Each WILLNEED submits a read and blocks while the device queue is full (~0.1 ms a row on a disk that serves
+        # random reads one at a time): 16 rows cost 1+ ms on the caller. The syscalls release the GIL, so a worker
+        # thread issues them and the decode thread goes on. (Opening the shard handles stays here: not thread-safe.)
+        work = []
         for uid in uids:
             if not 0 <= uid < self.num_rows:
                 continue            # (multimodal placeholder ids have no row)
             s, local = divmod(uid, self.rows_per_shard)
             h = self.stores[s]
-            os.posix_fadvise(h._ensure_open(), h.abs_offset + local * h.row_bytes, h.row_bytes,
-                             os.POSIX_FADV_WILLNEED)
+            work.append((h._ensure_open(), h.abs_offset + local * h.row_bytes, h.row_bytes))
+        if not work:
+            return
+        if ADVISE_THREAD:
+            if self._advise_exec is None:
+                self._advise_exec = ThreadPoolExecutor(max_workers = 1, thread_name_prefix = "row_advise")
+            self._advise_exec.submit(_advise_rows, work)
+        else:
+            _advise_rows(work)
 
     def drain_prefetch(self):
         for e in list(self._pending):

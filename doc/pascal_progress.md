@@ -398,6 +398,24 @@ first-300-token decode. All runs `-gs 4.0,15.0 -cs 24576 -cq 4 -mcs 256`, P100 a
   not the grid or the launch.
 - Next: count instructions per weight in the m = 1 5 bpw path (SASS / ncu if available) and look for a cheaper decode.
 
+### Qwen3.8-Flash-Next: decode, where the time goes (Nov 7)
+
+- GEMV 5 bpw on the P100: ~9 us fixed + decode/ALU bound (~170 GB/s, ~11.7 SASS instr per weight; time per weight constant over
+  K = 2..4); MoE `coop_d` runs at the same weights/s. Step with MTP (m = 4): `coop_d` 34%, GEMV ~16%, gated residual (`gr_*`) 13%.
+  gr pair on the P100 (cold tables): 35 / 41 / 49 / 57 us at R = 1..4, near the bandwidth floor at R <= 2; fusing launches would
+  gain < 3%. The P100 has ~1000 kernels per step but gaps < 20 us total only ~1.7 ms; its ~26 ms/step of idle is the RTX 2060's layers
+  (~15 ms, the two GPUs run in pipeline, the 2060 is slower per layer) plus ~11 ms of host work.
+- Decode-time n-gram reads: one lookup per verification step, ~64 rows, 3-9 ms of the main thread (~10% of the step). The SSD
+  serves random reads one at a time, ~0.27 ms each even with 64 threads (rand_read2.py), so only the number of cold rows matters.
+  `posix_fadvise` 30 ms ahead cuts a cold decode lookup from 12 ms to 0.23 ms in isolation. Wired into the generator
+  (`EXL3_NGRAM_ADVISE=1`: leading token after a verification, each drafted token as its pinned copy lands): lookups drop to 0.32 ms
+  in the runs that use it, but the time per verification round does not improve (94.4 vs 97.1 ms inline with fadvise on the
+  main thread, 97.5 vs 92.3 with the syscalls on a worker: hints land late there) and an inline advise call costs 0.6-1.9 ms.
+  **Default off.** Also learned: two identical runs (same prompt, greedy, same settings) already differ in text and acceptance
+  (the CPU expert placement is dynamic), so single t/s numbers move +-10%; compare ms per round over >= 6 runs.
+- CPU side: `-mcs` 256 -> 352 (CPU experts 50% -> 69%) leaves decode unchanged, so the AVX2 MoE kernels are not on the decode
+  critical path (the 5800X has no AVX-512; the AVX2 tier is a dedicated implementation, not scalar).
+
 ### Qwen3.8-Flash-Next: long context (Nov 7)
 
 - KV cost is small (12 attention layers x 2 KV heads x 256 dims, 4 bit: ~6-7 KB/token): 131k ~0.9 GB, 262k ~1.8 GB. The limit is

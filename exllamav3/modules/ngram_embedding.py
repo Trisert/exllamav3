@@ -359,6 +359,28 @@ class NGramEmbedding(Module):
         if n >= PREFETCH_MIN_TOKENS:
             self.table.prefetch(history, n * self.num_heads, self._resolve)
 
+    def advise(self, history: torch.Tensor, out_len: int = 1):
+        """
+        Hint only: ask the OS to read ahead the table rows a forward over `history` (1 x (context + out_len)
+        ids, CPU) will look up. Decode reads a handful of random rows per step from a disk that serves
+        random reads one at a time (~0.3 ms each), so announcing them while the host waits for the GPU
+        hides that latency. A wrong or late hint costs nothing.
+        """
+        if self.table is None or not self.table.on_disk:
+            return
+        # The C++ hash (GIL released, ~20 us) with persistent scratch buffers: the torch reference costs ~1 ms a call
+        n = history.shape[0] * out_len * self.num_heads
+        scratch = getattr(self, "_advise_scratch", None)
+        if scratch is None or scratch[0].numel() < n:
+            scratch = self._advise_scratch = (
+                torch.empty(n, dtype = torch.int64), torch.empty(n, dtype = torch.int64), torch.empty(n, dtype = torch.int32))
+        uids, inverse, heads = scratch
+        U = ext.ngram_hash_cpu(
+            history.to("cpu", torch.int64).contiguous(), out_len,
+            self.layer_multipliers, self.head_offsets, self.head_vocab_sizes,
+            self.heads_per_ngram, self.eos_token_id, uids, inverse, heads)
+        self.table.advise(uids[:U].tolist())
+
     @override
     def forward(
         self,
