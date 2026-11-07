@@ -350,6 +350,38 @@ not byte-bound, so the floor is not reachable; m = 1 costs ~17 us per expert, an
   `-sdh 0 / 8192 / 32768`, `-dc`. With 1.8 tokens per step on prose, `-ndt 1` is the likely prose winner.
 - `bench_chat` now prints tokens per step ((new - 1) / (new - 1 - accepted)) and the sparse-head miss rate / mode.
 
+### Qwen3.8-Flash-Next: prefill under the agentic workload (Nov 7, branch `flash-ngram-prefetch`)
+
+Context: the user reopened Flash-Next for general agentic use, mainly code, so prefill and long context matter more than the
+first-300-token decode. All runs `-gs 4.0,15.0 -cs 24576 -cq 4 -mcs 256`, P100 at 1328 MHz, 54-76 C.
+
+- **Prefill baseline** (`examples/bench_prefill.py`): 2k 170 t/s, 8k 199, 16k 183 (spread 11-16% between repeats). A 10-load
+  sweep of `EXL3_MOE_STREAM_T` (4/16/32), `EXL3_MOE_STREAM_BATCH_EXPERTS` (12/48), `EXL3_MOE_CPU_STAGE_THREADS` (2/8) and
+  `-mcpa` against two defaults found **no knob that beats the default**: the first load of a session ran 175/188 t/s (cold),
+  every later load, including a repeat of the default, 224-259 t/s at 4096/8192 tokens. Only `STAGE_THREADS=2` was slower
+  (176/199). The 170-199 t/s baselines of the earlier measurements were cold first loads.
+- **Decode by context depth** (`-mtp -ndt 3 -sdh 16384`, greedy, repository code + a request): the step cost does not grow
+  with context up to 22k (93-116 ms per step); the t/s drop from 33 (short prompt, 86% drafts accepted) to 21-28 comes from
+  the acceptance (48-54%) on prose-like answers, not from depth. Prefill 205 t/s at 8k, 210 at 16k, 184 at 22k (120 s);
+  a second turn on the same prefix re-processed 1553 of 22033 tokens in 8 s.
+- **Where the prefill time goes** (torch.profiler trace of a 4096-token prefill, 23.5 s): the two GPUs run kernels together
+  for only 13.1 s; 8.2 s have no kernel on any device, in two gaps (4.5 s at the start, 3.2 s at the start of the second
+  2048-token chunk). Stack sampling of the main thread puts both in `row_table.lookup` waiting on the n-gram row prefetch
+  (random 62-byte reads from the USB SSD; ~2 ms per token), i.e. 34% of the prefill. Per-device kernel time (P100):
+  `exl3_moe_kernel<1,..,16,true>` 3.3 s, hfma2 GEMM 2.3 s, pinned->device copies 1.1 s, hgemm/sgemm fallbacks ~1.2 s.
+- **Prefetch of the next chunk's n-gram rows** (`358cbdf7`): `Job.prefill` passes the ids of the following chunk in
+  `params["ple_prefetch_next"]` and `PLELayer.prefetch` queues them right behind the current chunk's, so they are staged
+  while the current chunk runs (`EXL3_NGRAM_PREFETCH_AHEAD`, default on). Generated text identical. Six cold ABBA pairs
+  (4096-token prompts never read before, one load, `ab_ahead.py`): off 22.06 / 22.11 / 22.60 / 22.42 / 23.39 / 25.09 s,
+  on 19.53 / 18.80 / 18.93 / 22.22 / 22.64 / 21.27 s; **mean 22.95 -> 20.57 s (-2.4 s, -10%)**, better in 6 of 6 pairs but
+  from -0.2 to -3.8 s. The wait of the second chunk goes from 2.4-3.1 s to 0.00 s in the runs that gain; in two runs the
+  time saved on the wait did not show in the total (CPU contention with the expert worker is the suspect, not checked).
+  The first chunk still stalls ~3.3-4 s, nothing to overlap it with.
+- `EXL3_NGRAM_FADVISE_ALL=1` (WILLNEED on every row before a large gather): -12% lookup time in isolation (1.29 -> 1.14 s,
+  12 trials each, inside the noise); left off. `EXL3_NGRAM_DEBUG=1` prints the wait of every large lookup.
+- Next: progressive first chunks (256, 512, 1024, 2048) so the lookup of chunk k+1 always overlaps chunk k (exposed stall ~4 s ->
+  ~0.5 s); `EXL3_MOE_FUSED_ROWS` sweep on the P100; GEMV 5 bpw grid fill for decode (wave quantisation hypothesis).
+
 ## Qwen3.8-27B (dense) stage 0
 
 Nov 5, branch `dense27-stage0` (= `flash-fix-ndt` c5145bcb, same `.so`; only `bench_chat -cool` added). Model
