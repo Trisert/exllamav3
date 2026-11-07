@@ -371,8 +371,15 @@ first-300-token decode. All runs `-gs 4.0,15.0 -cs 24576 -cq 4 -mcs 256`, P100 a
   `exl3_moe_kernel<1,..,16,true>` 3.3 s, hfma2 GEMM 2.3 s, pinned->device copies 1.1 s, hgemm/sgemm fallbacks ~1.2 s.
 - **Prefetch of the next chunk's n-gram rows** (`358cbdf7`): `Job.prefill` passes the ids of the following chunk in
   `params["ple_prefetch_next"]` and `PLELayer.prefetch` queues them right behind the current chunk's, so they are staged
-  while the current chunk runs (`EXL3_NGRAM_PREFETCH_AHEAD`, default on). Generated text identical. Six cold ABBA pairs
-  (4096-token prompts never read before, one load, `ab_ahead.py`): off 22.06 / 22.11 / 22.60 / 22.42 / 23.39 / 25.09 s,
+  while the current chunk runs (`EXL3_NGRAM_PREFETCH_AHEAD`, default on). Generated text identical. **Erratum (Opus review, checked
+  against `ab_ahead.log` / `ab_ahead2.log`): these were six off-then-on pairs, always in that order, each mode on its own
+  prompt (offsets 400000.. in steps of 10000), not ABBA; the pairs come from two loads and the second load re-used the first
+  load's offsets (400000-450000), so about half of the "cold" prompts had their rows in the page cache already. The prefetch
+  stats show `hit` unchanged at 2 and `retired` 1 in every "on" run: the staged entry for the next chunk is never the one the
+  next forward asks for (the real chunks are 2048 / 1792 / 255 tokens, the prediction used 2047), so the gain, if real, is the
+  page-cache warming of the rows the two chunks share, not a used prefetch. Treat the -10% as unproven (n = 6, confounded).**
+  Six cold pairs
+  (4096-token prompts, `ab_ahead.py`): off 22.06 / 22.11 / 22.60 / 22.42 / 23.39 / 25.09 s,
   on 19.53 / 18.80 / 18.93 / 22.22 / 22.64 / 21.27 s; **mean 22.95 -> 20.57 s (-2.4 s, -10%)**, better in 6 of 6 pairs but
   from -0.2 to -3.8 s. The wait of the second chunk goes from 2.4-3.1 s to 0.00 s in the runs that gain; in two runs the
   time saved on the wait did not show in the total (CPU contention with the expert worker is the suspect, not checked).
