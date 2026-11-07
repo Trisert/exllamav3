@@ -398,6 +398,18 @@ first-300-token decode. All runs `-gs 4.0,15.0 -cs 24576 -cq 4 -mcs 256`, P100 a
   not the grid or the launch.
 - Next: count instructions per weight in the m = 1 5 bpw path (SASS / ncu if available) and look for a cheaper decode.
 
+### Qwen3.8-Flash-Next: long context (Nov 7)
+
+- KV cost is small (12 attention layers x 2 KV heads x 256 dims, 4 bit: ~6-7 KB/token): 131k ~0.9 GB, 262k ~1.8 GB. The limit is
+  VRAM left on the P100 after the weights: `-gs 4.0,15.0 -cs 131072` and `-gs 4.0,15.8 -cs 131072 -mcs 256` fail ("Insufficient VRAM",
+  the last layer is ~160 MiB short); `-gs 5.0,14.0` / `4.5,14.5` also fail (the P100 needs >= 15 GB; CUDA device 0 is the RTX 2060).
+- Loads and decodes at the same speed as the default (bench_chat, two 400-token turns): `-gs 4.0,15.8 -cs 131072 -mcs 272` 42.2 t/s,
+  `-mcs 288` 44.0, `-cs 262144 -mcs 320` 44.0, `-mcs 352` 44.0 (default `-cs 24576 -mcs 256`: 39.2 / 43.1 / 44.8 over three loads).
+- `-gs 4.0,15.8 -cs 262144 -mcs 320 -cq 4 -mtp -ndt 3 -sdh 16384` (bench_depth, code corpus, greedy): prefill 65k 332 s (197 t/s),
+  131k 719 s (182 t/s), 250k 1429 s (175 t/s); decode 18.3 / 21.3 / 17.6 t/s with draft acceptance 58 / 56 / 51% (short chat 46.6 t/s, 82%);
+  re-asking at 250k reuses the prefix (3.2 s prefill, 20.9 t/s). P100 reaches 78-79 C and 1189 MHz during the long prefills.
+  Decode is flat from 65k to 250k, so the drop against short chat comes from acceptance/content and the heat, not from context length.
+
 ## Qwen3.8-27B (dense) stage 0
 
 Nov 5, branch `dense27-stage0` (= `flash-fix-ndt` c5145bcb, same `.so`; only `bench_chat -cool` added). Model
