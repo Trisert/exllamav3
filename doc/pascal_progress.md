@@ -769,6 +769,12 @@ MTP settings (35B, two prompts, 160 W): `-ndt 1` is the safe choice (57.3 t/s); 
 
 ## Ruled out (measured)
 
+- (Nov 7) Narrow / wide config of the EXL3 4 bpw GEMV for Ornith's projections on the P100 (`hgemv_bench/bench_exl3_gemv.py`, forced with
+  `EXL3_GEMV=3/4`, m = 2): 4096x2048 narrow 42.9 / wide 41.0 us (heuristic picks narrow), 2048x4096 33.7 / 38.1, 2048x8192 54.0 / 54.6,
+  2048x12288 73.4 / 71.7; the heuristic is within 5% of the best everywhere, so re-picking configs saves ~0.06 ms per iteration
+  (32 o_proj calls), not the 0.8-1.5 ms estimated. Small shapes cost a fixed ~15 us per launch (2048x512 and 2048x1024 both 16 us at
+  m = 2), i.e. launch count, not geometry; only fusing projections (k / v, router) could help, at most ~0.3-0.5 ms.
+
 - (Nov 7) Batched sampling of the verify positions with a presence penalty (position i sampled with committed ids + draft[:i], so
   a job with `reqs_past_ids` joins the one-synchronize batch path in `iterate_gen`): no gain at the serving config
   (Ornith 4 bpw, `-ndt 1 -sdh 16384`, sampling, `-cool 62`, ABAB, seed 1): old 82.87 / 83.90 t/s, new 82.05 / 83.18 (-0.8 each pair).
