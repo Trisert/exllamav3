@@ -379,8 +379,11 @@ first-300-token decode. All runs `-gs 4.0,15.0 -cs 24576 -cq 4 -mcs 256`, P100 a
   The first chunk still stalls ~3.3-4 s, nothing to overlap it with.
 - `EXL3_NGRAM_FADVISE_ALL=1` (WILLNEED on every row before a large gather): -12% lookup time in isolation (1.29 -> 1.14 s,
   12 trials each, inside the noise); left off. `EXL3_NGRAM_DEBUG=1` prints the wait of every large lookup.
-- Next: progressive first chunks (256, 512, 1024, 2048) so the lookup of chunk k+1 always overlaps chunk k (exposed stall ~4 s ->
-  ~0.5 s); `EXL3_MOE_FUSED_ROWS` sweep on the P100; GEMV 5 bpw grid fill for decode (wave quantisation hypothesis).
+- Ruled out: progressive first chunks (first chunk 256 or 512 tokens, doubling, so the lookup of chunk k+1 overlaps chunk k).
+  Generated text identical, but 4 rounds x 3 modes of cold 4096-token prompts (distinct offsets, page table reset) give mean
+  base 20.4 s, 256-first 20.3 s, 512-first 20.8 s; cold-prompt spread for one mode is 16.6-22.2 s, larger than any difference.
+  Code reverted (not committed).
+- Next: `EXL3_MOE_FUSED_ROWS` sweep on the P100; GEMV 5 bpw grid fill for decode (wave quantisation hypothesis).
 
 ## Qwen3.8-27B (dense) stage 0
 
