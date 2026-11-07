@@ -383,7 +383,14 @@ first-300-token decode. All runs `-gs 4.0,15.0 -cs 24576 -cq 4 -mcs 256`, P100 a
   Generated text identical, but 4 rounds x 3 modes of cold 4096-token prompts (distinct offsets, page table reset) give mean
   base 20.4 s, 256-first 20.3 s, 512-first 20.8 s; cold-prompt spread for one mode is 16.6-22.2 s, larger than any difference.
   Code reverted (not committed).
-- Next: `EXL3_MOE_FUSED_ROWS` sweep on the P100; GEMV 5 bpw grid fill for decode (wave quantisation hypothesis).
+- `EXL3_MOE_FUSED_ROWS` sweep (P100 uses the plain value, wide tiles need cc >= 7.0), 4096-token cold prompts, 3 per load,
+  two loads per value: 64 -> 269 / 234 t/s, 128 (default) -> 225 / 257, 256 -> 255 / 248 (warm-up load 226). The spread
+  between two loads of the same value (up to 35 t/s) exceeds the difference between values: default kept.
+- Decode GEMV, 5 bpw mul1 on the P100 (`util/bench_gemv_decode.py`, m = 1 and 4 are the same speed): 28-146 us per call,
+  i.e. 112-150 GB/s of trellis bytes against ~480 GB/s achievable. 2560x2048 still takes 28 us for 3.3 MB, so a fixed cost of
+  ~20 us per call (cooperative launch, in-kernel input Hadamard) dominates the small shapes; 2560x10240 is the worst
+  (112 GB/s). Wave quantisation alone does not explain a 3-4x gap; next is to split fixed cost from streaming time.
+- Next: GEMV fixed-cost vs streaming split (time the kernel with a zero-size K loop / nsys), then grid fill if it matters.
 
 ## Qwen3.8-27B (dense) stage 0
 
