@@ -416,6 +416,15 @@ first-300-token decode. All runs `-gs 4.0,15.0 -cs 24576 -cq 4 -mcs 256`, P100 a
 - CPU side: `-mcs` 256 -> 352 (CPU experts 50% -> 69%) leaves decode unchanged, so the AVX2 MoE kernels are not on the decode
   critical path (the 5800X has no AVX-512; the AVX2 tier is a dedicated implementation, not scalar).
 
+- Hybrid drafting (`-hdt N`, suffix-match continuation on top of MTP) on a copy-heavy agentic turn (a ~7000-char source excerpt in the
+  prompt, "reproduce it with one function renamed", 500 greedy tokens, `-mtp -ndt 3`, `bench_rewrite.py`, one load, modes alternated,
+  4 rounds): baseline 42.5 t/s (MTP alone already accepts 373/381 drafted tokens there, capped by the 3-token window);
+  `-hdt 3` 41.7 (same window), `-hdt 5` 41.7 (30.8 on its first use of a new row count, 43.5-47.9 after), **`-hdt 7` 49.0 (39.6 on
+  the first use, then 49.6-53.8, about +22%)**; `-hdt 12` 38.3 (more than 8 rows per verification leaves the m <= 8 GEMV path).
+  Free-form chat prompts (no copying, acceptance ~70%): baseline 34.3, hdt 3 35.1, hdt 5 33.9, hdt 7 32.8 t/s, all inside the +-10% run
+  noise, so no visible cost. Recommended for code-editing workloads: `-hdt 7` (8 rows per verification). A larger gain needs
+  the GEMV/MoE paths to take m = 9..16 rows (EXL3_GEMV_MAX_M is 8).
+
 ### Qwen3.8-Flash-Next: long context (Nov 7)
 
 - KV cost is small (12 attention layers x 2 KV heads x 256 dims, 4 bit: ~6-7 KB/token): 131k ~0.9 GB, 262k ~1.8 GB. The limit is
