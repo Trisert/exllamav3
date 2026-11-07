@@ -924,3 +924,23 @@ tokens); the MTP run with `-cs 262144` failed with `CUDA error: out of memory` i
 475 MiB of desktop processes (Chromium and others); the cause was not isolated (desktop memory on the 6 GB card, the persistent MoE
 scratch, or the context size) and the model was deleted afterwards, so the question is open. Ling-type models, which hit the same
 absorb limit, were not retried.
+
+## Ornith decode step at the serving config (Nov 7, profiler, P100 + 2060)
+
+`-ndt 1 -sdh 16384`, card sampling (temp 0.7, top-p 0.8, top-k 20, presence 1.5), 4 bpw, script `ornith_prof.py` (copy of the Stage 0
+profile). Unprofiled: 22.4 ms per MTP iteration, 1.70 tokens per iteration, 75.7 t/s. Profiled GPU busy time per iteration: P100 19.5 ms
+(515 kernels), 2060 4.8 ms (156 kernels); the two add up to about the wall time, so launch gaps are no longer a large part of the step.
+
+| P100, ms/iter | kernel |
+| ---: | :--- |
+| 6.88 | `exl3_moe_coop_d_kernel` (31 layers, 215 us per layer at m = 2) |
+| 2.45 + 1.61 + 0.52 + 0.33 | EXL3 4 bpw GEMV (projections, shared expert) |
+| 1.65 | `exl3_moe_kernel` (0.6 calls per iteration: rounds with more rows) |
+| 1.29 | 6 bpw GEMV (lm_head, sparse head not used for verification) |
+| 0.71 / 0.67 / 0.59 | GatedDeltaNet recurrence / paged attention (split + combine) / fp16 hgemv |
+
+The 2060 spends 2.08 ms in the same MoE kernel (9 layers) and 0.9 ms in EXL3 GEMV. MoE is about 40% of the step on both cards.
+A MoE layer at m = 2 reads 16 distinct experts x 3 matrices (~25 MB of 4 bpw weights): 215 us is ~115 GB/s against ~550 GB/s
+available, ~116 G weights/s against an ALU ceiling of ~400 G weights/s (11.7 SASS instructions per weight on 56 SMs x 64 lanes).
+The step is therefore bound by dequantisation and by work distribution inside the MoE kernel, not by launch gaps: a whole-step
+megakernel would remove at most the ~1-2 ms of gaps and none of the dequant cost.
