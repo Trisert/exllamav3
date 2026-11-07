@@ -938,6 +938,26 @@ tokens); the MTP run with `-cs 262144` failed with `CUDA error: out of memory` i
 scratch, or the context size) and the model was deleted afterwards, so the question is open. Ling-type models, which hit the same
 absorb limit, were not retried.
 
+## MoE `coop_d`: per-item trace and two blocks per SM (Nov 7)
+
+`EXL3_MOE_TRACE=1` makes the dual kernel record one entry per queue item (globaltimer start / end, SM, kind, block, item, end of the wait on
+the A stage, end of the GEMV tile); `ext.exl3_moe_coop_trace_dump(device)` returns them. Scripts in `tests/kernels/moe/coop_trace/`
+(`trace_decode.py` runs the serving config, `analyze.py` splits the records into kernel calls: a call ends when no record is still running).
+Ornith 4 bpw, 16 slots (m = 2), per kernel call before the change:
+
+- wall 225 us on the P100 (56 blocks of 512 threads, one per SM: 128 registers each), 238 us on the 2060 (30 blocks); blocks are busy 95% of the
+  time (less than 12 us per call with fewer than half of them running), so the queue order is not the problem.
+- per block, P100: routed gate/up 90 us GEMV + 12 us epilogue, routed down 13 us wait for the A stage + 44 us GEMV + 16 us epilogue, shared
+  expert 36 us (not decomposed). The GEMV core runs at ~6.8 G weights/s per SM in every phase (12-13 issue slots per weight against ~8 in the
+  SASS), so fixed per-item costs (ramp, cross-warp reduction, completion counters, fences) are ~40 of the 225 us.
+- Fix: 256-thread blocks (`MOE_COOP_THREADS` 256, `WK` = 8 warps, `__launch_bounds__(256, 2)`, still 128 registers per thread), so two items
+  per SM overlap each other's ramp / epilogue / wait. Kernel call: P100 225 -> 209 us, 2060 238 -> 187 us. The k-split across warps is
+  halved, so the fp32 summation order changes (not bit-identical; `tests/kernels/moe`: 368 passed).
+- End to end, `-ndt 1 -sdh 16384`, sampling, `-cool 62`, ABAB, ms per step (tokens per step / t/s): old 22.53 / 22.55 / 22.55 / 22.71, new 21.97 /
+  21.92 / 22.02 / 21.90, i.e. **-0.63 ms per step (-2.8%)**, 83.3-83.6 -> 83.9-84.9 t/s (acceptance differs between the two because the
+  sampled text diverges, so compare ms per step, not t/s).
+- 128-thread blocks (4 per SM) fail `test_batch_extremes` (CUDA error): some part of the kernel assumes at least 8 warps. Not pursued.
+
 ## Ornith decode step at the serving config (Nov 7, profiler, P100 + 2060)
 
 `-ndt 1 -sdh 16384`, card sampling (temp 0.7, top-p 0.8, top-k 20, presence 1.5), 4 bpw, script `ornith_prof.py` (copy of the Stage 0

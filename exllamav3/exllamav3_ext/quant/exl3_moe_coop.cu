@@ -311,6 +311,42 @@ static MoeCoopKernel moe_coop_kernel_d(float K_r, float K_s, int cb, int Hi)
     }
 }
 
+static unsigned long long*& moe_coop_trace_slot(int device)
+{
+    static unsigned long long* bufs[MAX_DEVICES] = {};
+    return bufs[device];
+}
+
+// EXL3_MOE_TRACE=1: per-device buffer of per-item records of the dual kernel (see exl3_moe_coop_d_kernel), read per call
+static unsigned long long* moe_coop_trace_buf(int device)
+{
+    const char* env = std::getenv("EXL3_MOE_TRACE");
+    if (!env || std::atoi(env) == 0) return nullptr;
+    unsigned long long*& buf = moe_coop_trace_slot(device);
+    if (!buf)
+    {
+        cuda_check(cudaMalloc(&buf, sizeof(unsigned long long) * (4 + 4 * 1000000)));
+        cuda_check(cudaMemset(buf, 0, sizeof(unsigned long long) * 4));
+    }
+    return buf;
+}
+
+// Copy the records of one device out (n x 4 int64: t0, t1, meta, 0) and reset its counter
+at::Tensor exl3_moe_coop_trace_dump(int64_t device)
+{
+    unsigned long long* buf = moe_coop_trace_slot((int) device);
+    if (!buf) return at::empty({0, 4}, at::TensorOptions().dtype(at::kLong));
+    cudaSetDevice((int) device);
+    cuda_check(cudaDeviceSynchronize());
+    unsigned long long n = 0;
+    cuda_check(cudaMemcpy(&n, buf, sizeof(n), cudaMemcpyDeviceToHost));
+    if (n > 1000000) n = 1000000;
+    at::Tensor t = at::empty({(int64_t) n, 4}, at::TensorOptions().dtype(at::kLong));
+    if (n) cuda_check(cudaMemcpy(t.data_ptr(), buf + 4, n * 4 * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+    cuda_check(cudaMemset(buf, 0, sizeof(unsigned long long)));
+    return t;
+}
+
 void exl3_moe_coop_launch_pair
 (
     const MoeCoopParams& p_in, float K_gu, float K_d, int cb,
@@ -368,6 +404,7 @@ void exl3_moe_coop_launch_pair
         if (ps.a_global) moe_coop_rot(ps, stream);
         if (p.a_global) moe_coop_rot(p, stream);
     }
+    p.trace = moe_coop_trace_buf(device);
     void* args[] = { (void*) &p, (void*) &ps };
     const int grid = std::min(resident, pl.grid_a + pl.grid_b + pls.grid_a + pls.grid_b);
     cuda_check(cudaLaunchKernel(kd.kernel, dim3(grid), dim3(MOE_COOP_THREADS), args, kd.smem, stream));
