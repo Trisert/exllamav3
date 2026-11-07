@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 import torch
 from ..loader.safetensors import DiskTensorHandle
@@ -25,8 +26,13 @@ writer waits on it before reusing the buffers.
 
 PREFETCH_ENABLED = os.environ.get("EXL3_NGRAM_PREFETCH", "1") != "0"   # debug/A-B switch
 PREFETCH_MIN_TOKENS = 256   # positions (bsz * seq) below which prefetch() declines (decode-sized)
-MAX_PIN_SETS = 2            # staging sets: one with the last forward's uploads in flight, one being staged
+DEBUG = os.environ.get("EXL3_NGRAM_DEBUG", "0") != "0"   # print the wait of every large lookup
+PREFETCH_AHEAD = os.environ.get("EXL3_NGRAM_PREFETCH_AHEAD", "1") != "0"   # stage the next prefill chunk's rows too
+MAX_PIN_SETS = 2           # staging sets: one with the last forward's uploads in flight, one being staged
 INLINE_MAX_ROWS = 16        # rows of a table that gets read-ahead hints, below which a gather reads in line
+# Before a large gather from disk, ask the kernel for every row at once (posix_fadvise WILLNEED) so the device
+# sees a deep queue of random reads instead of the gather threads' few outstanding ones (slow SATA/USB SSDs)
+FADVISE_ALL = os.environ.get("EXL3_NGRAM_FADVISE_ALL", "0") != "0"
 
 
 class _PinSet:
@@ -311,6 +317,12 @@ class RowTable:
                             ext.ngram_gather_cpu(store._ensure_open(), store.abs_offset,
                                                  store.row_bytes, uids[i : i + 1], base, out[i : i + 1])
                     else:
+                        if FADVISE_ALL and hasattr(os, "posix_fadvise"):
+                            fd = store._ensure_open()
+                            off0 = store.abs_offset
+                            rb = store.row_bytes
+                            for u in (seg - base).tolist():
+                                os.posix_fadvise(fd, off0 + u * rb, rb, os.POSIX_FADV_WILLNEED)
                         ext.ngram_gather_cpu(store._ensure_open(), store.abs_offset,
                                              store.row_bytes, seg.contiguous(), base, out[i0 : i1])
                 else:
@@ -375,7 +387,13 @@ class RowTable:
             self.prefetch_stats["miss"] += 1
             pin = self._acquire_pin(n)
         try:
+            if DEBUG:
+                t_dbg = time.time()
+                done_dbg = entry["future"].done() if entry is not None else None
             U, in_order = entry["future"].result() if entry is not None else self._stage(ids, pin, resolve, skip_read)
+            if DEBUG and n >= PREFETCH_MIN_TOKENS:
+                print(f" -- row_table {self.key[-24:]}: lookup n {n} {'prefetched' if entry is not None else 'inline'}"
+                      f"{' (already done)' if done_dbg else ''}, waited {time.time() - t_dbg:.2f} s", flush = True)
             out = decode(pin.packed[:U].to(device, non_blocking = True), pin, U)
             if not in_order:
                 out = out.index_select(0, pin.inverse[:n].to(device, non_blocking = True))

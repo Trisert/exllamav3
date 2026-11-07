@@ -588,6 +588,15 @@ class PLELayer(Module):
             return
         history, _, _ = self._state_history(self._prepare_ids(input_ids), params)
         self.ple_embedding.prefetch(history)
+        # The prefill loop knows the ids of the chunk after this one: queue its rows right behind this chunk's
+        # (the worker is a single thread, so this chunk's gather still goes first) and they are staged while this
+        # chunk's layers run, instead of stalling the next forward at its first layer. The history is the carried
+        # id context (the last ids of the prompt before the next chunk) plus the next ids, which is what the next
+        # forward builds from the state slots; a mismatch is simply not used
+        nxt = params.get("ple_prefetch_next")
+        if nxt is not None:
+            prev_ids, next_ids = nxt
+            self.ple_embedding.prefetch(torch.cat((self._prepare_ids(prev_ids), self._prepare_ids(next_ids)), dim = 1))
 
     @override
     def prepare_for_device(self, x: torch.Tensor, params: dict) -> torch.Tensor:

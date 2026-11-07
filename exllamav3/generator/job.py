@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .generator import Generator
 from ..constants import PAGE_SIZE
+from ..modules import row_table
 import numpy as np
 from .pagetable import Sequence, tensor_hash_checksum, random_hash
 from .filter import Filter
@@ -1589,6 +1590,20 @@ class Job:
                 }
                 if self.generator.draft_model:
                     params.update(self.generator.draft_model.draft_verifier_params)
+                # Models that stage input-dependent rows from disk (PLE n-gram table) can start reading the next
+                # chunk's rows while this chunk runs: hand them the ids that follow
+                model = self.generator.model
+                pf_layers = [] if model.loaded_tp else model._get_prefetch_layers
+                if pf_layers and row_table.PREFETCH_AHEAD:
+                    next_start = prefill_end
+                    next_end = (next_start + (chunk_size or self.generator.max_chunk_size)) // PAGE_SIZE * PAGE_SIZE
+                    next_end = min(next_end, len(seq.sequence_ids) - 1)
+                    ctx_len = pf_layers[0].ple_embedding.context_len
+                    if next_end > next_start and next_start >= ctx_len:
+                        params["ple_prefetch_next"] = (
+                            seq.sequence_ids.torch_slice(next_start - ctx_len, next_start),
+                            seq.sequence_ids.torch_slice(next_start, next_end),
+                        )
                 dm = self.generator.draft_model
                 if self.generator.mtp_draft and not (dm is not None and dm.caps.get("draft_uses_target_cache")):
                     # MTP needs the target's post-final-norm state for every prompt token.
