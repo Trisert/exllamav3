@@ -390,7 +390,13 @@ first-300-token decode. All runs `-gs 4.0,15.0 -cs 24576 -cq 4 -mcs 256`, P100 a
   i.e. 112-150 GB/s of trellis bytes against ~480 GB/s achievable. 2560x2048 still takes 28 us for 3.3 MB, so a fixed cost of
   ~20 us per call (cooperative launch, in-kernel input Hadamard) dominates the small shapes; 2560x10240 is the worst
   (112 GB/s). Wave quantisation alone does not explain a 3-4x gap; next is to split fixed cost from streaming time.
-- Next: GEMV fixed-cost vs streaming split (time the kernel with a zero-size K loop / nsys), then grid fill if it matters.
+- GEMV fixed cost vs streaming (k sweep at fixed n, m = 1): fixed cost ~9 us (k = 128: 9.7-10.4 us; two grid syncs plus the
+  Hadamards), not 20; asymptotic streaming 170 GB/s (n = 2560, k 2048 -> 8192: 172 GB/s; n = 10240, k 2048 -> 4096: 170 GB/s).
+  Same shape 4096 x 10240 at K = 2 / 3 / 4: 121 / 134 / 122 us, i.e. time per weight is constant while bytes per weight
+  double: the kernel is decode/ALU bound (~350 Gweights/s = ~4.7 weights per clock per SM), not memory bound. K = 5 is
+  slower again (162-226 us across runs, thermal spread). The lever is instructions per weight in the decode + HFMA2 path,
+  not the grid or the launch.
+- Next: count instructions per weight in the m = 1 5 bpw path (SASS / ncu if available) and look for a cheaper decode.
 
 ## Qwen3.8-27B (dense) stage 0
 
