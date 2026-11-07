@@ -769,6 +769,13 @@ MTP settings (35B, two prompts, 160 W): `-ndt 1` is the safe choice (57.3 t/s); 
 
 ## Ruled out (measured)
 
+- (Nov 7) Batched sampling of the verify positions with a presence penalty (position i sampled with committed ids + draft[:i], so
+  a job with `reqs_past_ids` joins the one-synchronize batch path in `iterate_gen`): no gain at the serving config
+  (Ornith 4 bpw, `-ndt 1 -sdh 16384`, sampling, `-cool 62`, ABAB, seed 1): old 82.87 / 83.90 t/s, new 82.05 / 83.18 (-0.8 each pair).
+  The sampler chain is not on the critical path at `-ndt 1`. Text cannot be compared byte for byte here: two runs of the unmodified
+  code already diverge (same byte, line 70), the engine is not deterministic between loads. Reverted. Baseline at that moment
+  (P100 cool): 81-86 t/s per turn, 1.83-1.95 tokens per step.
+
 - (Nov 7) HFMA2 form of the fp16 GEMV (`hgemv_f16.cu`; half2 accumulators, 32-term fp16 partials flushed to fp32, N 1024..32768):
   no speed change on any shape, P100, bench `tests/kernels/gemm/hgemv_bench/bench.py` (m = 1 / 2 / 4, GB/s): 2048x8192 493 -> 493 /
   465 -> 463 / 363 -> 368, 2048x4096 452 -> 450 / 408 -> 407, 4096x2048 444 -> 443 / 397 -> 396; relative error 2.6e-4 -> 8e-4.
