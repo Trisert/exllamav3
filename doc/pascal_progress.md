@@ -769,6 +769,16 @@ MTP settings (35B, two prompts, 160 W): `-ndt 1` is the safe choice (57.3 t/s); 
 
 ## Ruled out (measured)
 
+- (Nov 7) HFMA2 form of the fp16 GEMV (`hgemv_f16.cu`; half2 accumulators, 32-term fp16 partials flushed to fp32, N 1024..32768):
+  no speed change on any shape, P100, bench `tests/kernels/gemm/hgemv_bench/bench.py` (m = 1 / 2 / 4, GB/s): 2048x8192 493 -> 493 /
+  465 -> 463 / 363 -> 368, 2048x4096 452 -> 450 / 408 -> 407, 4096x2048 444 -> 443 / 397 -> 396; relative error 2.6e-4 -> 8e-4.
+  The kernel is not issue-bound (HFMA2 cuts the per-weight instructions about 3x). lm_head (2048x248320) runs at 579-591 GB/s, at
+  the HBM2 limit, so nothing there either. Reverted. The K split is already at its optimum: sweeping `ksplit` at m = 2 the
+  automatic choice is within 4% of the best value on every mid shape (72.4 vs 69.3 us, 40.3 vs 39.1, 41.1 vs 38.6). Small
+  shapes (2048x512, 512x2048: 10-12 us, 190-215 GB/s) are launch / reduction latency (their 2 MB weights also sit in the 4 MB
+  L2 in the bench), which points to CUDA graphs for Ornith's fp16 layers rather than a kernel change. `use-hfma2` is for the
+  issue-bound kernels (prefill GEMM), not for this one.
+
 - (Nov 3) Router GEMV + top-k fused into one launch (`EXL3_ROUTER_FUSED`): same kernel time in the model (29.1 vs 18.1 + 10.6
   us per layer at m = 2), end to end +0.25..0.66 ms/iter; the top-k latency (K serial warp-argmax rounds) stays on the critical
   path. A 256-wide bitonic sort in the same selection order in its place: 27 vs 18 us for the fused launch, slower.
