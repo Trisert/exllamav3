@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import torch
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -17,6 +18,19 @@ from ..util.tensor import SeqTensor
 from ..tokenizer import MMEmbedding
 from functools import lru_cache
 from ..util import profile_opt
+
+# Progressive first prefill chunks for models that stream a row table from disk (the PLE n-gram
+# table): the first chunk of a cold prompt is the one gather with nothing to overlap, and its
+# cost is linear in the rows the chunk touches (~300 us per cold random row on the USB SSD), so
+# start with one page and double up to the normal chunk size. Only the chunk boundaries of a
+# dedicated prefill change: page alignment, the token order and the forward semantics are the
+# same, and the later chunks' gathers then run behind the GPU work of the earlier ones.
+NGRAM_RAMP = os.environ.get("EXL3_NGRAM_RAMP", "1") != "0"
+NGRAM_RAMP_FIRST = max(PAGE_SIZE, int(os.environ.get("EXL3_NGRAM_RAMP_FIRST", str(PAGE_SIZE))))
+# Growth factor per chunk, rounded to whole pages. 1.5 costs one or two more (cheap) forwards and
+# keeps every chunk's gather inside the previous chunk's compute time; 2.0 reaches the full chunk
+# size sooner. Both start at one page.
+NGRAM_RAMP_GROW = max(1.0, float(os.environ.get("EXL3_NGRAM_RAMP_GROW", "2.0")))
 
 
 class NonFiniteLogits(RuntimeError):
@@ -1364,6 +1378,7 @@ class Job:
             self.corpus_cursor = generator.ngram_corpus.cursor() if generator.ngram_corpus else None
 
         self.time_enqueue = time.time()
+        self._ramp_next = None      # progressive first chunk size (see _ramp_gate)
 
         # Prepare MRoPE embeddings
         if self.embeddings and generator.model.caps.get("mrope"):
@@ -1391,6 +1406,56 @@ class Job:
         return new_pages
 
 
+    def _ramp_gate(self, chunk_size: int | None) -> bool:
+        """Whether this prefill should ramp its first chunks up: a dedicated prefill (no
+        generating job to share the GPU with) of a text model whose first layers stage table
+        rows from disk (PLE n-gram table), so the exposed first gather shrinks with the chunk."""
+        if not NGRAM_RAMP or chunk_size is not None:
+            return False
+        if self.embeddings:
+            return False        # multimodal chunking has its own span-exact boundaries
+        model = self.generator.model
+        if model.loaded_tp:
+            return False        # the TP prefill path does no row prefetch
+        return bool(model._get_prefetch_layers) and self.generator.max_chunk_size > NGRAM_RAMP_FIRST
+
+    def _ramp_peek(self, chunk_size: int | None) -> int:
+        """Cap for the chunk about to be ingested: the generator's shared chunk size when one is
+        given, the ramp's current size while it is still growing, else the full chunk size."""
+        if chunk_size is not None:
+            return chunk_size
+        if not self._ramp_gate(chunk_size):
+            return self.generator.max_chunk_size
+        if self._ramp_next is None:
+            self._ramp_next = min(NGRAM_RAMP_FIRST, self.generator.max_chunk_size)
+        return self._ramp_next
+
+    def _ramp_peek_next(self, chunk_size: int | None) -> int:
+        """Cap the chunk after the current one will use (the ramp doubles per chunk)."""
+        if chunk_size is not None:
+            return chunk_size
+        if not self._ramp_gate(chunk_size):
+            return self.generator.max_chunk_size
+        cur = self._ramp_peek(chunk_size)
+        grown = max(int(cur * NGRAM_RAMP_GROW) // PAGE_SIZE * PAGE_SIZE, cur + PAGE_SIZE)
+        return min(grown, self.generator.max_chunk_size)
+
+    def _next_chunk_end(self, seq, start: int, chunk_size: int | None) -> int:
+        """End position the prefill loop takes for the chunk after one ending at start: mirror of
+        its own bounds (page rounding, prompt end, recurrent last-page split) so the next chunk's
+        row prefetch is for exactly the ids the next forward will look up."""
+        end = min(
+            (start + self._ramp_peek_next(chunk_size)) // PAGE_SIZE * PAGE_SIZE,
+            len(seq.sequence_ids) - 1,
+        )
+        if self.generator.recurrent_cache is not None:
+            # the loop cuts a chunk that would straddle the last full page, so the final partial
+            # page is a forward of its own (a recurrent checkpoint at the generation boundary)
+            last_page_b = (len(seq.sequence_ids) - 1) // PAGE_SIZE * PAGE_SIZE
+            if start < last_page_b <= end:
+                end = last_page_b
+        return end
+
     def prefill(self, results: list, chunk_size: int | None = None):
         """
         Run prompt prefill chunks for already allocated cache pages.
@@ -1416,6 +1481,10 @@ class Job:
             cp_pos = self.recurrent_state.position if self.recurrent_state is not None else -1
 
             prefill_start = seq.kv_position
+            # Cap for this pass: the generator's shared chunk size when one is given, otherwise
+            # the progressive ramp's size while a cold prompt's first chunks grow, else the full
+            # max_chunk_size (see _ramp_peek)
+            chunk_cap = self._ramp_peek(chunk_size)
             prefill_end = seq.kv_position + self.generator.max_chunk_size
             prefill_end = (prefill_end // PAGE_SIZE) * PAGE_SIZE
             prefill_end = min(prefill_end, len(seq.sequence_ids) - 1)
@@ -1450,8 +1519,8 @@ class Job:
 
             # A reduced chunk bounds the forward pass only, after the cached pages were skipped over the full
             # window above, so a job resuming a cached prompt still walks it at the usual rate
-            if chunk_size is not None:
-                prefill_end = min(prefill_end, (prefill_start + chunk_size) // PAGE_SIZE * PAGE_SIZE)
+            if chunk_size is not None or chunk_cap < self.generator.max_chunk_size:
+                prefill_end = min(prefill_end, (prefill_start + chunk_cap) // PAGE_SIZE * PAGE_SIZE)
 
             if prefill_end <= prefill_start:
                 continue
@@ -1535,6 +1604,10 @@ class Job:
                         prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
                     break
 
+            if row_table.DEBUG:
+                print(f" -- prefill chunk {prefill_start}..{prefill_end} ({prefill_end - prefill_start} tok), "
+                      f"cap {chunk_cap}, ramp {self._ramp_next}", flush = True)
+
             # Inference
             if prefill_end > prefill_start:
 
@@ -1596,8 +1669,7 @@ class Job:
                 pf_layers = [] if model.loaded_tp else model._get_prefetch_layers
                 if pf_layers and row_table.PREFETCH_AHEAD:
                     next_start = prefill_end
-                    next_end = (next_start + (chunk_size or self.generator.max_chunk_size)) // PAGE_SIZE * PAGE_SIZE
-                    next_end = min(next_end, len(seq.sequence_ids) - 1)
+                    next_end = self._next_chunk_end(seq, next_start, chunk_size)
                     ctx_len = pf_layers[0].ple_embedding.context_len
                     if next_end > next_start and next_start >= ctx_len:
                         params["ple_prefetch_next"] = (
@@ -1614,6 +1686,10 @@ class Job:
                     # (A drafter fed the last decoder layer's output takes the regular prefill, which runs
                     # through that layer)
                     self.generator.model.prefill(input_ids = prefill_ids, params = params)
+
+                # The chunk is ingested: grow the progressive chunk size (EXL3_NGRAM_RAMP)
+                if self._ramp_gate(chunk_size):
+                    self._ramp_next = self._ramp_peek_next(chunk_size)
 
                 if self.generator.dflash_draft:
                     self.generator.draft_model.update_kv_from_target(
