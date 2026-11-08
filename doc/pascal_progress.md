@@ -1430,3 +1430,54 @@ A MoE layer at m = 2 reads 16 distinct experts x 3 matrices (~25 MB of 4 bpw wei
 available, ~116 G weights/s against an ALU ceiling of ~400 G weights/s (11.7 SASS instructions per weight on 56 SMs x 64 lanes).
 The step is therefore bound by dequantisation and by work distribution inside the MoE kernel, not by launch gaps: a whole-step
 megakernel would remove at most the ~1-2 ms of gaps and none of the dequant cost.
+
+## Ornith decode: host/launch overhead investigated; the step is GPU-bound (Nov 8, branch `ornith-graphs`)
+
+Investigated the non-graphed launch path and the ~1.6 ms/iter of host/idle in the Ornith serving config (22.38 ms/iter
+unprofiled, 1.68 tok/iter, P100 16.95 ms busy + 2060 3.82 ms, `-gs 4.0,15.0 -cs 32768 -cq 4 -mtp -ndt 1 -sdh 16384`), greedy and
+sampling. Tools: `tmp/ornith_host_prof.py` (one load, 300-token warm-up outside the window, wrappers on Tensor.to/.cpu/.copy_/.item
+and `cuda.synchronize` logging dtype/numel/device/callsite, plus cProfile and a chrome trace), `tmp/sync_timeline.py`,
+`tmp/idle_windows.py`; logs `tmp/host_prof_greedy.log`, `tmp/host_prof_diag2.log`.
+
+**Per-callsite, greedy (benchmark) path, per iteration:**
+- 1x `cuda.synchronize`, 13.0 ms of CPU: the batched-sampling sync (the GPU executes the draft+verify pipeline while the host
+  waits; necessary, not the target).
+- 24x `to(float32)` of the (1, 2, 2048) hidden state in `gated_delta_net.py:1322` (0.36 ms CPU) + 8x in `attn.py:637` (0.11 ms) +
+  a few in `gdn:1478`/`mlp:931`: ~0.6 ms of CPU launch time, one kernel per site. The fp16 sublayer outputs are widened to the fp32
+  residual stream (by design: `architecture/qwen3_5.py` builds these modules with `out_dtype = torch.float`).
+- 1.7x pageable 1-element int32 H2D (`attn.py:1112` `decode_flash_attn` -> `get_for_device`; a pageable source uploads with a
+  *synchronous* H2D that drains the target stream): 0.37 ms CPU, plus 0.1x to the other device 0.35 ms.
+- 1x 1-element D2H (draft-window pinned copy) 0.13 ms; 2x (sampled-token pinned stage) 0.06 ms.
+- 0.1x pageable 100 KB H2D + 1.6x 2 KB (`qwen3_5_mtp.py`: the CPU token-embedding path uploads its output pageably) 0.12 + 0.05 ms;
+  1.6x cross-GPU 2048 fp16 (MTP hidden state) 0.08 ms.
+- CUDA API totals: `cudaLaunchKernel` 308 x 4.5 us = 1.38 ms, `cudaGraphLaunch` 42 x 16.1 us = 0.67 ms (the 40 per-layer BC
+  graphs), `cudaStreamSynchronize` 6.3 x 128 us = 0.81 ms.
+- Idle structure: one post-sync host window of 0.31-0.35 ms (accept walk + `receive_sample` + bookkeeping) plus ~25 small gaps
+  >= 5 us; 1.2-1.4 ms unprofiled in total.
+
+**Three Python-only fixes, each A/B'd ABBA within one load (200-300 greedy tokens per run, `tmp/ornith_ab.py`):**
+1. Pinned staging of the pageable `cache_seqlens` in `Attention.decode_flash_attn` (attn.py): 22.86 vs 22.82 ms/iter (+0.2 %,
+   noise). **No gain**: the host waits there anyway because the next GPU work is already queued, so the 0.9 ms/iter of measured
+   "synchronous H2D" is a consequence of the host being ahead, not a delay of the GPU.
+2. Pinned staging of the MTP CPU-embedding uploads (`architecture/qwen3_5_mtp.py`): 22.54 vs 22.49 ms/iter (+0.2 %). **No gain.**
+3. fp16->fp32 widening fused into the residual add (attn.py / gated_delta_net.py / mlp.py return fp16 in decode and let the fp32
+   residual add convert): ms/iter 23.22 -> 22.89 (-1.4 %) but **t/s 76.0 -> 74.7 (-1.7 %)**. The arms differ in draft acceptance
+   (77.5/75.4 % off vs 74.4/67.6 % on), i.e. the ms/iter delta is explained by the ON arm doing less work per iteration, and the
+   acceptance change suggests the fused-norm path may not compute the mixed residual add in fp32. **Not shipped.** Text comparison
+   cannot arbitrate either: four runs of the same config produced four different md5s (the engine diverges between runs within a
+   load), so only the by-construction exactness argument exists and the acceptance drift contradicts it.
+   All three patches were reverted; the branch carries no Ornith code change.
+
+**Conclusion.** At this configuration the Ornith step is GPU-bound: 20.77 ms of the 22.38 ms wall is kernel time on two GPUs that
+run serially by layer order (the dependency chain leaves nothing to overlap), and the host/launch work (~2.0 ms of CPU) overlaps
+that time. The 1.6 ms idle is the post-sync host window plus small gaps, and the three staging/launch changes above do not move
+it; even in the best case graphs/launch elimination is worth ~0.3-0.4 ms here, below the -0.5 ms target. The remaining levers are
+kernel-side (MoE coop, EXL3 GEMV, lm_head, GDN/attention kernels) and GPU clocks: the RTX 2060 runs at 1365 MHz at decode load
+against 1815-1890 MHz under synthetic load, ~1 ms/iter of margin for a keep-alive.
+
+**Separate, for sampling configs** (`-presp`/repetition penalties): the MTP verify leaves the batched sampling path
+(`batchable` is false when `sampler.reqs_past_ids`) and runs two serial positions, each with a `.cpu()` readback of the sampled token
+(13.0 ms/iter of measured host *wait* in the `-presp` profile) plus a `prepare_sampling_past_ids` per accepted position. A batched
+variant is available - pre-launch all positions' samplers with the draft tokens written into the device past-ids buffer (exact for
+every position the accept walk can reach, because accepted ids equal the drafts), one pinned staging and one synchronize, then a
+host-only accept walk - but it was not implemented (time) and does not affect the greedy benchmark.
