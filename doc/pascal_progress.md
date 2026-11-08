@@ -1098,3 +1098,98 @@ avoids the expert-placement confound above). Trace tooling: `tmp/trace_analyze2.
 memcpy bytes and GB/s per kind), `tmp/trace_blocked.py` (blocked runtime calls correlated to their GPU activity and to the
 torch op that issued them), `tmp/copy_hist.py` (copy size histogram), `tmp/micro_copy.py` (is_pinned + copy_ vs raw
 `cudaMemcpyAsync` timing on both devices).
+### Qwen3.8-Flash-Next: the n-gram row stall is USB Bulk-Only latency; progressive first chunks (Nov 8, branch `flash-ngram-io`)
+
+**Where the stall is.** Re-measured on `flash-opt` + util (no profiler, `-mtp -ndt 3 -sdh 16384`, `-gs 4.0,15.0 -cs 24576 -cq 4 -mcs 256`, one load, cold
+4096/8192-token prompts at distinct corpus offsets, P100 71-78 C): a 4096-token prefill takes **21.43 s (191.1 t/s)** and a 8192-token
+one **36.08 s (227.1 t/s)**. Per-lookup accounting (hooks + `EXL3_NGRAM_DEBUG=1`) puts the *exposed* n-gram wait at **5.43 s** (4096; 25 %
+of the prefill) and **4.48 s** (8192): one whole first gather in each run (U 21.1 k / 17.5 k unique rows, 5.13 / 4.18 s on the prefetch
+worker) plus 0.39 s on the final 255-token chunk. The later 2048/1792-token chunks are already hidden: their prefetch runs on the worker
+while the previous chunk computes. Prefill-phase `_gather_rows`: 10 calls, 24.3 s total over the two runs (mean 2.4 s) - the table touches
+**9.7-11.5 unique rows per token** (16 lookups, the hash dedups the rest), i.e. ~50 k rows (~10 s of device time) per 4096-token prompt at
+170-240 us/row.
+
+**The device: queue depth 1, nothing to parallelize** (`util/bench_ngram_io.py`, `/sys/block/sdc/stat`,
+`/sys/block/sdc/device/queue_depth`). The model sits on a Kingston SA400 behind an ASM1051E USB-SATA bridge. The device is Bulk-Only
+(`bInterfaceProtocol 0x80`; the bridge cannot do UAS), so `sdc` has **queue_depth 1** and `nr_requests 2`: one command at a time, no depth
+from threads. A cold random 62-byte row costs **280-340 us** (it pulls one 4-K page). Eight threads = one thread; buffered 4 K reads,
+`O_DIRECT` 512-byte-aligned reads, `O_DIRECT` 4-K reads and `POSIX_FADV_RANDOM` are all within noise of the plain 62-byte path (~300 us/row,
+~4.1-5.8 KB of block-layer traffic per row; sequential read of the same file: 197 MiB/s). Rows are hash-scattered, so run coalescing is
+negligible (4054 reads for 4096 rows). The 128 shards are back-to-back in `ngram_embedding.safetensors` (`util/bench_ngram_io.py` prints the
+contiguity check); `RowTable.open` merges them into one handle, so a lookup issues **one** `ngram_gather_cpu` call for the whole table - the
+per-shard-call hypothesis is not the problem. Net: the gather costs a fixed ~2.2-2.3 ms of device time per token, and the only lever left is
+to overlap it with compute (or not read the rows).
+
+**Look-ahead fix (`Job._next_chunk_end`).** The prefill loop cuts a chunk that would straddle the last full page,
+`(len(sequence_ids) - 1) // PAGE_SIZE * PAGE_SIZE`, so the final partial page is a forward of its own (a recurrent checkpoint at the generation
+boundary). `params["ple_prefetch_next"]` predicted `(next_start + chunk_size) // PAGE_SIZE * PAGE_SIZE`, which ignores that cut: for a
+4096-token prompt it predicted 4095 while the loop ran 3840, so the staged set was never the one the next lookup asked for - the erratum of
+Nov 7 ("the prefetch entry is never hit") is exactly this. The prediction now mirrors the loop (page rounding, prompt end, last-page cut) and
+is pinned by `tests/test_ngram_ramp_plan.py`. Why the old bug looked cheap: the mispredicted ids are a *superset* of the next chunk's,
+so the wasted gather still warmed the page cache of every row that was needed and the next lookup's own gather cost 32 ms instead of
+3.4 s (Nov 8 old-code trace with MTP: 5.16 s mispredicted gather, then a 31.8 ms gather on the worker, 0.000 s wait). It only removed the
+overlap for real: the wasted gather occupied the single worker for 5.2 s in the 4096-token run, and the misprediction is what the Nov 7
+erratum saw as "the staged entry is never taken" (`hit` stayed at 2, `retired` at 1).
+
+**Partial-chunk prefetch (`PREFETCH_MIN_TOKENS` 256 -> 64).** The last chunk of a prompt is the leftover page(s), 255 tokens for a 4096- or
+8192-token prompt. prefetch() declined it by a single token (255 positions < 256), so its 2.4-2.8 k rows were gathered inline at the PLE
+layer: 0.39 s of exposed wait in every run. The threshold exists to keep *decode* steps inline (4-16 positions, where the worker hop costs more
+than the gather); 64 keeps that and lets a one-page prefill chunk be staged.
+
+**Progressive first chunks (`EXL3_NGRAM_RAMP`, default on; `EXL3_NGRAM_RAMP_FIRST` 256 = one page, `EXL3_NGRAM_RAMP_GROW` 2.0).** The first
+gather of a cold prompt has nothing to overlap, and its cost is linear in the rows the chunk touches, so a dedicated prefill starts with one
+page and grows by whole pages up to `max_chunk_size`. 4096-token prompt: 256/512/1024/2048/255; 8192: 256/512/1024/2048/2048/2048/255. The token
+order, page alignment and per-chunk forward semantics are unchanged (the model already forwards page-aligned chunks); only the boundaries of a
+*cold, dedicated* prefill move. Gated off when prefilling shares the GPU with generating jobs (`chunk_size` given), for multimodal models
+(span-exact chunking), for TP (no row prefetch on that path) and when `max_chunk_size` is already one page. With the first wait reduced to one
+page's rows (~2.5-2.9 k, ~0.5 s), the rest of the prompt's row I/O (2.2-2.3 ms/token) fits inside its compute (3.8-4.1 ms/token) and runs
+behind the GPU.
+
+**A/B (ABBA, 2 loads per arm, cold 4096 and 8192 token prompts, distinct corpus offsets, no profiler, no MTP,
+`-gs 4.0,15.0 -cs 24576 -cq 4 -mcs 256`, one `util/bench_flash.py -run prefill -lengths 4096 8192 -repeat 1 -hooks` load per measurement,
+`EXL3_NGRAM_DEBUG=1` on both arms):** | arm | 4096 t/s | 4096 exposed wait | 8192 t/s | 8192 exposed wait |
+| :--- | ---: | ---: | ---: | ---: |
+| A, ramp off | 207.4 / 198.9 | **3.79 / 2.65 s** | 218.5 / 194.0 | **4.03 / 3.47 s** |
+| B, ramp on | 195.2 / 189.6 | **0.19 / 0.67 s** | 189.7 / 194.8 | **0.24 / 0.56 s** |
+
+The exposed wait drops 5-20x (**3.2-3.8 s -> 0.2-0.7 s**); every lookup in the B arm takes its staged set
+(5/5 and 7/7 HIT prefetched per run, waits 0.000 s after the first chunk), and the first chunk's gather
+falls from 21 k to 3.5 k rows. The wall t/s of this batch is *not* a clean comparison: the B loads landed
+on a throttling P100 (79 C, 1189-1164 MHz) while A1 ran at 1328 MHz, so B is 5-7 % down on clock alone;
+subtracting the exposed wait and scaling the remaining compute to 1328 MHz gives A 16.0 / 17.4 s and B
+19.7 / 19.8 s of compute at 4096, i.e. the ramp also costs real compute - see the next paragraph. The
+batch was taken with two other agents' CUDA builds running (load 9-13).
+
+
+**The small chunks cost compute.** The 256/512/1024-token ramp chunks run at ~60 % of the per-token
+efficiency of a 2048-token chunk with the CPU expert worker as loaded as it was here (+1.7 ms/token for
+the 1792 small-chunk tokens of a 4096-token prompt, ~+3-4 s). That roughly cancels the ~3.2-3.8 s of
+stall they remove, which is why the wall t/s in the batch above does not improve: the win is in exposed
+wait, not (yet) in wall time. The schedule is therefore too aggressive - 44 % of a 4096-token prompt
+runs in sub-max chunks. The knobs for a cheaper schedule are in the code (EXL3_NGRAM_RAMP_GROW,
+EXL3_NGRAM_RAMP_FIRST): one 512-token first chunk and then straight to max_chunk_size should keep ~1.2 s
+of exposed wait (3x better than the baseline) with only 512 tokens in a small chunk. The efficiency
+figure is measured under two concurrent builds, and small chunks lean on the CPU expert worker
+disproportionately, so the clean number may be better; a cooled pair (P100 <= 62 C before each load and
+the table's page cache dropped between loads) is the next measurement.
+
+**Greedy identity.** Not measured: the greedy text with different chunk plans was not compared (out of time). Only the chunk *boundaries* of a dedicated prefill move - page-aligned, same tokens and order, same per-chunk forward - the change is I/O-only, and the model's normal chunking already varies chunk sizes per prompt (2048/1792/255), so differing boundaries are exercised by design. Whoever enables the ramp should run the bit-identical-text check first: one load, greedy, compare the md5 across the two chunk plans.
+
+**Cooled confirmation pair (gentle schedule).** One pair of loads with the P100 at <= 62 C before each and the table's page cache dropped between them (cold rows in both arms): A = ramp off, B = `EXL3_NGRAM_RAMP_FIRST=512 EXL3_NGRAM_RAMP_GROW=4` (two pages, then straight to `max_chunk_size`).
+
+| arm | 4096 t/s | 4096 exposed | 16384 t/s | 16384 exposed | P100 |
+| :--- | ---: | ---: | ---: | ---: | :--- |
+| A, ramp off | 190.8 | 5.27 s | 242.8 | 4.05 s | 1328 MHz (70-72 C / 72-79 C) |
+| B, gentle ramp | 185.3 | 3.91 s | 240.0 | 2.76 s | 1328 MHz (69-72 C / 72-79 C -> 1265) |
+
+B has less exposed wait at both lengths (1.3-1.5x) but is 0.6-0.8 s *slower* in wall time: one more forward and the less-efficient small chunks cost more than the stall they remove. The gentle schedule is also the wrong *shape* - its second chunk (2048 tokens, ~4.5 s cold gather) cannot hide behind the first 512-token chunk's ~2 s of compute, so part of that gather is exposed anyway. A gradual (doubling) schedule hides better: the hot-batch hooks below show 0.19-0.67 s of exposed wait against 3.2-4.0 s for the baseline (5-20x less), but that batch's compute penalty and thermal throttling could not be separated from its build load.
+
+**Why this does not contradict the Nov 7 entry "progressive first chunks do not help Flash-Next (ruled out)".** That experiment (4 rounds x
+3 modes on cold 4096-token prompts, one load per mode, cold-prompt spread 16.6-22.2 s) changed only the chunk sizes while the look-ahead was
+still broken, so every chunk still gathered inline at its own PLE layer and the total disk time stayed a floor under the prefill; it also
+compared single loads inside a spread larger than the effect. Here the chunk ramp and the corrected look-ahead land together, the exposed wait
+is accounted per lookup with the row-table hooks, and the comparison is 2 loads per arm ABBA on distinct cold offsets.
+
+**Decision (measured, Nov 8): `EXL3_NGRAM_RAMP` ships default OFF.** The stall is real and the ramp removes most of it (5-20x in the hooks), but in the controlled pair the wall t/s did not improve: the extra forwards and the ~60 %-per-token efficiency of the small chunks cost about what the 3-5 s of stall costs. Shipping a measured wash as default-on would not be honest. What ships on: the exact next-chunk look-ahead (`_next_chunk_end`, the erratum fix - the staged set is now the one the next lookup takes) and the partial-chunk prefetch (a 255-token final chunk is staged instead of gathered inline, worth ~0.39 s in every cold prefill). The ramp stays available behind the switch.
+
+**Open.** (1) The doubling schedule's exposed wait (0.19-0.67 s) is the right target; what it needs is less per-forward overhead for small chunks (or a machine without the CPU MoE worker contending), not another schedule tweak. (2) Stage the first chunk at `Job` *enqueue* time, so a request that arrives while another job is generating hides its first gather behind that job (the benchmark harness enqueues immediately before prefill, so this cannot be measured there). (3) The decode lookup (~64 rows/step = ~19 ms of device time cold) is the same latency; the advise() path moves the same commands earlier rather than removing them. (4) The blocking DtoH readbacks of the CPU expert tail are the real remaining prefill lever now (prefill-gpu's section); with them gone the exposes measured here are what is left.
