@@ -1008,3 +1008,93 @@ tokens); the MTP run with `-cs 262144` failed with `CUDA error: out of memory` i
 475 MiB of desktop processes (Chromium and others); the cause was not isolated (desktop memory on the 6 GB card, the persistent MoE
 scratch, or the context size) and the model was deleted afterwards, so the question is open. Ling-type models, which hit the same
 absorb limit, were not retried.
+
+## Qwen3.8-Flash-Next: prefill expert-stream DMA and the blocking host readbacks (Nov 8, branch `flash-prefill-gpu`)
+
+Task: cut the prefill's GPU/kernel time. Config for every run here: `-gs 4.0,15.0 -cs 24576 -cq 4 -mcs 256`, cold
+corpus chunks from `util/bench_flash.py`, one load per measurement, P100 temperature/clock logged before and after each
+run. Hardware relevant to this section: the P100 trains at PCIe Gen3 **x4** (2.75-2.83 GB/s measured on this work), the
+RTX 2060 at x16 (12.96-12.98 GB/s measured).
+
+**What was changed** (`e2bca597`, Python only, `exllamav3/model/moe_cpu_host.py`): the streamed-expert VRAM-ring DMA, the
+pinned-arena (`-mcpa`) DMA, the CPU-tail per-job issue and readback copies and the pinned->device bandwidth probe now
+call `ext.cuda_memcpy_async` (a raw `cudaMemcpyAsync` on the current stream) instead of torch's `copy_`. Motivation:
+`cuda_host.h` documents that torch does not always recognise `cudaHostRegister`'ed memory as pinned and may stage such
+transfers through a pageable buffer, and the profiler attributed 13.3 s of CPU time to `cudaMemcpyAsync` on one 4096-token
+prefill. The change is correct by construction: same bytes, same stream order, and the flag waits/writes that gate ring and
+slot reuse stay ordered behind the copies on the same stream; only contiguous same-size views take the raw path (anything
+else keeps `copy_`). `EXL3_MOE_ASYNC_DMA=0` restores the old path (read once at import).
+
+**The traces say the 13.3 s is not the expert stream.** Method: `bench_flash.py -run prefill -lengths 4096 8192 -repeat 2
+-profile_prefill -record_shapes -trace <prefix>`, the torch.profiler chrome trace parsed per device, per memcpy kind, with
+each `cudaMemcpyAsync`/event runtime call correlated to its GPU activity. On the profiled 4096-token run (s1 below, 21.88 s
+window): `cudaMemcpyAsync` 13.25 s of CPU time, of which **13.16 s is 355 `aten::copy_` calls to
+`Memcpy DtoH (Device -> Pageable)`** - 0.03 s of actual GPU time, one 1.57 MB call and the rest a median of **2.1 kB**,
+each taking 20-150 ms because the copy only runs when the compute stream reaches it (plus 10 `cudaStreamSynchronize` calls,
+0.39 s, and 2 `cudaDeviceSynchronize`, 0.03 s). Those are host-side planning values read back in the middle of the layer
+loop, and they are the real serialization: the host blocks ~13 s while the P100 is busy only ~10.5 s. The expert DMA is
+**not** the blocker and was already asynchronous before this work: the handoff segment and the arena are pinned
+(`is_pinned() == True` on the `wviews`/`arena_views` views), a 32 MiB pinned H2D `copy_` returns after 0.05 ms of CPU
+(0.03 ms with `ext.cuda_memcpy_async`), DMA 2.59 ms on the 2060 (12.98 GB/s), and in the traces the pinned->device copies
+carry negligible CPU time in both builds. **The async-copy patch is therefore performance-neutral in the warm-placement
+case; it is kept as the correct/cleaner path (and it does remove the host-side staging for the cold case's large handoff
+DMA). No t/s win is claimed for it.**
+
+**The s1/s2 t/s delta is a placement confound, not a copy-path result.** Two loads were compared with
+`EXL3_MOE_ASYNC_DMA=1/0`, and the load logs differ: s1 was cold (`CPU split experts (worker, dynamic): ... [256..512) of
+512`), s2 loaded `placement from saved profile` (warm). Cause: the expert-stats file key is
+`sha1(abspath(model_dir) | num_experts)`, and a run started from a worktree resolves `models/...` under the worktree, so
+it hashes to a different file than a run from `/home/nicola/exllamav3`; the restore step wrote the wrong file and the first
+load of the session ran cold. The two placements stream very different amounts of expert weights:
+
+| | window | P100 kernels | P100 copies | 2060 kernels | 2060 copies | expert H2D bytes | P100 / 2060 H2D rate |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| s1 (cold) | 21.876 s | 10.493 s | 2.639 s | 1.459 s | 0.222 s | **9.58 GB** (6.79 / 2.79) | 2.75 / 12.97 GB/s |
+| s2 (warm) | 16.745 s | 9.974 s | 0.526 s | 1.375 s | 0.115 s | **2.42 GB** (1.03 / 1.39) | 2.83 / 12.96 GB/s |
+
+Both sit at the link rate, and the byte count is decided by placement: cold, the CPU holds arbitrary experts, every CPU
+expert clears the stream threshold and 9.58 GB crosses the links; warm, the CPU holds the cold experts, only 2.42 GB is
+streamed and the CPU tail does the rest. Measured t/s of the two loads (not an A/B, listed with thermals for the record):
+4096 tokens 187.6 / 200.4 t/s (s1, 54-60 C, 1328 MHz) vs 245.2 / 261.9 t/s (s2, 67-73 C, 1328 MHz); 8192 tokens 240.0 /
+249.3 (s1, 60-69 C) vs 264.2 / 275.4 (s2, 72-79 C, last run 1303 MHz). The documented cold->warm placement gain is 10-20%
+on this model by itself, and s2 ran hotter, so the +27-31% at 4096 cannot be credited to the copy path. Lesson for future
+A/B on this model: make every side load from the same cwd/model path (or pass `EXL3_MOE_CPU_SPLIT_STATS`), then verify the
+`placement from saved profile` line in both logs - otherwise the expert placement differs and the t/s comparison is void.
+
+**Where the rest of the prefill goes** (s1 trace, cold 4096; P100 kernels 10.493 s of the 21.88 s window):
+`exl3_moe_kernel<1,128,2,16,true>` 2.429 s / 163 calls (14.9 ms each), `<1,128,2,32,true>` 1.936 s / 643 calls (3.0 ms),
+`hfma2::gemm_kernel` 0.91 + 0.89 s (571 + 911 calls), `aten::mm` (cuBLAS) 0.845 s / 582, `_qsa_sparse_split_kernel`
+0.797 s / 36 (22 ms each), the `<2,128,2,*>` MoE instances 0.285 + 0.217 + 0.210 + 0.130 s, GDN kernels 0.614 s,
+`reconstruct_had_batch` 0.169 s + `reconstruct_had` 0.108 s. On the 2060 (s2 trace): `exl3_moe_kernel<2,128,2,64,false>`
+0.196 s / 37, `_qsa_sparse_split_kernel` 0.107 s / 3 (35.8 ms each), GDN 0.215 s, and **cuBLAS fp16 GEMMs ~0.23 s**
+(`turing_fp16_s1688gemm*`, `turing_s1688gemm*`) because `hgemm_f16acc` is gated to Ampere+, so the 2060's reconstruct GEMMs
+run SIMT. The P100's cuBLAS fallbacks (`hgemm_32x32x64_NT_vec` 0.469 s / 162, `hgemm_128x128x8_NT_vec` 0.266 s / 162,
+`hgemm_32x64x32_NN_vec` 0.056 s / 80, `hgemm_32x32x32_NT_vec` 0.051 s / 162 = 0.84 s, plus `aten::mm` 0.845 s) are the
+shapes `hfma2::covered`/`pick_tile` reject: gates/ups of the MoE reconstruct tiers have N = 640 and small M, so their
+64-row-block grid stays under the 96-block threshold and they go to cuBLAS. Not tuned in this session; a
+shape-microbenchmark sweep (`ext.hgemm_hfma2` vs cuBLAS per shape) is the way in.
+
+**Open lead (the biggest remaining prefill lever): the blocking pageable DtoH readbacks.** 355 `aten::copy_` calls,
+13.16 s of CPU time against 0.03 s of GPU time, median 2.1 kB, 20-150 ms each, on the compute stream: the host asks for
+small planning tensors (CPU-tail routing/slot handoff values) in the middle of the layer loop and pays the full
+compute-stream latency for each. Options, in likely order of payoff: (a) move those readbacks to a pinned ring with
+`cuda_memcpyAsync` and consume the values one layer later (double-buffered host-side planning, the producer keeps running
+on period i while the host uses the values of period i-1); (b) restructure the layer pipeline so layer i's CPU tail is
+collected after layer i+1's GPU work is enqueued (the decode path already defers its collects this way; prefill collects
+the tail inline); (c) find the exact call sites - `bench_flash.py -copy_sites` prints the Python stack of every distinct
+`Tensor.copy_` pattern (added, but the verify loads that would have run it were cancelled for lane time). Expected gain:
+up to several seconds per 4096-token chunk, i.e. the difference between a ~16 s and a ~11-12 s cold 4096 prefill if the
+host can run one layer ahead of the GPU. This is the item to pick up first for prefill work on this model.
+
+**ngram-io lane, for the record** (lead's report, not my measurement): the n-gram row-table ramp reduced the exposed prefill
+stall from 7.8 s to 0.4-1.2 s; the 4096-token t/s in their ABBA was thermally confounded, so the final cooled
+merged-vs-baseline battery will quantify the wall-time gain.
+
+**Harness additions used here** (`bench_flash.py`, append-only): `-check_text N` (md5 of 48 greedy continuation tokens);
+`-check_text_toggle 1,0,...` (same-process rounds at one cold offset that flip `moe_cpu_host.TUNING.async_dma`, an
+identity gate for a copy-path change); `-trace <prefix>` (chrome trace of the profiler windows); `-record_shapes`;
+`-copy_sites`; `-abba_async 1,0,1,0` (within-load A/B of the copy path, one mode per prefill run - the only design that
+avoids the expert-placement confound above). Trace tooling: `tmp/trace_analyze2.py` (per-device kernels/copies/gaps,
+memcpy bytes and GB/s per kind), `tmp/trace_blocked.py` (blocked runtime calls correlated to their GPU activity and to the
+torch op that issued them), `tmp/copy_hist.py` (copy size histogram), `tmp/micro_copy.py` (is_pinned + copy_ vs raw
+`cudaMemcpyAsync` timing on both devices).
