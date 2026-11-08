@@ -191,6 +191,11 @@ def main(args):
 
     def prefill_run(n, offset):
         ids = ids_all[offset:offset + n].unsqueeze(0)
+        try:
+            from exllamav3.model.moe_cpu_host import TUNING as _T
+            async_dma = int(_T.async_dma)
+        except Exception:
+            async_dma = -1
         pre = smi(args.smi_index)
         job = Job(input_ids = ids, max_new_tokens = 1, stop_conditions = [], sampler = ArgmaxSampler())
         generator.enqueue(job)
@@ -202,9 +207,11 @@ def main(args):
         post = smi(args.smi_index)
         new_ctx = n - last.get("cached_tokens", 0)
         t = last.get("time_prefill", 1e-6) or 1e-6
-        d = dict(kind = "prefill", n = n, new_ctx = new_ctx, t_s = new_ctx / t, seconds = t, smi = f"{pre} -> {post}")
+        d = dict(kind = "prefill", n = n, new_ctx = new_ctx, t_s = new_ctx / t, seconds = t,
+                 smi = f"{pre} -> {post}", async_dma = async_dma)
         rec.add(d)
-        print(f"PREFILL {n} tok: {new_ctx} uncached at {d['t_s']:.1f} t/s ({t:.2f} s) | P100 {pre} -> {post}", flush = True)
+        print(f"PREFILL {n} tok: {new_ctx} uncached at {d['t_s']:.1f} t/s ({t:.2f} s) | "
+              f"async_dma={async_dma} | P100 {pre} -> {post}", flush = True)
 
     def text_check(n, offset):
         """Greedy continuation of a cold n-token chunk, printed as an md5: A/B runs that must be
@@ -302,8 +309,17 @@ def main(args):
     if args.run == "prefill" or args.run == "both":
         k = 1
         rates = {}
+        abba = [int(c) for c in args.abba_async.split(",")] if args.abba_async else None
+        if abba:
+            from exllamav3.model.moe_cpu_host import TUNING as _T
         for n in args.lengths:
             for r in range(args.repeat):
+                # Within-load A/B of the streamed-copy path: same process, same expert placement,
+                # so only the copy mechanism differs between adjacent runs; the alternation
+                # pattern spreads thermal drift over both modes
+                if abba:
+                    _T.async_dma = bool(abba[(k - 1) % len(abba)])
+                    print(f"ABBA run {k}: async_dma={int(_T.async_dma)}", flush = True)
                 if args.profile_prefill and k == 1:
                     with torch.profiler.profile(
                         activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
@@ -359,6 +375,10 @@ if __name__ == "__main__":
     parser.add_argument("-profile_file", "--profile_file", type = str, default = None)
     parser.add_argument("-record_shapes", "--record_shapes", action = "store_true",
                         help = "torch.profiler record_shapes (aten op input shapes, e.g. the fallback GEMM shapes)")
+    parser.add_argument("-abba_async", "--abba_async", type = str, default = None,
+                        help = "comma-separated moe_cpu_host.TUNING.async_dma values, one per prefill run "
+                               "(within-load A/B of the streamed copy path: same process, same placement, "
+                               "no cross-load expert-placement confound)")
     parser.add_argument("-copy_sites", "--copy_sites", action = "store_true",
                         help = "print the Python call site of every distinct Tensor.copy_ pattern (first hit)")
     parser.add_argument("-check_text_toggle", "--check_text_toggle", type = str, default = None,
