@@ -204,7 +204,7 @@ def main(args):
     def profile(kind, fn):
         with torch.profiler.profile(
             activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-            record_shapes = False, profile_memory = False,
+            record_shapes = bool(args.record_shapes), profile_memory = False,
         ) as prof:
             fn()
         print(f"PROFILE {kind} top CUDA:")
@@ -273,6 +273,7 @@ def main(args):
                 if args.profile_prefill and k == 1:
                     with torch.profiler.profile(
                         activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                        record_shapes = bool(args.record_shapes),
                     ) as prof:
                         prefill_run(n, k * stride)
                     print("PROFILE prefill top CUDA:")
@@ -318,6 +319,8 @@ if __name__ == "__main__":
     parser.add_argument("-tag2", "--tag2", type = str, default = None)
     parser.add_argument("-json", "--json", type = str, default = None)
     parser.add_argument("-profile_file", "--profile_file", type = str, default = None)
+    parser.add_argument("-record_shapes", "--record_shapes", action = "store_true",
+                        help = "torch.profiler record_shapes (aten op input shapes, e.g. the fallback GEMM shapes)")
     parser.add_argument("-trace", "--trace", type = str, default = None,
                         help = "export the torch.profiler window as a chrome trace to <prefix>.<kind>.json")
     parser.add_argument("-profile_decode", "--profile_decode", action = "store_true")
