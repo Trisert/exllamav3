@@ -343,6 +343,16 @@ every other width, codebook, half-integer rate and `m > 16` keeps the old fallba
 Weight-extraction strategy inside the fp16 GEMV kernel: `-1` picks per bitrate (default), `0`
 forces shuffle extraction, `1` forces shared-memory staging. Testing only.
 
+### `EXL3_GEMV_FUSED` (default: `1`)
+
+Pascal, 1-2 rows: same-input EXL3 4 bpw mul1 projection pairs through one fused GEMV launch
+(`quant/exl3_gemv_fused.cuh`), bit-identical to the two separate calls (same GEMV config, same per-output arithmetic).
+The groups are qkv+z in `GatedDeltaNet` and k+v in `Attention`; `EXL3_GEMV_FUSED_KV=0` disables only the k+v pair,
+`EXL3_GEMV_FUSED=0` disables both and restores the separate linears. Note that the decode and MTP-verify shapes run the C++
+graph objects (`BC_GatedDeltaNetSplit`, `BC_ATTN`), which return before the Python path these fusions are wired into, so at
+the serving config the switch only affects eager 1-2-row passes; the measured score is neutral in the Ornith round
+(`doc/pascal_progress.md`).
+
 ### `EXL3_HGEMV` (default: on for sm_60 and sm_75, off elsewhere)
 
 Dense fp16 GEMV (`hgemv_f16.cu`) for unquantized linears (`LinearFP16`: projections and lm_head of

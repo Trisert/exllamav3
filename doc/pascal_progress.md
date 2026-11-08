@@ -863,6 +863,14 @@ MTP settings (35B, two prompts, 160 W): `-ndt 1` is the safe choice (57.3 t/s); 
 
 ## Ruled out (measured)
 
+- (Nov 8) Tensor parallel for Ornith across the P100 + RTX 2060 (`-tp -gs 4.0,15.0`, MTP, one load per arm): 70.58 t/s against
+  83.13 t/s for the serial layer split, plain 49.03 against 57.56 t/s (-15% in both), with both cards concurrently busy and the
+  2060 at 1950 MHz. The 4 GB budget leaves the 2060 21% of the 19.3 GB model, so TP's ceiling is ~-3.5 ms/step (the P100, at
+  15 GB of budget, must still run 79% of every layer) and the native collectives' ~180 us per layer cost more than that. TP also
+  loads the model in 40 s against 24-85 s for the layer split (page-cache dependent). Numbers, GPU utilisation and the split
+  arithmetic in the round-integration section at the end of this file. TP also loads slower: 40 s with the model in page cache,
+  against 24-28 s for the layer split warm (67-85 s cold).
+
 - (Nov 7) Narrow / wide config of the EXL3 4 bpw GEMV for Ornith's projections on the P100 (`hgemv_bench/bench_exl3_gemv.py`, forced with
   `EXL3_GEMV=3/4`, m = 2): 4096x2048 narrow 42.9 / wide 41.0 us (heuristic picks narrow), 2048x4096 33.7 / 38.1, 2048x8192 54.0 / 54.6,
   2048x12288 73.4 / 71.7; the heuristic is within 5% of the best everywhere, so re-picking configs saves ~0.06 ms per iteration
@@ -1569,3 +1577,94 @@ against 1815-1890 MHz under synthetic load, ~1 ms/iter of margin for a keep-aliv
 variant is available - pre-launch all positions' samplers with the draft tokens written into the device past-ids buffer (exact for
 every position the accept walk can reach, because accepted ids equal the drafts), one pinned staging and one synchronize, then a
 host-only accept walk - but it was not implemented (time) and does not affect the greedy benchmark.
+## Ornith-1.5-35B-A3B decode: round integration, the fused GEMV is unreachable in the graphed decode, and tensor parallel measured (Nov 8, branch `ornith-opt`)
+
+Round target (user, Nov 3): **100 t/s** on the code prompt with `examples/bench_chat.py`, greedy, P100 cooled to <= 62 C.
+Serving config for every number below: `-gs 4.0,15.0 -cs 32768 -cq 4 -mtp -ndt 1 -sdh 16384`, one load per arm,
+`tmp/ornith_ab.sh` / `tmp/ornith_final_abba.log`.
+
+### What was tried, and what shipped
+
+| branch | change | end to end |
+| :--- | :--- | :--- |
+| `worktree-ornith-hgemv-hfma2` | MoE coop: 256-thread blocks, 2 blocks/SM | -0.63 ms/step (-2.8%), 83.3-83.6 -> 83.9-84.9 t/s (see the MoE section above) |
+| `ornith-moe` | compact dual queue (on by default), `EXL3_MOE_COOP_KSPLIT_A` knob, model-free bench + per-item trace with the shared expert decomposed | queue neutral (-0.6%, inside noise); three further queue/decomposition levers measured and rejected |
+| `ornith-gemv` | fused multi-matrix GEMV (`quant/exl3_gemv_fused.cuh`, 341 lines): qkv+z and k+v through one launch each, sm_60 direct-dot at m = 1/2, verified bit-identical against the separate calls | **unreachable in decode** (below); the end-to-end A/B against the baseline build is neutral |
+| `ornith-graphs` | host/launch investigation + three Python staging fixes | none moved the step (it is GPU-bound); no code change kept |
+
+### Final A/B: merged tree vs baseline build (4 cooled loads, 900-token greedy turns)
+
+Baseline = worktree `ornith-base` at 861fdf0e with its own `.so` through `EXL_SRC`; merged = this tree
+(`.so` at 20:16, 223,559,912 B). Arms in the order they ran (A B B A), P100 temperature logged at start.
+
+| arm | build | t/s | tok/step | draft accept | P100 start -> end |
+| :--- | :--- | ---: | ---: | ---: | :--- |
+| baseB1 | 861fdf0e | 80.84 | 1.82 | 81.8% | 55 -> 62 C |
+| mergedB1 | `ornith-opt` | 80.89 | 1.83 | 82.9% | 61 -> 65 C |
+| mergedB2 | `ornith-opt` | 80.42 | 1.83 | 82.9% | 62 -> 67 C |
+| baseB2 | 861fdf0e | 80.44 | 1.81 | 80.5% | 48 -> 58 C |
+| **mean** | base / merged | **80.64 / 80.66** | | | |
+
++0.02 t/s (+0.02%): **neutral**, against a load-to-load spread of +-0.3-0.5 t/s on this benchmark. The absolute level of
+these four arms is 2-3 t/s below the 82.1-84.5 t/s measured in earlier sessions; a reference load at the same config late
+in the session (after the model was in page cache) gave 83.13 t/s at 1.86 tokens/step, so the offset is environmental
+(cold model load from the USB disk, room temperature), not a regression of this round.
+
+### Why the fused GEMV cannot show: the graphed decode path owns the layer
+
+`GatedDeltaNet.forward` runs the whole layer in `self.bc.run_bszN(...)` (the C++ `BC_GatedDeltaNetSplit` graph
+object) and returns for `1 <= bsz <= MAX_BSZ, 1 <= seqlen <= MAX_QLEN` (the decode and MTP-verify shapes) before it ever
+reaches the Python "Torch path". `gemv_qkvz_fused` is wired into that Torch path, so at the serving config it is never
+called; the same is true of the attention k+v fusion, whose `project_qkv` is also past the `BC_ATTN` return. On Pascal
+the graph path cannot use the sliced qkv+z mgemm bundle the other architectures get either (`use_mgemm` returns false
+for `cap < 7`), so it runs the two GEMVs separately inside the graph - which is exactly the pair the fused kernel would
+join. The earlier -0.51 ms/iter reading in the `ornith-gemv` section above came from a within-load A/B whose two arms
+drifted by 0.92 ms (P100 heating), i.e. it was noise; the four-load A/B above is the honest measurement of what the
+checked-in wiring delivers today: nothing. The kernel itself is correct and bit-identical (dispatch comparison
+`tmp/dbg_fused2.py` at m = 1 and 2, gemv/m34/tail regressions 52 passed / 1 skipped on both cards), so it is kept as
+the building block for the one place where it can pay: a fused instance inside `BC_GatedDeltaNetSplit`.
+
+### Tensor parallel across the two cards: measured 15% slower
+
+The structural alternative to the serial layer split is to run every layer on both cards. It is implemented (upstream
+`-tp`, one worker process per device, `--gpu_split` sets the per-device storage budget) and it works on this pair with
+the Qwen3.5-MoE model, MTP included. Same params, one load per arm, `-cs 16384`:
+
+| build / mode | t/s | tok/step | ms/step | draft accept |
+| :--- | ---: | ---: | ---: | ---: |
+| layer split, plain (m = 1) | 57.56 | 1.00 | 17.4 | - |
+| tensor parallel, plain (m = 1) | 49.03 | 1.00 | 20.4 | - |
+| layer split, `-mtp -ndt 1 -sdh 16384` | **83.13** | 1.86 | 22.4 | 86.0% |
+| tensor parallel, `-mtp -ndt 1 -sdh 16384` | 70.58 | 1.85 | 26.2 | 84.3% |
+
+`-gs 4.0,15.0` in TP mode gives the 2060 a 4 GB budget and the P100 15 GB, i.e. the 2060 holds 21% of the 19.3 GB model.
+During TP generation both cards are busy (P100 98-99% utilisation at 1328 MHz, 2060 65-76% at **1950 MHz**, against
+1365 MHz when it works alone in layer split) - so TP does exploit the 2060 better clock-wise, yet it is 3.0-3.8 ms per
+step slower. Arithmetic: with weights split 79/21 the P100 must run 79% of *every* layer, i.e. 40 x 0.547 ms x 0.79 =
+17.3 ms of P100 time against the 20.8 ms of GPU time the serial split spends today, so the ceiling of TP on this pair is
+only ~-3.5 ms **if the cross-GPU collectives were free**; the native backend's two reductions per layer cost ~180 us each
+here (per-layer activation matrices are 2 KB, so this is latency, not bandwidth), which more than eats the 3.5 ms. TP is
+not the road to 100 t/s with a 16 GB + 6 GB pair: the 2060's 4 GB usable is 21% of the model, and a split that gave it
+more would not fit.
+
+### Where the step is, and what is left (ranked, all measured unless noted)
+
+1. **RTX 2060 clocks** (not tested, needs root): the 2060 runs at 1365 MHz / P2 / 51-58 W in layer-split decode while
+   TP (both cards busy) holds it at 1950 MHz. Its share is 4.0-4.4 ms of the 22.4 ms step, so +33-43% clock is worth up
+   to ~1.2 ms/step (+5%) if its kernels scale with SM clock. `sudo nvidia-smi -i 1 -lgc 1800` before the load; the
+   in-process keep-alive is ruled out (a foreign block starves the cooperative MoE launch).
+2. **Fused GEMV inside the graph path**: the microbenchmark's saving is real (-22.7 us x 30 GDN layers per step) but it
+   needs a fused instance in `exllamav3_ext/libtorch/gated_delta_net_bc.h/.cpp`, not in the Python path.
+3. **lm_head**: 1.29 ms/iter (6 bpw, 248320 x 2048, 508.6 M weights = 394 G weights/s, 295 GB/s). The staged-tile 6 bpw
+   GEMV is near its instruction bound (same instructions per weight as the 4 bpw path that runs at ~250 GB/s), not its
+   byte floor, so there is at most ~0.3 ms there.
+4. **MoE work-stealing queue**: the only remaining item from the MoE section (~-3/-5 us/call estimated, not measured); the
+   kernel already runs at 2.7-3.0 G weights/s per block, at the dense GEMV's rate.
+
+### Verdict on the 100 t/s target
+
+100 t/s at 1.82 tokens/step is 18.2 ms/step, i.e. -19% of the GPU time, with both cards already at ~100% in their own
+phases and the dependency chain leaving nothing to overlap. The two structural options are measured dead (tensor parallel
+-15%; component overlap across the cards has no room because the layers are serial). What is left is single-digit percent
+from the four items above; the realistic band for this model on this pair is **85-90 t/s**, against 83.1 t/s measured at
+the serving config in this session (80.4-80.9 in the cold-load A/B), and 82.1-84.5 t/s in the earlier sessions.
