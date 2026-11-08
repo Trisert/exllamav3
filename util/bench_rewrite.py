@@ -85,21 +85,28 @@ def main():
             job = Job(input_ids = ids, max_new_tokens = args.max_new, stop_conditions = stops, sampler = ArgmaxSampler())
             gen.enqueue(job)
             last = {}
-            steps = 0
+            out = ""
+            chunks = 0
             pre = smi(args.smi_index)
             while gen.num_remaining_jobs():
                 for r in gen.iterate():
-                    steps += 1
+                    chunks += 1
+                    out += r.get("text", "") or ""
                     if r.get("eos"): last = r
             post = smi(args.smi_index)
             n, t = last.get("new_tokens", 0), last.get("time_generate", 1e-9)
             acc = last.get("accepted_draft_tokens", 0); rej = last.get("rejected_draft_tokens", 0)
+            # Verification rounds: every round samples one token of its own and may accept the drafted ones, so a
+            # reply of n tokens over r rounds with a accepted drafts has r = n - a. tok/step as in bench_chat
+            steps = max(n - acc, 1)
+            tok_step = (n - 1) / max(n - 1 - acc, 1)
             m16 = os.environ.get("EXL3_GEMV_M16", "1")
             d = dict(kind = "turn", hdt = hdt, m16 = m16, k = k, ctx = int(ids.shape[-1]), new = n,
-                     t_s = n / t, ms_step = 1000 * t / max(steps, 1), steps = steps,
-                     accepted = acc, drafted = acc + rej, text = last.get("text", "") or "", smi = f"{pre} -> {post}")
+                     t_s = n / t, ms_step = 1000 * t / steps, steps = steps, tok_step = tok_step, chunks = chunks,
+                     accepted = acc, drafted = acc + rej, text = out, smi = f"{pre} -> {post}")
             print(f"RW hdt={hdt:2d} m16={m16} k={k} ctx {ids.shape[-1]} | {n} tok {d['t_s']:.2f} t/s "
-                  f"| {d['ms_step']:.1f} ms/step | draft {acc}/{acc + rej} | P100 {pre} -> {post}", flush = True)
+                  f"| {d['ms_step']:.1f} ms/step, {tok_step:.2f} tok/step | draft {acc}/{acc + rej} "
+                  f"| P100 {pre} -> {post}", flush = True)
             return d
 
         def set_m16(v):
@@ -108,7 +115,8 @@ def main():
             else:
                 os.environ["EXL3_GEMV_M16"] = v
 
-        set_m16(None)
+        if args.m16ab:
+            set_m16(None)   # the flag drives the sides per turn; otherwise the env set at load time stands
         turn(0, 99)  # warm-up (kernel selection, autotune, Triton compile)
         modes = list(args.hdts)
         sides = [None, "0"] if args.m16ab else [None]

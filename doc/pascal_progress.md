@@ -1008,3 +1008,104 @@ tokens); the MTP run with `-cs 262144` failed with `CUDA error: out of memory` i
 475 MiB of desktop processes (Chromium and others); the cause was not isolated (desktop memory on the 6 GB card, the persistent MoE
 scratch, or the context size) and the model was deleted afterwards, so the question is open. Ling-type models, which hit the same
 absorb limit, were not retried.
+
+### Qwen3.8-Flash-Next: m = 9..16 verification rows for hybrid drafting (Nov 8, branch `flash-decode-draft`)
+
+**Problem.** Hybrid drafting on copy-heavy agentic turns: `-hdt 7` (8 rows per verification) gave 49.0 t/s against 42.5
+at m = 4 (Nov 7), but `-hdt 12` (13 rows) collapsed to 38.3 because every dense projection left the small-m GEMV at
+`size_m > EXL3_GEMV_MAX_M` (8, `exl3_gemv.cu`) and ran the block-pipelined tile GEMM, which on sm_60 is several times off
+the roofline. This section makes the 9..16-row verification fast.
+
+**The rows were already in the fragments.** MMODE 1 loads only the first row group of the m16n8k16 fragments: `a01[1]` /
+`a23[1]` (A rows lane/4 + 8) are zeroed and the second half of `FragC_h` (C rows lane/4 + 8) is discarded, so rows 8..15
+were computed for free and thrown away. **MMODE 5** turns the second group on: two more A half2 loads per k-slice, 8 more
+shuffles per k-slice on sm_60 (`gather_a_rows16`, the emulated MMA), a second fp32 fold accumulator (`acc1`) and 16
+instead of 8 smem rows in `sh_red` (32 KB static). Row r's arithmetic is unchanged (the MMA has no cross-row terms, the
+fold cadence and the cross-warp reduction are the same), so MMODE 5 is bit-identical to MMODE 1 for the same rows.
+
+**Dispatch and instances** (`exl3_gemv.cu`, `exl3_gemv_kernel.cuh`):
+- `EXL3_GEMV_MAX_M` stays 8, so every existing path is untouched; `EXL3_GEMV_MAX_M16` = 16 and MMODE 5 only when
+  9 <= size_m <= 16.
+- Taken on Pascal and Turing only, integer mul1 rates only. 12 instances: `SEL_GRID_M5(bits, cb, smem)` x {cfg 0/1} x
+  {fp16/fp32} for (4, mul1, shuffle extraction) = lm_head, (5, mul1, staged words) = attention / GDN projections,
+  (6, mul1, staged words) = MTP fc_hidden / fc_embedding. Every other width, codebook, half-integer rate and m > 16 keeps
+  the tile-GEMM fallback it had.
+- `EXL3_GEMV_M16=0` disables the path (read per call, for A/B). The cfg heuristic is unchanged.
+
+**What did not need changing.**
+- **MoE coop**: runs are capped at ROWS = 8 *slots of one expert*, not at 8 verification rows, so m = 13 only means more
+  runs (130 slots vs 80 at m = 8) - the cost is linear in the number of distinct experts, which is inherent to verifying
+  more rows (each expert's trellis has to be decoded once per run). `MAX_BSZN` = 8 is the *bsz* dimension (1 here) and
+  `MAX_SLOTS` = 256 covers 16 rows x top_k 10, so no row template or scratch change.
+- **Gated residual**: R 5..32 already takes `gr_dots_kernel2` / `gr_finalize_kernel2` (GR_MAX_R = 32); only R <= 4 uses
+  `gr_mix3`, which cannot be widened (10.2 KB of smem per row, R = 4 is already 41 KB of the 48 KB block limit). So
+  9..16 pays the ~1.5-2x slower generic pair, no cliff.
+- **Host**: nothing. `model_init.py` sizes the cache `max_history` from max(ndt, hdt) (hdt 15 -> 16 rows is legal),
+  `max_q_size` = `max_draft_tokens` + 1, and `row_limited` / `draft_max_rows` is off by default.
+
+**Kernel tests** (`tests/kernels/gemm/test_exl3_gemv_m16.py`, new; modelled on `test_exl3_gemv_m34.py`). Contract: a
+single m-row call (m = 9 / 12 / 13 / 16) must equal rows 0..7 in one call plus rows 8..m-1 zero-padded to 8 rows in a
+second call, bit for bit (that second call is MMODE 1, i.e. exactly the arithmetic MMODE 5 has to reproduce); plus the
+float64-reference tolerance (rel RMS < 2.5e-3, max < 4e-3), zero-padded-row invariance, repeat-launch identity and
+`EXL3_GEMV_M16=0` making m > 8 ineligible.
+- P100 (cuda:1): 11/11 passed. RTX 2060 (cuda:0): 3 passed, 8 skipped (K = 5 / 6 are Pascal-only, K = 4 runs).
+- Regression `test_exl3_gemv.py` + `test_exl3_gemv_m34.py` + `test_exl3_gemv_tail.py`: 52 passed, 1 skipped on both
+  devices.
+
+**Registers / stack / shared memory** (`cuobjdump -res-usage`, MMODE 1 -> MMODE 5, per sm_60 cubin):
+
+| bits, cfg | regs | stack | smem |
+| :--- | ---: | ---: | ---: |
+| 4, narrow | 127 -> 128 | 0 -> 0 | 16384 -> 32768 |
+| 4, wide | 217 -> 220 | 0 -> 0 | 16384 -> 32768 |
+| 5, narrow | 128 -> 128 | 0 -> 0 | 22528 -> 38912 |
+| 5, wide | 172 -> 165 | 0 -> 0 | 21504 -> 37888 |
+| 6, narrow | 127 -> 128 | 0 -> 0 | 22528 -> 38912 |
+| 6, wide | 174 -> 164 | 0 -> 0 | 22528 -> 38912 |
+
+No spills anywhere (STACK 0), occupancy unchanged (sm_60 narrow is 512 thr x 128 regs = the whole 64K register file for
+MMODE 1 already; wide 165-220 regs at 256 thr = 1 block/SM), staged smem 38.9 KB < 48 KB per block. The structural cost
+is the +16 KB of smem and, on sm_60, the 8 extra A-gather shuffles per k-slice.
+
+**End to end** (`util/bench_rewrite.py`, the ~7000-char copy-heavy rewrite turn, greedy, `-gs 4.0,15.0 -cs 24576 -cq 4
+-mcs 256 -mtp -ndt 3 -sdh 16384 -hdt 15 -hdts 0 7 12 15 -rounds 2 -max_new 500`; `-hdt 15` at load time only sizes
+`max_history`; the widths are switched per turn, m = 4 / 8 / 13 / 16):
+
+| load | thermal | hdt 0 (m 4) | hdt 7 (m 8) | hdt 12 (m 13) | hdt 15 (m 16) |
+| :--- | :--- | ---: | ---: | ---: | ---: |
+| a1, first load of the session (cold n-gram page cache) | cooled to 64 C, 1328-1177 MHz | 37.7 | 47.4 | **49.4** | 48.7 |
+| a2, warm cache | 69-79 C, 1328-784 MHz (throttling) | 50.3 | 65.4 | 43.0 | 46.4 |
+| b1, warm cache | 75-79 C, 1328-1025 MHz (throttling) | 50.6 | 63.2 | 37.3 | 38.0 |
+
+a1, per verification row: 26.1 / 20.3 / 18.6 / 17.8 ms per row (ms per step 104 / 162 / 241 / 285, tokens per step
+3.96 / 7.80 / 12.17 / 14.26, acceptance 98 / 98 / 98 / 97%). The m > 8 cliff is gone: at m = 13 the step is now
+*cheaper per row* than at m = 8, where on Nov 7 `-hdt 12` (the same 13 rows, no MMODE 5) gave 38.3 t/s, i.e. 300-320 ms
+per step at the same acceptance, ~23-25 ms per row - i.e. **+29% at hdt 12 in the same cooled load** (49.4 vs 38.3 t/s),
+hdt 7 inside the noise
+(47.4 vs 49.0) and hdt 0 lower by the cold-cache/placement noise (37.7 vs 42.5).
+
+Caveats, in order of size:
+- **Thermal**: the P100 throttles to 784-1189 MHz during the later turns of a load, and the widths run in a fixed order
+  within a round, so a2/b1 cannot compare widths (their hdt 12/15 turns ran at 784-1160 MHz against 1328 for hdt 7).
+  Only a1 (cooled, first round at 1328 MHz, all four widths within 1303-1328 MHz) compares widths fairly; a future A/B
+  must either interleave widths or cool between turns.
+- **Page cache**: a1 is the first load of the session and pays the cold n-gram table reads (hdt 0: 37.7 against 50.3 in
+  the warm loads at the same clock). The cold penalty is per step, so it flatters the wide widths slightly in a1; the
+  per-row comparison above is corrected for it only qualitatively.
+- **The M16=0 arm was not measured.** b1 was intended as it, but `bench_rewrite.py` cleared `EXL3_GEMV_M16` before its
+  warm-up turn (only the `-m16ab` path should do that), so all three loads ran with the path on - the JSON's `m16`
+  field records 1 for every row. Fixed; a valid pair is the next measurement.
+- **Exactness**: the kernel-level bit-identity test is the strong evidence. In the model, the greedy text was identical
+  across all four draft widths of the same load for the same prompt (k = 100: a2 and b1 both 717ed118ca; k = 101 in b1
+  all four widths 82af09ba66; a1's k = 100 all four widths 711f6fbdff, its k = 101 text was not accumulated by the old
+  harness). One outlier: a2 k = 101 hdt 7 differed from hdt 0/12/15 - that is m = 8, where MMODE 5 is not used, so it is
+  the known run-to-run drift, not the new path.
+
+**Verdict / next.** With MMODE 5 the 13/16-row verification no longer pays the tile-GEMM penalty, so `-hdt 12` is back
+in play as the copy-heavy code setting (49.4 t/s against 47.4 at `-hdt 7` in the same cooled load; +29% over the Nov 7
+`-hdt 12` number), and the dense part of the step is now flat in the number of verification rows. What is left of the
+per-row cost at m = 13 (18.9 ms/row) is the MoE (distinct experts grow with the verification width) and the R > 4
+gated-residual pair, not the GEMV. Remaining work: one valid cooled ABBA pair with `EXL3_GEMV_M16=0` (the harness is
+fixed), and, if the wide widths are to be the default, a `-hdt` recommendation that accounts for the extra MoE time per
+row on non-copying turns.
+
