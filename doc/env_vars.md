@@ -328,6 +328,16 @@ Pascal (sm_60), m = 3..4 rows (MTP verify at `-ndt 2/3`): the GEMV takes MMODE 4
 with one output per lane, bit-identical to the MMA path and 10-40% faster. `0` restores the MMA path (MMODE 1).
 Read per call.
 
+### `EXL3_GEMV_M16` (default: `1`)
+
+Pascal/Turing, m = 9..16 rows: the GEMV takes MMODE 5, the MMA path with both row groups of the m16n8k16
+fragments live (the second group costs one more A load per k-slice, one more fold accumulator and 16 instead
+of 8 shared-memory rows; bit-identical by construction to splitting the call into two m <= 8 GEMVs). Without
+it, `m > 8` leaves the GEMV entirely and the dense projections run the tile GEMM, which on sm_60 is several
+times off the roofline at those batches — the difference between -hdt 7 and -hdt 12 paying or not on copy-heavy
+agentic turns. Instances exist for 4/5/6 bpw mul1 only (the dense-projection classes of Qwen3.8-Flash-Next);
+every other width, codebook, half-integer rate and `m > 16` keeps the old fallback. `0` disables. Read per call.
+
 ### `EXL3_GEMV_SMEM` (default: `-1`)
 
 Weight-extraction strategy inside the fp16 GEMV kernel: `-1` picks per bitrate (default), `0`
@@ -486,6 +496,20 @@ Memcpy threads used by the worker's dedicated stager (which packs streamed exper
 into the pinned staging ring, concurrently with the compute pool working the CPU tail). A few
 threads saturate host memcpy bandwidth; raising this mainly helps wide streamed batches on
 models with many small experts (see issue trace on Qwen3.6-35B-A3B).
+
+### `EXL3_MOE_STREAM_T` (default: per-device, bandwidth-scaled from `16`)
+
+### `EXL3_MOE_ASYNC_DMA` (default: `1`)
+
+Issue the streamed-expert weight DMAs and the CPU-tail slot transfers as raw `cudaMemcpyAsync` on the
+current stream instead of torch `Tensor.copy_`. The handoff segment and the pinned arena are
+`cudaHostRegister`'ed shared memory, which torch's `copy_` does not reliably classify as pinned: it
+stages the transfer through a pageable buffer and blocks the host until the DMA completes. On the
+Qwen3.8-Flash-Next prefill that was 13 s of the 21 s main-thread time per 4096-token chunk (2.1 s of
+actual HtoD transfer over a Gen3 x4 link); replacing it raised cold prefill from 188-200 t/s to
+245-262 t/s at 4096 tokens and 240-249 to 274-275 t/s at 8192 tokens. See the progress log for the
+output-identity check on this model.
+`0` restores `copy_` for A/B.
 
 ### `EXL3_MOE_STREAM_T` (default: per-device, bandwidth-scaled from `16`)
 
@@ -1047,6 +1071,24 @@ Linux only. The process's `RLIMIT_MEMLOCK` must cover the table (the soft limit 
 hard limit when that suffices; `ulimit -l unlimited`, `LimitMEMLOCK=infinity` for systemd
 services) or the interpreter needs `CAP_IPC_LOCK`; this is checked before the table loads. Also
 `--ngram_lock` / `-ngl` in `model_init`-based scripts.
+
+### `EXL3_NGRAM_RAMP` (default: `1`), `EXL3_NGRAM_RAMP_FIRST` (default: one page), `EXL3_NGRAM_RAMP_GROW` (default: `2.0`)
+
+Progressive first prefill chunks for models that stream a row table from disk (PLE n-gram tables): a cold
+prompt's first chunk is the one row gather with nothing to overlap, and its cost is linear in the rows it
+touches (~300 us per cold random row on this machine's USB SSD, queue depth 1). On a dedicated prefill the
+first chunks ramp up from `EXL3_NGRAM_RAMP_FIRST` tokens, multiplied by `EXL3_NGRAM_RAMP_GROW` each chunk
+until the normal `--chunk_size`; the later chunks' gathers then run on the row-table worker behind the GPU
+work of the earlier ones. Only chunk boundaries change (page aligned, same token order and forward
+semantics). Gated off for multimodal inputs, tensor parallel, and shared/cooldown chunking (when another job
+is generating). `EXL3_NGRAM_RAMP=0` restores the fixed chunking. See also the exact next-chunk lookahead
+(`ple_prefetch_next`), which now mirrors the prefill loop's bounds including the recurrent last-page split.
+
+### `EXL3_NGRAM_PREFETCH_MIN` (default: `64`)
+
+Position count below which a row-table prefetch declines to stage on the worker thread (decode-sized
+inputs gather inline, faster than the thread hop). The old default of 256 left the last chunk of a
+4096/8192-token prompt (255 positions) gathering inline at the PLE layer, exposed in the prefill.
 
 ### `EXL3_EMBED_STREAM` (default: `0`)
 
