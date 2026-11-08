@@ -201,6 +201,18 @@ def main(args):
               f"len {len(out)} | {out[:80]!r}", flush = True)
         rec.add(dict(kind = "textcheck", n = n, offset = offset, text = out))
 
+    def text_check_toggle(n, offset, rounds):
+        """Identity gate for a copy-path change: the same cold chunk prefilled and continued
+        greedily several times inside ONE process, alternating TUNING.async_dma. Same load and
+        same expert placement, so within-mode repeats bound the harness's own nondeterminism
+        (the streamed MoE tier accumulates with float atomics) and on-vs-off differences can be
+        judged against it."""
+        from exllamav3.model.moe_cpu_host import TUNING
+        for i, on in enumerate(rounds):
+            TUNING.async_dma = bool(on)
+            print(f"TOGGLE round {i} async_dma={int(on)}", flush = True)
+            text_check(n, offset)
+
     def profile(kind, fn):
         with torch.profiler.profile(
             activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
@@ -290,6 +302,9 @@ def main(args):
             print_hooks("prefill")
         if args.check_text:
             text_check(args.check_text, k * stride + 7)
+        if args.check_text_toggle:
+            text_check_toggle(args.check_text or 1024, k * stride + 7,
+                              [int(c) for c in args.check_text_toggle.split(",")])
 
     dec = [d["t_s"] for d in rec.rows if d["kind"] == "decode"]
     pp = {}
@@ -301,7 +316,8 @@ def main(args):
         print("SUMMARY prefill: " + ", ".join(f"{n}: {sum(v) / len(v):.0f} t/s" for n, v in pp.items()))
     if args.json:
         with open(args.json, "w") as f:
-            json.dump(dict(tag = args.tag, load_s = load_s, rows = rec.rows, hooks = HOOKS), f, indent = 1)
+            hooks_json = {f"{k[0]}.{k[1]}" if isinstance(k, tuple) else str(k): v for k, v in HOOKS.items()}
+        json.dump(dict(tag = args.tag, load_s = load_s, rows = rec.rows, hooks = hooks_json), f, indent = 1)
         print(f"JSON {args.json}")
 
 
@@ -321,6 +337,10 @@ if __name__ == "__main__":
     parser.add_argument("-profile_file", "--profile_file", type = str, default = None)
     parser.add_argument("-record_shapes", "--record_shapes", action = "store_true",
                         help = "torch.profiler record_shapes (aten op input shapes, e.g. the fallback GEMM shapes)")
+    parser.add_argument("-check_text_toggle", "--check_text_toggle", type = str, default = None,
+                        help = "comma-separated async_dma values: run one text check per round at the same "
+                               "cold offset inside one process, flipping moe_cpu_host.TUNING.async_dma "
+                               "(identity gate for the copy-path change)")
     parser.add_argument("-trace", "--trace", type = str, default = None,
                         help = "export the torch.profiler window as a chrome trace to <prefix>.<kind>.json")
     parser.add_argument("-profile_decode", "--profile_decode", action = "store_true")
