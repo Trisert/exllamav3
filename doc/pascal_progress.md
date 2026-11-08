@@ -1453,7 +1453,10 @@ the same GEMV config as the separate calls the per-output arithmetic is identica
 bit-identical: verified against the model's own dispatch for qkv+z at m = 1 and 2 and for the k+v pair
 (tmp/dbg_fused2.py, EXACT). A q+k+v group is deliberately NOT used: its fused width selects the wide
 config while the model's k/v calls take the narrow one, which changes the k-split and the last ULPs.
-Wired into gated_delta_net.py for the split qkv/z projections behind EXL3_GEMV_FUSED (default 1);
+Wired into gated_delta_net.py for the split qkv/z projections behind EXL3_GEMV_FUSED (default 1) and
+into attn.py for the k_proj + v_proj pair behind EXL3_GEMV_FUSED_KV (default 1, disabled as well when
+EXL3_GEMV_FUSED=0: the pair is exact but its ~0.12 ms is below single-load noise, so the two groups
+are switched separately for A/B);
 GatedDeltaNet.gemv_qkvz_fused returns None and the two linears run as before when the config does not
 qualify.
 
