@@ -25,7 +25,10 @@ from ..util import profile_opt
 # start with one page and double up to the normal chunk size. Only the chunk boundaries of a
 # dedicated prefill change: page alignment, the token order and the forward semantics are the
 # same, and the later chunks' gathers then run behind the GPU work of the earlier ones.
-NGRAM_RAMP = os.environ.get("EXL3_NGRAM_RAMP", "1") != "0"
+# Default OFF: the ramp removes 5-20x of the exposed n-gram wait (hooks, Nov 8) but in a cooled, cold-row
+# pair it did not convert that into wall time - the extra forwards and the ~60 %-per-token efficiency of
+# the small chunks cost about what the stall costs (see doc/pascal_progress.md). Kept as a switch.
+NGRAM_RAMP = os.environ.get("EXL3_NGRAM_RAMP", "0") != "0"
 NGRAM_RAMP_FIRST = max(PAGE_SIZE, int(os.environ.get("EXL3_NGRAM_RAMP_FIRST", str(PAGE_SIZE))))
 # Growth factor per chunk, rounded to whole pages. 1.5 costs one or two more (cheap) forwards and
 # keeps every chunk's gather inside the previous chunk's compute time; 2.0 reaches the full chunk

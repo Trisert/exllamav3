@@ -34,7 +34,7 @@ PREFETCH_ENABLED = os.environ.get("EXL3_NGRAM_PREFETCH", "1") != "0"   # debug/A
 PREFETCH_MIN_TOKENS = int(os.environ.get("EXL3_NGRAM_PREFETCH_MIN", "64"))
 DEBUG = os.environ.get("EXL3_NGRAM_DEBUG", "0") != "0"   # print the wait of every large lookup
 PREFETCH_AHEAD = os.environ.get("EXL3_NGRAM_PREFETCH_AHEAD", "1") != "0"   # stage the next prefill chunk's rows too
-MAX_PIN_SETS = max(2, int(os.environ.get("EXL3_NGRAM_PIN_SETS", "2")))   # staging sets: one with the last forward's uploads in flight, one being staged
+MAX_PIN_SETS = 2           # staging sets: one with the last forward's uploads in flight, one being staged
 INLINE_MAX_ROWS = 16        # rows of a table that gets read-ahead hints, below which a gather reads in line
 # Before a large gather from disk, ask the kernel for every row at once (posix_fadvise WILLNEED) so the device
 # sees a deep queue of random reads instead of the gather threads' few outstanding ones (slow SATA/USB SSDs)
