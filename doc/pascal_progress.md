@@ -1293,3 +1293,78 @@ gated-residual pair, not the GEMV. Remaining work: one valid cooled ABBA pair wi
 fixed), and, if the wide widths are to be the default, a `-hdt` recommendation that accounts for the extra MoE time per
 row on non-copying turns.
 
+## Qwen3.8-Flash-Next: decode and prefill optimization round - integration (Nov 8, branch `flash-opt`)
+
+Three workstreams developed in parallel by three agents in separate worktrees, each measured against the same tree, then
+merged here: `flash-opt` = `flash-ngram-prefetch` 89fe340e (which already contains `pascal-27b-run` and the Nov 7
+Flash-Next work) + the three branches below. End-to-end config for every run: `-gs 4.0,15.0 -cs 24576 -cq 4 -mcs 256`,
+plus `-mtp -ndt 3 -sdh 16384` when decoding; greedy; P100 temperature and clock logged before/after every run.
+
+Hardware facts measured this round (not datasheet): the P100 trains at PCIe Gen3 **x4** (2.75-2.83 GB/s measured; the RTX
+2060 is x16 at 12.96-12.98 GB/s); the model disk is a USB **Bulk-Only** bridge (ASM1051E, protocol 0x80) with device
+`queue_depth 1`, so a cold random 62-byte n-gram row costs 280-340 us regardless of thread count and the 19.8 GB table is
+latency-bound, not bandwidth-bound; the host has 31 GB of RAM (a model load plus a CUDA build do not coexist: one TU peaks
+at ~7.5 GB).
+
+### What changed
+1. **N-gram row table (prefill I/O)**, branch `flash-ngram-io`: exact next-chunk lookahead (`Job._next_chunk_end`
+   mirrors the prefill loop's own bounds including the recurrent last-page split - the Nov 7 erratum, where the staged set
+   predicted 4095 tokens and the loop then ran 3840), `PREFETCH_MIN_TOKENS` 256 -> 64 (`EXL3_NGRAM_PREFETCH_MIN`) so the
+   255-token final chunk is staged instead of gathered inline (~0.39 s per cold prefill), and progressive first chunks
+   (`EXL3_NGRAM_RAMP`, default **off** - see below).
+2. **Streamed CPU-expert copies (prefill)**, branch `flash-prefill-gpu`: per-job issue/readback and VRAM-ring DMAs use a
+   raw `cudaMemcpyAsync` (`EXL3_MOE_ASYNC_DMA`, default on) instead of `Tensor.copy_`, which does not recognise
+   `cudaHostRegister`'ed memory as pinned; correct by construction, performance-neutral in the warm-placement case. The
+   traces taken for it found the real remaining serialization (open lead 1 below).
+3. **Decode**, branch `flash-decode-draft`: GEMV MMODE 5 for m = 9..16 verification rows (`EXL3_GEMV_M16`, default on;
+   the m16n8k16 fragments already carry rows 8..15, so the second group costs one more A load per k-slice, one more fold
+   accumulator and 16 instead of 8 shared-memory rows; bit-identical to two m <= 8 GEMVs; 11/11 new tests on the P100,
+   3 pass + 8 Pascal-only skips on the 2060, gemv/m34/tail regressions 52 passed/1 skipped on both; no spills, 1 block/SM,
+   staged smem 38.9 KB < 48 KB). This removes the reason `-hdt 12` used to collapse: at m = 13 the dense projections used
+   to leave the GEMV for the sm_60 tile GEMM.
+
+### Measured results (same protocol: cold prompt, n-gram page cache dropped, P100 cooled before the load, 1328 MHz)
+
+| measurement | before (`flash-opt`) | after (this branch) |
+| :--- | ---: | ---: |
+| cold prefill 4096 tok | 194.5 t/s (21.06 s), 73-75 C | 206.5 t/s (19.84 s), 66-68 C |
+| cold prefill 16384 tok | 236.3 t/s (69.34 s), 75-79 C, 1088 MHz at the end | 238.7 t/s (68.64 s), 68-75 C, 1328 MHz |
+| decode, code prompt, 300 greedy tok | 40.21 t/s, 81.6% accept, 3.48 tok/step | 40.94 t/s, 84.3% accept, 3.56 tok/step |
+| copy-heavy agentic turn, 500 tok, `-hdt 0` | 37.7-42.5 t/s | 37.7 t/s (same load as the rows below) |
+| copy-heavy agentic turn, `-hdt 7` | 47.0-47.4 t/s | 47.4 t/s |
+| copy-heavy agentic turn, `-hdt 12` | 38.3 t/s (Nov 7, no MMODE 5, tile-GEMM fallback) | **49.4 t/s** (+29% over Nov 7; same load as `-hdt 7`) |
+| copy-heavy agentic turn, `-hdt 15` | n/a | 48.7 t/s |
+
+Reading the table honestly: (a) the two end-to-end prefill rows were run on the after-tree 6-8 C cooler at load start, so
+the 4096 difference (+6%) is partly thermal and the 16384 one (+1%) is inside run-to-run noise: **the prefill wall time is
+unchanged in this round**, while the n-gram stall itself is mechanically 5-20x smaller (exposed first gather 3.2-4.0 s ->
+0.2-0.7 s, 5/5 and 7/7 lookups HIT prefetched) and the remaining serialization is now identified and quantified (open lead
+1). (b) The copy-heavy rows come from the cooled load `a1` (P100 64 C at start, 1328 MHz; hdt 0/7/12/15 in ONE load,
+98% acceptance, 3.96 / 7.80 / 12.17 / 14.26 tokens per step, 26.1 / 20.3 / 18.6 / 17.8 ms per row): at 13 rows the step
+is cheaper per row than at 8, and greedy text was identical across the four widths in the same load. (c) The standard
+decode row is inside the +-5-10% run-to-run spread: MMODE 5 does not touch m <= 8, so no change is expected there.
+
+### Committed defaults and recommended run config
+- Defaults: `EXL3_GEMV_M16=1`, `EXL3_MOE_ASYNC_DMA=1`, `EXL3_NGRAM_PREFETCH_MIN=64`, `EXL3_NGRAM_RAMP=0`.
+- Agentic code / copy-heavy turns: `-mtp -ndt 3 -sdh 16384 -hdt 12` (`-hdt 7` when a turn may not be copying: a long
+  draft that is not accepted costs MoE time).
+- Free-form chat / prose: no `-hdt` (acceptance there is 30-40%, extra draft positions do not pay).
+- Long context unchanged: `-cs 131072 -mcs 272` .. `-cs 262144 -mcs 320`.
+
+### Open leads (measured, not done, ranked)
+1. **355 blocking pageable DtoH readbacks** in the CPU-tail handoff: 13.16 s of host-blocked CPU time per 4096-token cold
+   prefill (median 2.1 kB each, 20-150 ms per call waiting on the compute stream) against ~10.5 s of P100 busy. A pinned
+   ring with the copy consumed one layer later, or deferring the collect across layers, should recover several seconds per
+   chunk (16 s -> ~11-12 s estimated).
+2. **P100 small-grid reconstruct GEMMs fall back to cuBLAS**: 0.845 s `aten::mm` + 0.84 s `hgemm_*` on one 4096-token
+   prefill; `hgemm_f16acc`'s `pick_tile` rejects < 96 blocks of 64 rows. The 2060's reconstruct GEMMs are excluded from
+   `hgemm_f16acc` by an Ampere+ gate (0.23 s).
+3. **MoE prefill kernel** is still the largest GPU item: 4.9 s of a 14 s GPU budget on a cold 4096-token prefill
+   (2.43 s in `exl3_moe_kernel<1,128,2,16,true>`).
+4. **Ramp**: the stall is mechanically hidden but the CPU contention eats the gain; re-measure at 16k-64k prompts after
+   lead 1 frees the CPU tail.
+5. **M16 = 0 arm**: the intended off-arm of the decode A/B never ran (a harness env reset) and the second pair was
+   thermally unusable (784-1316 MHz); the +29% at `-hdt 12` is against the Nov 7 cross-session number. One cooled 2-load
+   pair with the fixed harness is the outstanding check.
+6. **Chunk plans**: greedy text across differing chunk plans was not compared; whoever enables the ramp should run the
+   one-load md5 check first.
