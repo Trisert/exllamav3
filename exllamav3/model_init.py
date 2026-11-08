@@ -137,6 +137,7 @@ def add_args(
         parser.add_argument("-sdh", "--sparse_draft_head", type = int, default = 0, help = "Draft through a dynamic sparse LM head of this many vocabulary columns (MTP/DFlash drafting; 0 = full head)")
         parser.add_argument("-dc", "--draft_confidence", type = float, help = "Confidence target for dynamic draft truncation, default: 0.4", default = 0.4)
         parser.add_argument("-dmcl", "--draft_moe_cpu_layers", type = int, help = "Experimental: like --moe_cpu_offload, but for the draft model (or MTP head)", default = 0)
+        parser.add_argument("-dgs", "--draft_gpu_split", type = str, default = None, help = "GPU split for the draft model, comma-separated per-device limits in GB (default: --gpu_split; 0 disables a device). Example: -dgs 0,3.0 keeps the drafter off the first device")
 
 
 def get_arg_sampler(args):
@@ -354,6 +355,12 @@ def init(
         split = None
     else:
         split = [float(alloc) for alloc in args.gpu_split.split(",")]
+    # The drafter can take its own per-device limits: with a separate draft model the two loads share
+    # the same --gpu_split otherwise, and on an asymmetric pair (16 GB + 6 GB) the drafter is then
+    # placed on whichever device has room first, which moves the target's layer split with it
+    draft_split = split
+    if getattr(args, "draft_gpu_split", None):
+        draft_split = [float(alloc) for alloc in args.draft_gpu_split.split(",")]
 
     # Parallelism options
     tp_options = {
@@ -381,7 +388,7 @@ def init(
     elif draft_model_dir:
         printp(not quiet, f" -- Loading {draft_model_dir}")
         draft_model.load(
-            use_per_device = split,
+            use_per_device = draft_split,
             progressbar = progress,
             verbose = args.load_verbose,
             max_batch_size = args.autosplit_max_batch_size,

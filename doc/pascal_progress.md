@@ -1668,3 +1668,44 @@ phases and the dependency chain leaving nothing to overlap. The two structural o
 -15%; component overlap across the cards has no room because the layers are serial). What is left is single-digit percent
 from the four items above; the realistic band for this model on this pair is **85-90 t/s**, against 83.1 t/s measured at
 the serving config in this session (80.4-80.9 in the cold-load A/B), and 82.1-84.5 t/s in the earlier sessions.
+## Qwen3.8-27B (dense) + DFlash2 drafter: MTP vs DFlash2, measured (Nov 8, branch `qwen38-27b-dflash2`)
+
+Target `models/Qwen3.8-27B-exl3`: 4.0 bpw body, 5 bpw lm_head, 64 layers (48 GDN + 16 full attention), hidden 5120,
+MLP 17408, vocab 248320, 1-layer MTP head at 4 bpw, 14.7 GiB text + 0.2 GiB MTP (the 0.86 GiB vision tower is not
+loaded for text inference). Drafter `models/Qwen3.8-27B-DFlash2-EXL3-5.0bpw`: block-diffusion DFlash2, block_size 8
+(= 7 drafted tokens per step), 5 layers, selector rank 256 / top-k 16, 1.4 GiB at 5 bpw; it attaches to the target -
+the target exports hidden states at layers 5/19/33/47/61 and the drafter's selector walks the target's lm_head over the
+block rows. Config for every arm: `-gs 4.0,15.0 -cs 32768 -cq 4`, greedy, "Implement a quicksort in go", 300 tokens,
+one load per arm, P100 cooled to <= 62 C before the turn, `bench_chat.py`.
+
+| arm | t/s | tok/step | draft accept | loads |
+| :--- | ---: | ---: | ---: | ---: |
+| plain (no draft) | 15.57 | 1.00 | - | 1 |
+| MTP `-ndt 1 -dds` | 24.38 | 1.94 | 93.5% | 1 |
+| MTP `-ndt 2 -dds` | 27.56 | 2.69 | 83.9% | 1 |
+| MTP `-ndt 3 -dds` | 32.35 / 32.03 | 3.36 | 77.8% | 2 |
+| **DFlash2, full block (7 verified)** | **38.77 / 38.57** | 5.75 | 66.6% | 2 |
+| DFlash2 `-ndt 3` (3 verified) | 32.85 | 3.65 | 87.1% | 1 |
+| DFlash2 `-ndt 5` (5 verified) | 22.87 | 4.98 | 78.4% | 1 (outlier) |
+
+DFlash2 at its full block is **+19-20% over the best MTP** and repeats within 0.5% across loads. Do not truncate its
+verified window: the drafter always runs the full 8-row block, so a smaller window throws away accepted tokens without
+making the forward cheaper - at 3 verified tokens it lands on top of MTP `ndt 3` (32.85 vs 32.35), and the 5-token arm
+is an outlier explained by placement (below), not by the window. The step at the full block is ~148 ms for 5.75
+tokens/step: the 8-row verify amortizes the weight reads much better than MTP's 4-row one (18.5 vs ~30 ms per token
+across the whole step).
+
+**Placement caveat, and the new `-dgs` option.** With a separate drafter both models take the same `--gpu_split` in
+turn: the 1.4 GB drafter loads first onto the 2060, then the target's autosplit sees only ~4 GB of that card - and the
+2060 ends up at 5700 of its 5729 MiB (drafter + target layers + caches, measured: P100 12137 MiB / 2060 5707 MiB during
+the decode). The target's layer split therefore moves with whatever the desktop holds on the 2060: the same
+`df2_7` config measured 26.0 t/s on its very first (cold) load against 38.6-38.8 on the later ones. To make it
+deterministic, `exllamav3/model_init.py` now accepts `-dgs/--draft_gpu_split <per-device GB>` (default: the
+`--gpu_split` list; `0` disables a device) so the drafter can be pinned to the P100 (`-dgs 0,3.0`), giving the 2060
+its space back for target layers. Implemented and compile-checked, **not measured yet** - the next step is
+`-dgs 0,3.0` against the default with 2 loads per side.
+
+Where the time goes at the full block (estimates from the m-scaling of the Nov 5 dense-27B profile, to be measured with
+a profile trace): the P100's 48-layer share is ~2.3 ms/layer at m = 8 against ~1.3 ms/layer on the 2060 (its MMODE 1
+GEMV is flat in m), so at this verify width the 2060 is the fast card per layer and the interesting lever is moving
+target layers onto it (i.e. exactly what `-dgs` enables).
