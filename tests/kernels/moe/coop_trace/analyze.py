@@ -1,6 +1,8 @@
-import numpy as np, sys, collections
+import numpy as np, sys, collections, os
+ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../.."))
+OUT = os.environ.get("COOP_TRACE_DIR", os.path.join(ROOT, "tmp", "coop_trace"))
 def analyze(nm):
-    rec = np.load(f"coop_trace_{nm}.npy"); rec = rec[np.argsort(rec[:,0], kind="stable")]
+    rec = np.load(os.path.join(OUT, f"coop_trace_{nm}.npy")); rec = rec[np.argsort(rec[:,0], kind="stable")]
     t0,t1,meta,x = rec[:,0],rec[:,1],rec[:,2],rec[:,3]
     kind=(meta>>8)&255; blk=(meta>>16)&0xffff
     tw2 = (x & 0xffffffff)/1000.0; tw1 = (x >> 32)/1000.0
@@ -14,7 +16,7 @@ def analyze(nm):
         for kk,n in enumerate(["sharedA","routedA","sharedB","routedB"]):
             m = (kind[c]==kk)
             d = (t1[c][m]-t0[c][m])/1000
-            real = tw2[c][m] > 0                      # items that ran a GEMV (not "no run" exits)
+            real = tw2[c][m] > 0
             wait = np.where(real, tw1[c][m], 0)
             gemv = np.where(real, tw2[c][m]-tw1[c][m], 0)
             epi = np.where(real, d - tw2[c][m], 0)
