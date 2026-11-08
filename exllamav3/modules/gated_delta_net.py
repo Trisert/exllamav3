@@ -24,6 +24,9 @@ _bc_gdn_enable = os.environ.get("EXL3_BC_GDN", "1") != "0"
 # Prefill projections (qkv, z, forget/beta gates) come out of the GEMM in fp16 rather than fp32.
 # EXL3_GDN_PROJ_FP32=1 restores fp32
 _proj_dtype = torch.float if os.environ.get("EXL3_GDN_PROJ_FP32", "0") != "0" else torch.half
+# qkv/z through one fused GEMV launch (quant/exl3_gemv_fused.cuh; sm_60, 1-2 rows, 4 bpw mul1).
+# Off/on A/B via EXL3_GEMV_FUSED=0/1.
+_GEMV_FUSE = os.environ.get("EXL3_GEMV_FUSED", "1") != "0"
 # KDA's per-channel forget gate and beta logits: separate knob, the decay chain they feed is
 # where fp16 rounding compounds (see the A/B in the docs)
 _gate_dtype = torch.float if os.environ.get("EXL3_GDN_GATE_FP32", "1") != "0" else torch.half
@@ -1210,6 +1213,40 @@ class GatedDeltaNet(Module):
 
 
     @override
+    def gemv_qkvz_fused(self, x, dtype_qkv):
+        """in_proj_qkv and in_proj_z through ONE fused GEMV launch. Returns (qkv, z) or None when
+        the configuration does not qualify (then the caller runs the two linears as before).
+        P100 only, 1-2 rows, 4 bpw mul1 with a trellis: exactly the shapes whose separate calls
+        use the same GEMV config, so the outputs are bit-identical (tests/kernels/gemm)."""
+        if not _GEMV_FUSE or self.qkv_proj is None or self.z_proj is None:
+            return None
+        iq, iz = self.qkv_proj.inner, self.z_proj.inner
+        if getattr(iq, "trellis", None) is None or getattr(iz, "trellis", None) is None:
+            return None
+        if not (iq.mul1 and iz.mul1) or iq.mcg or iz.mcg or iq.K != 4 or iz.K != 4:
+            return None
+        if getattr(iq, "bias", None) is not None or getattr(iz, "bias", None) is not None:
+            return None
+        if self.qkv_proj.trim_padded_out or self.z_proj.trim_padded_out:
+            return None
+        xf = x.reshape(-1, x.shape[-1])
+        if xf.shape[0] > 2 or xf.shape[1] != iq.in_features:
+            return None
+        if not xf.is_contiguous():
+            xf = xf.contiguous()
+        if xf.dtype != torch.half:
+            xf = xf.to(torch.half)
+        rows, k = xf.shape
+        nq, nz = iq.out_features, iz.out_features
+        cq = torch.empty((rows, nq), dtype = dtype_qkv or torch.half, device = xf.device)
+        cz = torch.empty((rows, nz), dtype = torch.float, device = xf.device)
+        had = getattr(self, "_gemv_had", None)
+        if had is None or had.numel() < 2 * rows * k or had.device != xf.device:
+            had = self._gemv_had = torch.empty(2 * rows * k, dtype = torch.half, device = xf.device)
+        ext.exl3_gemv_fused(xf, [iq.trellis, iz.trellis], [cq, cz], [iq.suh, iz.suh], had,
+                            [iq.svh, iz.svh], False, True)
+        return cq.view(*x.shape[:-1], nq), cz.view(*x.shape[:-1], nz)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1407,8 +1444,12 @@ class GatedDeltaNet(Module):
             if getattr(self, "multi_qkvz", None) is not None and bsz * seqlen <= 32:
                 qkv, z = self.project_qkvz_sliced(x, bsz, seqlen)
             else:
-                qkv = self.qkv_proj.forward(x, params, out_dtype = _proj_dtype)
-                z = self.z_proj.forward(x, params)   # fp32: the gated norm takes a bf16 or fp32 gate
+                fused = self.gemv_qkvz_fused(x, _proj_dtype)
+                if fused is not None:
+                    qkv, z = fused
+                else:
+                    qkv = self.qkv_proj.forward(x, params, out_dtype = _proj_dtype)
+                    z = self.z_proj.forward(x, params)   # fp32: the gated norm takes a bf16 or fp32 gate
             z = z.view(bsz, seqlen, self.num_v_heads, self.v_head_dim)
             b = self.b_proj.forward(x, params)
             a = self.a_proj.forward(x, params)

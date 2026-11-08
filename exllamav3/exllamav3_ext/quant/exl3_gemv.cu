@@ -8,6 +8,7 @@ namespace cg = cooperative_groups;
 #include "../util.h"
 #include "../util.cuh"
 #include "exl3_gemv_kernel.cuh"
+#include "exl3_gemv_fused.cuh"
 #include "exl3_devctx.cuh"
 #include <map>
 
@@ -341,3 +342,112 @@ void exl3_gemv
 
     cuda_check(cudaPeekAtLastError());
 }
+
+// Fused multi-matrix GEMV (sm_60 direct path, see exl3_gemv_fused.cuh): one cooperative launch
+// computes several same-input EXL3 linears of one layer. Python passes the matrices in compute
+// order plus a scratch A_had of at least num_matrices * rows * k halves; the outputs land in the
+// caller's C tensors. Only for m = 1 / 2, 2..4 bpw mul1, integer rates. Bit-identical to the
+// per-matrix exl3_gemv calls (same k-split, partials, reduction order and epilogue).
+void exl3_gemv_fused
+(
+    const at::Tensor& A,
+    const std::vector<at::Tensor>& Bs,
+    const std::vector<at::Tensor>& Cs,
+    const std::vector<at::Tensor>& suhs,
+    at::Tensor& A_had,
+    const std::vector<at::Tensor>& svhs,
+    bool mcg,
+    bool mul1
+)
+{
+    using namespace exl3_gemv_fused_ns;
+    const int num = (int) Bs.size();
+    TORCH_CHECK(num >= 2 && num <= MAX_MATRICES, "exl3_gemv_fused: 2..4 matrices");
+    TORCH_CHECK((int) Cs.size() == num && (int) suhs.size() == num && (int) svhs.size() == num,
+                "exl3_gemv_fused: mismatched matrix lists");
+    const at::cuda::OptionalCUDAGuard device_guard(A.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    int device;
+    cudaGetDevice(&device);
+    const int cc = DevCtx::instance().get_cc(device);
+    TORCH_CHECK(cc == CC_PASCAL, "exl3_gemv_fused: sm_60 only");
+    TORCH_CHECK(A.is_contiguous() && A.dtype() == at::kHalf, "exl3_gemv_fused: A must be contiguous fp16");
+    const int size_k = (int) A.size(-1);
+    const int size_m = (int) (A.numel() / size_k);
+    TORCH_CHECK(size_m == 1 || size_m == 2, "exl3_gemv_fused: 1 or 2 rows");
+    TORCH_CHECK(size_k % 128 == 0, "exl3_gemv_fused: k must be a multiple of 128");
+    TORCH_CHECK(!(mcg && mul1), "exl3_gemv_fused: both codebooks");
+    const int cb = mul1 ? 2 : (mcg ? 1 : 0);
+    TORCH_CHECK(cb == 2, "exl3_gemv_fused: mul1 codebook only");
+    const int tile_u16 = (int) Bs[0].size(2);
+    TORCH_CHECK(tile_u16 % 16 == 0, "exl3_gemv_fused: integer bitrates only");
+    const int bits = tile_u16 / 16;
+    TORCH_CHECK(bits >= 2 && bits <= 4, "exl3_gemv_fused: 2..4 bpw");
+    const bool c_fp32 = Cs[0].dtype() == at::kFloat;
+    TORCH_CHECK(A_had.is_contiguous() && A_had.dtype() == at::kHalf && A_had.is_cuda(),
+                "exl3_gemv_fused: A_had must be a contiguous fp16 CUDA tensor");
+    TORCH_CHECK(A_had.numel() >= (int64_t) num * size_m * size_k, "exl3_gemv_fused: A_had too small");
+
+    GemvFusedArgs fa = {};
+    fa.A = (const half*) A.data_ptr();
+    fa.A_had = (half*) A_had.data_ptr();
+    fa.size_m = size_m;
+    fa.size_k = size_k;
+    fa.num_matrices = num;
+    fa.locks = DevCtx::instance().get_locks(device);
+    int n_total = 0;
+    for (int i = 0; i < num; ++i)
+    {
+        TORCH_CHECK(Bs[i].is_cuda() && Bs[i].is_contiguous() && Bs[i].dtype() == at::kShort,
+                    "exl3_gemv_fused: B must be a contiguous int16 CUDA tensor");
+        TORCH_CHECK(suhs[i].is_cuda() && suhs[i].dtype() == at::kHalf &&
+                    suhs[i].numel() == size_k && suhs[i].is_contiguous(), "exl3_gemv_fused: bad suh");
+        TORCH_CHECK(svhs[i].is_cuda() && svhs[i].dtype() == at::kHalf && svhs[i].is_contiguous(),
+                    "exl3_gemv_fused: bad svh");
+        TORCH_CHECK((int) Bs[i].size(0) * 16 == size_k, "exl3_gemv_fused: k mismatch");
+        TORCH_CHECK((int) Bs[i].size(2) == tile_u16, "exl3_gemv_fused: mixed bitrates");
+        TORCH_CHECK(Cs[i].is_cuda() && Cs[i].is_contiguous(), "exl3_gemv_fused: C must be contiguous");
+        const int n = (int) Bs[i].size(1) * 16;
+        TORCH_CHECK(n % 128 == 0, "exl3_gemv_fused: n must be a multiple of 128");
+        TORCH_CHECK((int) svhs[i].numel() == n, "exl3_gemv_fused: svh width");
+        TORCH_CHECK(Cs[i].numel() >= (int64_t) size_m * n, "exl3_gemv_fused: C too small");
+        TORCH_CHECK((Cs[i].dtype() == at::kFloat) == c_fp32, "exl3_gemv_fused: mixed output dtypes");
+        fa.suh[i] = (const half*) suhs[i].data_ptr();
+        fa.svh[i] = (const half*) svhs[i].data_ptr();
+        fa.B[i] = (const uint16_t*) Bs[i].data_ptr();
+        fa.C[i] = (void*) Cs[i].data_ptr();
+        fa.n[i] = n;
+        n_total += n;
+    }
+    // Config: the Pascal width rule on the fused width (one launch over all the matrices' groups)
+    const int cfg = (n_total <= 8192 && n_total <= size_k) ? 0 : 1;
+    const int cols = cfg == 0 ? 32 : 64;
+    int groups = 0;
+    fa.g[0] = 0;
+    for (int i = 0; i < num; ++i)
+    {
+        TORCH_CHECK(fa.n[i] % cols == 0, "exl3_gemv_fused: n % cols");
+        groups += fa.n[i] / cols;
+        fa.g[i + 1] = groups;
+    }
+    const int mmode = size_m == 1 ? 0 : 2;
+    void* kernel = exl3_gemv_fused_select(bits, cb, c_fp32, mmode, cfg);
+    TORCH_CHECK(kernel, "exl3_gemv_fused: no kernel instance for this shape");
+    const int block_dim = cfg == 0 ? 512 : 256;
+    static std::map<void*, int> occ_cache_fused[MAX_DEVICES];
+    int bps;
+    auto it = occ_cache_fused[device].find(kernel);
+    if (it != occ_cache_fused[device].end()) bps = it->second;
+    else
+    {
+        cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, kernel, block_dim, 0));
+        occ_cache_fused[device][kernel] = bps;
+    }
+    const int num_sms = DevCtx::instance().get_num_sms(device);
+    const int grid = MIN(groups, bps * num_sms);
+    TORCH_CHECK(grid >= 1, "exl3_gemv_fused: empty grid");
+    void* kernel_args[] = { (void*) &fa };
+    cuda_check(cudaLaunchCooperativeKernel(kernel, dim3(grid), dim3(block_dim), kernel_args, 0, stream));
+    cuda_check(cudaPeekAtLastError());
+}
+

@@ -42,3 +42,18 @@ void exl3_gemv
     bool mcg,
     bool mul1
 );
+
+// Fused multi-matrix GEMV (sm_60, m = 1 / 2, 2..4 bpw mul1): one cooperative launch for several
+// linears that share the input. A_had is a scratch of num_matrices * rows * k halves; each matrix's
+// output goes to its own C tensor. Bit-identical to the per-matrix exl3_gemv calls.
+void exl3_gemv_fused
+(
+    const at::Tensor& A,
+    const std::vector<at::Tensor>& Bs,
+    const std::vector<at::Tensor>& Cs,
+    const std::vector<at::Tensor>& suhs,
+    at::Tensor& A_had,
+    const std::vector<at::Tensor>& svhs,
+    bool mcg,
+    bool mul1
+);
