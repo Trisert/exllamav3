@@ -100,7 +100,29 @@ class Rec:
 
 
 @torch.inference_mode()
+def install_copy_sites():
+    """Print the Python call site and size of every distinct Tensor.copy_ pattern (first hit
+    only). Used to identify the small GPU->CPU readbacks that block the host on the compute
+    stream (they show up as multi-ms cudaMemcpyAsync CPU time in the profiler)."""
+    import traceback
+    from torch import Tensor
+    org = Tensor.copy_
+    seen = set()
+    def inner(self, src, non_blocking = False):
+        key = (str(self.device), str(src.device), self.dtype, src.dtype,
+               self.numel() * self.element_size())
+        if key not in seen:
+            seen.add(key)
+            st = "".join(traceback.format_stack()[-9:-1])
+            print(f"COPY_SITE {key[0]}<-{key[1]} {key[2]} {key[4]} B\n{st}", flush = True)
+        return org(self, src, non_blocking = non_blocking)
+    Tensor.copy_ = inner
+
+
+@torch.inference_mode()
 def main(args):
+    if args.copy_sites:
+        install_copy_sites()
     if args.hooks:
         install_hooks()
 
@@ -169,6 +191,11 @@ def main(args):
 
     def prefill_run(n, offset):
         ids = ids_all[offset:offset + n].unsqueeze(0)
+        try:
+            from exllamav3.model.moe_cpu_host import TUNING as _T
+            async_dma = int(_T.async_dma)
+        except Exception:
+            async_dma = -1
         pre = smi(args.smi_index)
         job = Job(input_ids = ids, max_new_tokens = 1, stop_conditions = [], sampler = ArgmaxSampler())
         generator.enqueue(job)
@@ -180,9 +207,11 @@ def main(args):
         post = smi(args.smi_index)
         new_ctx = n - last.get("cached_tokens", 0)
         t = last.get("time_prefill", 1e-6) or 1e-6
-        d = dict(kind = "prefill", n = n, new_ctx = new_ctx, t_s = new_ctx / t, seconds = t, smi = f"{pre} -> {post}")
+        d = dict(kind = "prefill", n = n, new_ctx = new_ctx, t_s = new_ctx / t, seconds = t,
+                 smi = f"{pre} -> {post}", async_dma = async_dma)
         rec.add(d)
-        print(f"PREFILL {n} tok: {new_ctx} uncached at {d['t_s']:.1f} t/s ({t:.2f} s) | P100 {pre} -> {post}", flush = True)
+        print(f"PREFILL {n} tok: {new_ctx} uncached at {d['t_s']:.1f} t/s ({t:.2f} s) | "
+              f"async_dma={async_dma} | P100 {pre} -> {post}", flush = True)
 
     def text_check(n, offset):
         """Greedy continuation of a cold n-token chunk, printed as an md5: A/B runs that must be
@@ -200,6 +229,18 @@ def main(args):
         print(f"TEXTCHECK {n} tok @{offset}: md5 {hashlib.md5(out.encode()).hexdigest()} "
               f"len {len(out)} | {out[:80]!r}", flush = True)
         rec.add(dict(kind = "textcheck", n = n, offset = offset, text = out))
+
+    def text_check_toggle(n, offset, rounds):
+        """Identity gate for a copy-path change: the same cold chunk prefilled and continued
+        greedily several times inside ONE process, alternating TUNING.async_dma. Same load and
+        same expert placement, so within-mode repeats bound the harness's own nondeterminism
+        (the streamed MoE tier accumulates with float atomics) and on-vs-off differences can be
+        judged against it."""
+        from exllamav3.model.moe_cpu_host import TUNING
+        for i, on in enumerate(rounds):
+            TUNING.async_dma = bool(on)
+            print(f"TOGGLE round {i} async_dma={int(on)}", flush = True)
+            text_check(n, offset)
 
     def profile(kind, fn):
         with torch.profiler.profile(
@@ -268,8 +309,17 @@ def main(args):
     if args.run == "prefill" or args.run == "both":
         k = 1
         rates = {}
+        abba = [int(c) for c in args.abba_async.split(",")] if args.abba_async else None
+        if abba:
+            from exllamav3.model.moe_cpu_host import TUNING as _T
         for n in args.lengths:
             for r in range(args.repeat):
+                # Within-load A/B of the streamed-copy path: same process, same expert placement,
+                # so only the copy mechanism differs between adjacent runs; the alternation
+                # pattern spreads thermal drift over both modes
+                if abba:
+                    _T.async_dma = bool(abba[(k - 1) % len(abba)])
+                    print(f"ABBA run {k}: async_dma={int(_T.async_dma)}", flush = True)
                 if args.profile_prefill and k == 1:
                     with torch.profiler.profile(
                         activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
@@ -290,6 +340,9 @@ def main(args):
             print_hooks("prefill")
         if args.check_text:
             text_check(args.check_text, k * stride + 7)
+        if args.check_text_toggle:
+            text_check_toggle(args.check_text or 1024, k * stride + 7,
+                              [int(c) for c in args.check_text_toggle.split(",")])
 
     dec = [d["t_s"] for d in rec.rows if d["kind"] == "decode"]
     pp = {}
@@ -301,7 +354,8 @@ def main(args):
         print("SUMMARY prefill: " + ", ".join(f"{n}: {sum(v) / len(v):.0f} t/s" for n, v in pp.items()))
     if args.json:
         with open(args.json, "w") as f:
-            json.dump(dict(tag = args.tag, load_s = load_s, rows = rec.rows, hooks = HOOKS), f, indent = 1)
+            hooks_json = {f"{k[0]}.{k[1]}" if isinstance(k, tuple) else str(k): v for k, v in HOOKS.items()}
+        json.dump(dict(tag = args.tag, load_s = load_s, rows = rec.rows, hooks = hooks_json), f, indent = 1)
         print(f"JSON {args.json}")
 
 
@@ -321,6 +375,16 @@ if __name__ == "__main__":
     parser.add_argument("-profile_file", "--profile_file", type = str, default = None)
     parser.add_argument("-record_shapes", "--record_shapes", action = "store_true",
                         help = "torch.profiler record_shapes (aten op input shapes, e.g. the fallback GEMM shapes)")
+    parser.add_argument("-abba_async", "--abba_async", type = str, default = None,
+                        help = "comma-separated moe_cpu_host.TUNING.async_dma values, one per prefill run "
+                               "(within-load A/B of the streamed copy path: same process, same placement, "
+                               "no cross-load expert-placement confound)")
+    parser.add_argument("-copy_sites", "--copy_sites", action = "store_true",
+                        help = "print the Python call site of every distinct Tensor.copy_ pattern (first hit)")
+    parser.add_argument("-check_text_toggle", "--check_text_toggle", type = str, default = None,
+                        help = "comma-separated async_dma values: run one text check per round at the same "
+                               "cold offset inside one process, flipping moe_cpu_host.TUNING.async_dma "
+                               "(identity gate for the copy-path change)")
     parser.add_argument("-trace", "--trace", type = str, default = None,
                         help = "export the torch.profiler window as a chrome trace to <prefix>.<kind>.json")
     parser.add_argument("-profile_decode", "--profile_decode", action = "store_true")
