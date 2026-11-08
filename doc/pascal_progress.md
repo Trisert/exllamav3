@@ -863,6 +863,29 @@ MTP settings (35B, two prompts, 160 W): `-ndt 1` is the safe choice (57.3 t/s); 
 
 ## Ruled out (measured)
 
+- (Nov 7) Narrow / wide config of the EXL3 4 bpw GEMV for Ornith's projections on the P100 (`hgemv_bench/bench_exl3_gemv.py`, forced with
+  `EXL3_GEMV=3/4`, m = 2): 4096x2048 narrow 42.9 / wide 41.0 us (heuristic picks narrow), 2048x4096 33.7 / 38.1, 2048x8192 54.0 / 54.6,
+  2048x12288 73.4 / 71.7; the heuristic is within 5% of the best everywhere, so re-picking configs saves ~0.06 ms per iteration
+  (32 o_proj calls), not the 0.8-1.5 ms estimated. Small shapes cost a fixed ~15 us per launch (2048x512 and 2048x1024 both 16 us at
+  m = 2), i.e. launch count, not geometry; only fusing projections (k / v, router) could help, at most ~0.3-0.5 ms.
+
+- (Nov 7) Batched sampling of the verify positions with a presence penalty (position i sampled with committed ids + draft[:i], so
+  a job with `reqs_past_ids` joins the one-synchronize batch path in `iterate_gen`): no gain at the serving config
+  (Ornith 4 bpw, `-ndt 1 -sdh 16384`, sampling, `-cool 62`, ABAB, seed 1): old 82.87 / 83.90 t/s, new 82.05 / 83.18 (-0.8 each pair).
+  The sampler chain is not on the critical path at `-ndt 1`. Text cannot be compared byte for byte here: two runs of the unmodified
+  code already diverge (same byte, line 70), the engine is not deterministic between loads. Reverted. Baseline at that moment
+  (P100 cool): 81-86 t/s per turn, 1.83-1.95 tokens per step.
+
+- (Nov 7) HFMA2 form of the fp16 GEMV (`hgemv_f16.cu`; half2 accumulators, 32-term fp16 partials flushed to fp32, N 1024..32768):
+  no speed change on any shape, P100, bench `tests/kernels/gemm/hgemv_bench/bench.py` (m = 1 / 2 / 4, GB/s): 2048x8192 493 -> 493 /
+  465 -> 463 / 363 -> 368, 2048x4096 452 -> 450 / 408 -> 407, 4096x2048 444 -> 443 / 397 -> 396; relative error 2.6e-4 -> 8e-4.
+  The kernel is not issue-bound (HFMA2 cuts the per-weight instructions about 3x). lm_head (2048x248320) runs at 579-591 GB/s, at
+  the HBM2 limit, so nothing there either. Reverted. The K split is already at its optimum: sweeping `ksplit` at m = 2 the
+  automatic choice is within 4% of the best value on every mid shape (72.4 vs 69.3 us, 40.3 vs 39.1, 41.1 vs 38.6). Small
+  shapes (2048x512, 512x2048: 10-12 us, 190-215 GB/s) are launch / reduction latency (their 2 MB weights also sit in the 4 MB
+  L2 in the bench), which points to CUDA graphs for Ornith's fp16 layers rather than a kernel change. `use-hfma2` is for the
+  issue-bound kernels (prefill GEMM), not for this one.
+
 - (Nov 3) Router GEMV + top-k fused into one launch (`EXL3_ROUTER_FUSED`): same kernel time in the model (29.1 vs 18.1 + 10.6
   us per layer at m = 2), end to end +0.25..0.66 ms/iter; the top-k latency (K serial warp-argmax rounds) stays on the critical
   path. A 256-wide bitonic sort in the same selection order in its place: 27 vs 18 us for the fused launch, slower.
@@ -1368,3 +1391,42 @@ decode row is inside the +-5-10% run-to-run spread: MMODE 5 does not touch m <= 
    pair with the fixed harness is the outstanding check.
 6. **Chunk plans**: greedy text across differing chunk plans was not compared; whoever enables the ramp should run the
    one-load md5 check first.
+## MoE `coop_d`: per-item trace and two blocks per SM (Nov 7)
+
+`EXL3_MOE_TRACE=1` makes the dual kernel record one entry per queue item (globaltimer start / end, SM, kind, block, item, end of the wait on
+the A stage, end of the GEMV tile); `ext.exl3_moe_coop_trace_dump(device)` returns them. Scripts in `tests/kernels/moe/coop_trace/`
+(`trace_decode.py` runs the serving config, `analyze.py` splits the records into kernel calls: a call ends when no record is still running).
+Ornith 4 bpw, 16 slots (m = 2), per kernel call before the change:
+
+- wall 225 us on the P100 (56 blocks of 512 threads, one per SM: 128 registers each), 238 us on the 2060 (30 blocks); blocks are busy 95% of the
+  time (less than 12 us per call with fewer than half of them running), so the queue order is not the problem.
+- per block, P100: routed gate/up 90 us GEMV + 12 us epilogue, routed down 13 us wait for the A stage + 44 us GEMV + 16 us epilogue, shared
+  expert 36 us (not decomposed). The GEMV core runs at ~6.8 G weights/s per SM in every phase (12-13 issue slots per weight against ~8 in the
+  SASS), so fixed per-item costs (ramp, cross-warp reduction, completion counters, fences) are ~40 of the 225 us.
+- Fix: 256-thread blocks (`MOE_COOP_THREADS` 256, `WK` = 8 warps, `__launch_bounds__(256, 2)`, still 128 registers per thread), so two items
+  per SM overlap each other's ramp / epilogue / wait. Kernel call: P100 225 -> 209 us, 2060 238 -> 187 us. The k-split across warps is
+  halved, so the fp32 summation order changes (not bit-identical; `tests/kernels/moe`: 368 passed).
+- End to end, `-ndt 1 -sdh 16384`, sampling, `-cool 62`, ABAB, ms per step (tokens per step / t/s): old 22.53 / 22.55 / 22.55 / 22.71, new 21.97 /
+  21.92 / 22.02 / 21.90, i.e. **-0.63 ms per step (-2.8%)**, 83.3-83.6 -> 83.9-84.9 t/s (acceptance differs between the two because the
+  sampled text diverges, so compare ms per step, not t/s).
+- 128-thread blocks (4 per SM) fail `test_batch_extremes` (CUDA error): some part of the kernel assumes at least 8 warps. Not pursued.
+
+## Ornith decode step at the serving config (Nov 7, profiler, P100 + 2060)
+
+`-ndt 1 -sdh 16384`, card sampling (temp 0.7, top-p 0.8, top-k 20, presence 1.5), 4 bpw, script `ornith_prof.py` (copy of the Stage 0
+profile). Unprofiled: 22.4 ms per MTP iteration, 1.70 tokens per iteration, 75.7 t/s. Profiled GPU busy time per iteration: P100 19.5 ms
+(515 kernels), 2060 4.8 ms (156 kernels); the two add up to about the wall time, so launch gaps are no longer a large part of the step.
+
+| P100, ms/iter | kernel |
+| ---: | :--- |
+| 6.88 | `exl3_moe_coop_d_kernel` (31 layers, 215 us per layer at m = 2) |
+| 2.45 + 1.61 + 0.52 + 0.33 | EXL3 4 bpw GEMV (projections, shared expert) |
+| 1.65 | `exl3_moe_kernel` (0.6 calls per iteration: rounds with more rows) |
+| 1.29 | 6 bpw GEMV (lm_head, sparse head not used for verification) |
+| 0.71 / 0.67 / 0.59 | GatedDeltaNet recurrence / paged attention (split + combine) / fp16 hgemv |
+
+The 2060 spends 2.08 ms in the same MoE kernel (9 layers) and 0.9 ms in EXL3 GEMV. MoE is about 40% of the step on both cards.
+A MoE layer at m = 2 reads 16 distinct experts x 3 matrices (~25 MB of 4 bpw weights): 215 us is ~115 GB/s against ~550 GB/s
+available, ~116 G weights/s against an ALU ceiling of ~400 G weights/s (11.7 SASS instructions per weight on 56 SMs x 64 lanes).
+The step is therefore bound by dequantisation and by work distribution inside the MoE kernel, not by launch gaps: a whole-step
+megakernel would remove at most the ~1-2 ms of gaps and none of the dequant cost.

@@ -31,7 +31,7 @@
 
 namespace exl3_moe_coop_ns {
 
-constexpr int WK = 16;                          // k-split (warps per block)
+constexpr int WK = MOE_COOP_THREADS / 32;       // k-split (warps per block)
 constexpr int WNT = MOE_COOP_WNT;               // adjacent n-tiles per warp
 constexpr int PF = 4;                           // prefetch ring depth
 constexpr int FOLD = 4;                         // fp16 -> fp32 fold cadence
@@ -803,7 +803,7 @@ void moe_coop_rot_body(const MoeCoopParams& p, const int bidx)
     rotate_chunk(p, si.row, suh, c, dst, lane);
 }
 
-__global__ __launch_bounds__(THREADS)
+__global__ __launch_bounds__(THREADS, MOE_COOP_MINB)
 void exl3_moe_coop_rot_kernel(const MoeCoopParams p)
 {
     moe_coop_rot_body(p, blockIdx.x);
@@ -811,7 +811,7 @@ void exl3_moe_coop_rot_kernel(const MoeCoopParams p)
 
 // Both rotation pre-kernels of a (shared, routed) pair in one launch (EXL3_MOE_ROT_PAIR): blocks below
 // grid_first take the first parameter set, the rest the second; the same warps do the same work
-__global__ __launch_bounds__(THREADS)
+__global__ __launch_bounds__(THREADS, MOE_COOP_MINB)
 void exl3_moe_coop_rot2_kernel(const MoeCoopParams p0, const MoeCoopParams p1, const int grid_first)
 {
     if ((int) blockIdx.x < grid_first) moe_coop_rot_body(p0, blockIdx.x);
@@ -831,7 +831,15 @@ struct ItemShared
     int ticket;
     int res[4];
     int rows[ROWS];
+    unsigned long long tw1, tw2;    // EXL3_MOE_TRACE: end of the wait on the A stage / end of the GEMV tile
 };
+
+__device__ __forceinline__ unsigned long long trace_now()
+{
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
 
 __device__ __forceinline__ int ld_volatile_s32(const int* ptr)
 {
@@ -913,6 +921,7 @@ __device__ __forceinline__ void a_item(const MoeCoopParams& p, const int item, u
         void* C = (void*) (((char*) (is_gate ? p.gu_g : p.gu_u)) + part);
         gemv_tile<bits, cb, WIDE, HALF>(B32, A2, a_stride2, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, sh_red, sh_stage, p.m34);
     }
+    if (p.trace && threadIdx.x == 0) { ss.tw1 = 0; ss.tw2 = trace_now(); }
 
     for (int r = 0; r < nrows; ++r)
     for (int j = 0; j < CPB; ++j)
@@ -976,7 +985,7 @@ __device__ __forceinline__ void a_item(const MoeCoopParams& p, const int item, u
 }
 
 template <int bits, int cb, bool WIDE, bool HALF = false>
-__global__ __launch_bounds__(THREADS)
+__global__ __launch_bounds__(THREADS, MOE_COOP_MINB)
 void exl3_moe_coop_a_kernel(const MoeCoopParams p)
 {
     extern __shared__ uint32_t smem_dyn[];
@@ -1031,6 +1040,7 @@ __device__ __forceinline__ void b_item(const MoeCoopParams& p, const int item, u
         __threadfence();
         __syncthreads();
     }
+    if (p.trace && threadIdx.x == 0) ss.tw1 = trace_now();
     const int local = slot_info(p, sh_rows[0]).local;
     const int kslices_all = p.I / 16;
     const int k_begin = kslices_all * ks / p.ksplit_b;
@@ -1042,6 +1052,7 @@ __device__ __forceinline__ void b_item(const MoeCoopParams& p, const int item, u
         gemv_tile<bits, cb, WIDE, HALF>(B32, (const half2*) p.act_out, (size_t) p.I / 2, sh_rows, nrows, C, p.Ho, true,
                                   k_begin, k_end, p.Ho / 16, group, sh_red, sh_stage, p.m34);
     }
+    if (p.trace && threadIdx.x == 0) ss.tw2 = trace_now();
 
     for (int r = 0; r < nrows; ++r)
     for (int j = 0; j < CPB; ++j)
@@ -1161,7 +1172,7 @@ __device__ __forceinline__ void b_item(const MoeCoopParams& p, const int item, u
 }
 
 template <int bits, int cb, bool WIDE, bool HALF = false>
-__global__ __launch_bounds__(THREADS)
+__global__ __launch_bounds__(THREADS, MOE_COOP_MINB)
 void exl3_moe_coop_b_kernel(const MoeCoopParams p)
 {
     extern __shared__ uint32_t smem_dyn[];
@@ -1183,7 +1194,7 @@ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
 // and the ready counters; the completion counters are reset by their last arrivals
 
 template <int bits, int cb, bool HALF = false>
-__global__ __launch_bounds__(THREADS)
+__global__ __launch_bounds__(THREADS, MOE_COOP_MINB)
 void exl3_moe_coop_f_kernel(const MoeCoopParams p)
 {
     extern __shared__ uint32_t smem_dyn[];
@@ -1221,19 +1232,40 @@ void exl3_moe_coop_f_kernel(const MoeCoopParams p)
 
 // HALF_R: routed experts at a half-integer rate (mul1); the shared expert is always an integer rate
 template <int bitsR, int bitsS, int cb, bool HALF_R = false>
-__global__ __launch_bounds__(THREADS)
+__global__ __launch_bounds__(THREADS, MOE_COOP_MINB)
 void exl3_moe_coop_d_kernel(const MoeCoopParams p, const MoeCoopParams ps)
 {
     extern __shared__ uint32_t smem_dyn[];
     __shared__ ItemShared ss;
     const int n_sa = ps.f_items_a, n_ra = p.f_items_a, n_sb = ps.f_items_b;
     const int n_items = n_sa + n_ra + n_sb + p.f_items_b;
+    // EXL3_MOE_TRACE: one record per queue item (start, end in globaltimer ns, smid | kind | block | item)
+    unsigned long long tr_t0 = 0, tr_meta = 0;
+    bool tr_have = false;
     while (true)
     {
+        if (p.trace && threadIdx.x == 0)
+        {
+            unsigned long long now; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+            if (tr_have)
+            {
+                unsigned long long i = atomicAdd(p.trace, 1ull);
+                if (i < 1000000) { unsigned long long* r = p.trace + 4 + i * 4; r[0] = tr_t0; r[1] = now; r[2] = tr_meta; r[3] = (ss.tw2 ? ss.tw2 - tr_t0 : 0) | ((ss.tw1 ? ss.tw1 - tr_t0 : 0) << 32); }
+            }
+            tr_t0 = now; tr_have = false;
+        }
         if (threadIdx.x == 0) ss.ticket = atomicAdd(p.f_queue, 1);
         __syncthreads();
         int t = ss.ticket;
         __syncthreads();
+        if (p.trace && threadIdx.x == 0 && t < n_items)
+        {
+            unsigned sm; asm volatile("mov.u32 %0, %%smid;" : "=r"(sm));
+            const unsigned kind = t < n_sa ? 0 : t < n_sa + n_ra ? 1 : t < n_sa + n_ra + n_sb ? 2 : 3;
+            ss.tw1 = 0; ss.tw2 = 0;
+            tr_meta = (unsigned long long) sm | ((unsigned long long) kind << 8) | ((unsigned long long) blockIdx.x << 16) | ((unsigned long long) t << 32);
+            tr_have = true;
+        }
         if (t >= n_items) break;
         if (t < n_sa) { a_item<bitsS, cb, true, false, true>(ps, t, smem_dyn, ss); continue; }
         t -= n_sa;

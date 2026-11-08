@@ -15,7 +15,12 @@
 #define MOE_COOP_ACT_RELU2 2
 #define MOE_COOP_ACT_SILU_OAI 3
 
-#define MOE_COOP_THREADS 512
+#ifndef MOE_COOP_THREADS
+#define MOE_COOP_THREADS 256
+#endif
+#ifndef MOE_COOP_MINB
+#define MOE_COOP_MINB 2                 // blocks per SM the register budget is sized for (65536 / (THREADS * MINB) regs per thread)
+#endif
 #define MOE_COOP_WNT 2                  // adjacent 16-column tiles per warp (32-column groups per block)
 #define MOE_COOP_COLS (MOE_COOP_WNT * 16)
 
@@ -86,6 +91,9 @@ struct MoeCoopParams
     // Shared expert (nullable): out += gate * sh_out, gate = sigmoid(x . sh_gate_w) or 1
     const float* sh_out;        // (bsz, H), row stride H
     const half* sh_gate_w;      // (H,) or null
+
+    // Diagnostics (EXL3_MOE_TRACE=1): per-item records of the dual kernel, 4 u64 each after a 4-word header; null normally
+    unsigned long long* trace;
 };
 
 // Launch with plain device pointers (called from BC_BlockSparseMLP). K: gate/up and down bit
@@ -206,3 +214,6 @@ inline int64_t exl3_moe_coop_ctr_len_fused(int64_t slots_max, int64_t bsz_max, i
 {
     return exl3_moe_coop_ctr_len(slots_max, bsz_max, I, Ho) + 2 + slots_max;
 }
+
+// EXL3_MOE_TRACE=1: records of the dual kernel since the last call, (n, 4) int64 [t0 ns, t1 ns, smid | kind << 8 | block << 16 | item << 32, 0]
+at::Tensor exl3_moe_coop_trace_dump(int64_t device);
