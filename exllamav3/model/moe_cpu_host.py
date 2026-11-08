@@ -167,6 +167,13 @@ class MoeCpuTuning:
         # Fused-tier row tiles (32 / 64-row kernel instances per expert range), as EXL3_MOE_MTILE
         # on the GPU side
         self.mtile = os.environ.get("EXL3_MOE_MTILE", "1") != "0"
+        # Issue the streamed-expert DMA and the CPU-tail slot copies as raw cudaMemcpyAsync on
+        # the current stream instead of torch's copy_. The handoff segment and the pinned arena
+        # are cudaHostRegister'ed shared memory, which torch's copy_ does not reliably recognize
+        # as pinned: it then stages the transfer through a pageable buffer and blocks the host
+        # until the DMA finishes (1-8 ms per streamed batch here, and the prefill's main thread
+        # spends most of its time in those calls). EXL3_MOE_ASYNC_DMA=0 restores copy_ for A/B
+        self.async_dma = os.environ.get("EXL3_MOE_ASYNC_DMA", "1") != "0"
 
         # --- debug / kill switches ---
         self.stream_debug = bool(os.environ.get("EXL3_MOE_STREAM_DEBUG"))
@@ -1527,6 +1534,21 @@ class MoeCpuHost:
             final_2d, slot["out_dev"], counts, slot_idx, ho,
             slot["done"], seq, slot["consumed"], self.gpu_base_ptr + 128)
 
+    def _copy(self, dst: torch.Tensor, src: torch.Tensor, kind: int):
+        """DMA between the handoff segment (or the pinned arena) and device memory. kind 1 is
+        host->device, 2 device->host; both directions here run on the current stream, so the
+        flag writes that follow stay ordered behind the transfer. With TUNING.async_dma the
+        transfer is a raw cudaMemcpyAsync (see cuda_host.h: torch's copy_ does not recognize
+        cudaHostRegister'ed memory as pinned and copies it synchronously through a staging
+        buffer). Contiguous views only; anything else keeps the torch path"""
+        if TUNING.async_dma and dst.is_contiguous() and src.is_contiguous():
+            nbytes = dst.numel() * dst.element_size()
+            if src.numel() * src.element_size() == nbytes:
+                if nbytes:
+                    ext.cuda_memcpy_async(dst.data_ptr(), src.data_ptr(), nbytes, kind)
+                return
+        dst.copy_(src, non_blocking = True)
+
     def _issue_compute(self, layer_idx, y, selected_experts, routing_weights, spec, out, h):
         """
         Stage inputs and publish one compute job per cap_rows chunk (descriptors, D2H copies
@@ -1586,9 +1608,9 @@ class MoeCpuHost:
             # may sit queued on a different stream than this issue
             if self.slot_last_seq[slot_idx]:
                 ext.exl3_moe_flag_wait(slot["consumed"], self.slot_last_seq[slot_idx], self.gpu_base_ptr + 128)
-            slot["x"][:n].copy_(y_pad[a:b], non_blocking = True)
-            slot["sel"][:n].copy_(sel32[a:b], non_blocking = True)
-            slot["w"][:n].copy_(routing_weights[a:b], non_blocking = True)
+            self._copy(slot["x"][:n], y_pad[a:b], 1)
+            self._copy(slot["sel"][:n], sel32[a:b], 1)
+            self._copy(slot["w"][:n], routing_weights[a:b], 1)
             ext.exl3_moe_flag_write(slot["data_ready"], seq)
             self.slot_last_seq[slot_idx] = seq
             jobs.append((seq, slot_idx, a, b, n))
@@ -1599,9 +1621,9 @@ class MoeCpuHost:
         slot = self.slots[slot_idx]
         ext.exl3_moe_flag_wait(slot["done"], seq, self.gpu_base_ptr + 128)
         if rtmp is None:
-            out[a:b].copy_(slot["out"][:n], non_blocking = True)
+            self._copy(out[a:b], slot["out"][:n], 1)
         else:
-            rtmp[:n].copy_(slot["out"][:n], non_blocking = True)
+            self._copy(rtmp[:n], slot["out"][:n], 1)
             out[a:b] = rtmp[:n, :h]
         # Publish consumption AFTER the readback on this same stream: the slot's next tenant
         # (possibly issuing from another device) gates on this
@@ -1707,7 +1729,7 @@ class MoeCpuHost:
         ev0, ev1 = torch.cuda.Event(enable_timing = True), torch.cuda.Event(enable_timing = True)
         def timed_copy():
             ev0.record(st["copy_stream"])
-            st["vram_slots"][0][:probe // 2].copy_(self.wviews[0][:probe // 2], non_blocking = True)
+            self._copy(st["vram_slots"][0][:probe // 2], self.wviews[0][:probe // 2], 1)
             ev1.record(st["copy_stream"])
             ev1.synchronize()
             return probe / (ev0.elapsed_time(ev1) * 1e-3) / 1e9   # GB/s
@@ -2123,9 +2145,8 @@ class MoeCpuHost:
                     raw = st["vram_slots"][ws]
                     for bi, e in enumerate(batch):
                         ci, off = blocks[e]
-                        raw[bi * exp_b // 2 : (bi + 1) * exp_b // 2].copy_(
-                            self.arena_views[ci][off // 2 : (off + exp_b) // 2],
-                            non_blocking = True)
+                        self._copy(raw[bi * exp_b // 2 : (bi + 1) * exp_b // 2],
+                                   self.arena_views[ci][off // 2 : (off + exp_b) // 2], 1)
             else:
                 # Stage job: its own ring, consumed by the worker's dedicated stager thread, so
                 # the weight memcpys overlap the compute pool's work on the tail
@@ -2153,7 +2174,7 @@ class MoeCpuHost:
                     if st["wslot_used"][ws]:
                         copy_stream.wait_event(st["wconsumed_ev"][ws])
                     ext.exl3_moe_flag_wait(self.stage_done_addr[ws], seq, abort)
-                    st["vram_slots"][ws][:used].copy_(self.wviews[ws][:used], non_blocking = True)
+                    self._copy(st["vram_slots"][ws][:used], self.wviews[ws][:used], 1)
                     ext.exl3_moe_flag_write(self.pinned_free_addr[ws], seq)
 
             if restore and st["native_slots"] is None:

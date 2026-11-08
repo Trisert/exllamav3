@@ -184,10 +184,27 @@ def main(args):
         rec.add(d)
         print(f"PREFILL {n} tok: {new_ctx} uncached at {d['t_s']:.1f} t/s ({t:.2f} s) | P100 {pre} -> {post}", flush = True)
 
+    def text_check(n, offset):
+        """Greedy continuation of a cold n-token chunk, printed as an md5: A/B runs that must be
+        exact (bit-identical numerics, e.g. a copy-path change) are compared on it. Same load
+        placement profile and same routing give the same text; different expert placement can
+        change it, so always run A/B from the same restored expert-stats profile."""
+        import hashlib
+        ids = ids_all[offset:offset + n].unsqueeze(0)
+        job = Job(input_ids = ids, max_new_tokens = 48, stop_conditions = [], sampler = ArgmaxSampler())
+        generator.enqueue(job)
+        out = ""
+        while generator.num_remaining_jobs():
+            for r in generator.iterate():
+                out += r.get("text", "") or ""
+        print(f"TEXTCHECK {n} tok @{offset}: md5 {hashlib.md5(out.encode()).hexdigest()} "
+              f"len {len(out)} | {out[:80]!r}", flush = True)
+        rec.add(dict(kind = "textcheck", n = n, offset = offset, text = out))
+
     def profile(kind, fn):
         with torch.profiler.profile(
             activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-            record_shapes = False, profile_memory = False,
+            record_shapes = bool(args.record_shapes), profile_memory = False,
         ) as prof:
             fn()
         print(f"PROFILE {kind} top CUDA:")
@@ -198,6 +215,9 @@ def main(args):
                 f.write(f"=== {kind} ===\n{rows}\n")
         print(f"PROFILE {kind} top CPU:")
         print(prof.key_averages().table(sort_by = "self_cpu_time_total", row_limit = 25))
+        if args.trace:
+            prof.export_chrome_trace(f"{args.trace}.{kind}.json")
+            print(f"TRACE {args.trace}.{kind}.json", flush = True)
 
     ids_all = tokenizer.encode(corpus(), add_bos = False)[0]
     print(f"CORPUS {ids_all.shape[0]} tokens", flush = True)
@@ -253,17 +273,23 @@ def main(args):
                 if args.profile_prefill and k == 1:
                     with torch.profiler.profile(
                         activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                        record_shapes = bool(args.record_shapes),
                     ) as prof:
                         prefill_run(n, k * stride)
                     print("PROFILE prefill top CUDA:")
                     print(prof.key_averages().table(sort_by = "self_cuda_time_total", row_limit = 45))
                     print("PROFILE prefill top CPU:")
                     print(prof.key_averages().table(sort_by = "self_cpu_time_total", row_limit = 30))
+                    if args.trace:
+                        prof.export_chrome_trace(f"{args.trace}.prefill{n}.json")
+                        print(f"TRACE {args.trace}.prefill{n}.json", flush = True)
                 else:
                     prefill_run(n, k * stride)
                 k += 1
         if args.hooks:
             print_hooks("prefill")
+        if args.check_text:
+            text_check(args.check_text, k * stride + 7)
 
     dec = [d["t_s"] for d in rec.rows if d["kind"] == "decode"]
     pp = {}
@@ -293,9 +319,16 @@ if __name__ == "__main__":
     parser.add_argument("-tag2", "--tag2", type = str, default = None)
     parser.add_argument("-json", "--json", type = str, default = None)
     parser.add_argument("-profile_file", "--profile_file", type = str, default = None)
+    parser.add_argument("-record_shapes", "--record_shapes", action = "store_true",
+                        help = "torch.profiler record_shapes (aten op input shapes, e.g. the fallback GEMM shapes)")
+    parser.add_argument("-trace", "--trace", type = str, default = None,
+                        help = "export the torch.profiler window as a chrome trace to <prefix>.<kind>.json")
     parser.add_argument("-profile_decode", "--profile_decode", action = "store_true")
     parser.add_argument("-profile_prefill", "--profile_prefill", action = "store_true")
     parser.add_argument("-profile_from", "--profile_from", type = int, default = 60)
     parser.add_argument("-hooks", "--hooks", action = "store_true")
+    parser.add_argument("-check_text", "--check_text", type = int, default = 0,
+                        help = "after the prefill runs, prefill this many tokens of a cold chunk and print the "
+                               "md5 of 48 greedy continuation tokens, for exact A/B comparisons")
     args = parser.parse_args()
     main(args)
