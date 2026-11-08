@@ -100,7 +100,29 @@ class Rec:
 
 
 @torch.inference_mode()
+def install_copy_sites():
+    """Print the Python call site and size of every distinct Tensor.copy_ pattern (first hit
+    only). Used to identify the small GPU->CPU readbacks that block the host on the compute
+    stream (they show up as multi-ms cudaMemcpyAsync CPU time in the profiler)."""
+    import traceback
+    from torch import Tensor
+    org = Tensor.copy_
+    seen = set()
+    def inner(self, src, non_blocking = False):
+        key = (str(self.device), str(src.device), self.dtype, src.dtype,
+               self.numel() * self.element_size())
+        if key not in seen:
+            seen.add(key)
+            st = "".join(traceback.format_stack()[-9:-1])
+            print(f"COPY_SITE {key[0]}<-{key[1]} {key[2]} {key[4]} B\n{st}", flush = True)
+        return org(self, src, non_blocking = non_blocking)
+    Tensor.copy_ = inner
+
+
+@torch.inference_mode()
 def main(args):
+    if args.copy_sites:
+        install_copy_sites()
     if args.hooks:
         install_hooks()
 
@@ -337,6 +359,8 @@ if __name__ == "__main__":
     parser.add_argument("-profile_file", "--profile_file", type = str, default = None)
     parser.add_argument("-record_shapes", "--record_shapes", action = "store_true",
                         help = "torch.profiler record_shapes (aten op input shapes, e.g. the fallback GEMM shapes)")
+    parser.add_argument("-copy_sites", "--copy_sites", action = "store_true",
+                        help = "print the Python call site of every distinct Tensor.copy_ pattern (first hit)")
     parser.add_argument("-check_text_toggle", "--check_text_toggle", type = str, default = None,
                         help = "comma-separated async_dma values: run one text check per round at the same "
                                "cold offset inside one process, flipping moe_cpu_host.TUNING.async_dma "
