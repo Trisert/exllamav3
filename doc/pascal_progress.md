@@ -1430,3 +1430,37 @@ A MoE layer at m = 2 reads 16 distinct experts x 3 matrices (~25 MB of 4 bpw wei
 available, ~116 G weights/s against an ALU ceiling of ~400 G weights/s (11.7 SASS instructions per weight on 56 SMs x 64 lanes).
 The step is therefore bound by dequantisation and by work distribution inside the MoE kernel, not by launch gaps: a whole-step
 megakernel would remove at most the ~1-2 ms of gaps and none of the dequant cost.
+
+## Ornith decode: fused multi-matrix GEMV for same-input projections (Nov 8, branch ornith-gemv)
+
+The P100's dense 4 bpw GEMV set for Ornith is 4.90 ms/iter over ~104 calls and runs at 100-150 GB/s
+per call even though a launch of twice the width reaches ~250 GB/s: a single projection's column
+groups never divide the 56 SMs evenly (n = 4096 with 64-column groups = 64 groups on 56 SMs, so 8 SMs
+get two; n = 8192 = 128 groups over 112 co-resident blocks). Per shape, m = 2 (m = 1 in brackets),
+P100, tmp/bench_ornith_gemv.py: qkv 2048x8192 fp32 54.7 us (55.0); z 2048x4096 fp32 37.7 (36.2);
+out 4096x2048 fp32 38.6 (39.2); q 2048x8192 fp16 54.5 (52.2); k and v 2048x512 fp16 14.4 each (15.0,
+12-13 us of it fixed cost); o 38.6; lm_head 6 bpw 2048x248320 1455-1497 us (1224) = 350 Gw/s against
+a ~500 Gw/s issue ceiling and a 0.69 ms HBM floor, so at most -0.2/-0.3 ms there (it is already on
+the MMODE 2 direct path). A forced narrow/wide config A/B (EXL3_GEMV=3/4) shows the current auto
+choice is already best within noise: no config win.
+
+Added: exllamav3_ext/quant/exl3_gemv_fused.cuh and ext.exl3_gemv_fused(A, [B...], [C...], [suh...],
+A_had, [svh...]): one cooperative launch for several linears sharing the input. It runs the input
+Hadamard per matrix into its own scratch row group, one grid sync, then a single column-group loop
+that walks the matrices back to back, then one output Hadamard per matrix. sm_60 direct-dot path only
+(m = 1 MMODE 0, m = 2 MMODE 2), 2..4 bpw integer mul1, shuffle extraction. When the fused launch uses
+the same GEMV config as the separate calls the per-output arithmetic is identical, so the outputs are
+bit-identical: verified against the model's own dispatch for qkv+z at m = 1 and 2 and for the k+v pair
+(tmp/dbg_fused2.py, EXACT). A q+k+v group is deliberately NOT used: its fused width selects the wide
+config while the model's k/v calls take the narrow one, which changes the k-split and the last ULPs.
+Wired into gated_delta_net.py for the split qkv/z projections behind EXL3_GEMV_FUSED (default 1);
+GatedDeltaNet.gemv_qkvz_fused returns None and the two linears run as before when the config does not
+qualify.
+
+Measured: one load, same placement, 120-token greedy jobs alternating the flag (2 ABBA pairs): fused
+20.83 / 21.75 ms/iter, separate 21.76 / 21.85 -> -0.51 ms/iter on the mean, the pair drift dominated by
+the P100 heating up over the run; generated text byte-identical in all four jobs. Microbenchmark
+expectation: -22.7 us x 30 GDN layers = -0.68 ms on the P100, and the attention k+v pair another
+-11.9 us x 10 (-0.12 ms) once wired. Not done: the 2060's GEMV (sm_75 MMA path, the direct-dot fused
+kernel does not apply) and the attention k+v wiring; the lm_head split across the GPUs is the lead's
+call as a later lever.
