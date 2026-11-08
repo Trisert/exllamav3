@@ -147,6 +147,11 @@ def prepare_for_attn(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
             raise ValueError(f"Unknown attn_mode: {attn_mode}")
 
 
+# k_proj + v_proj through one fused GEMV launch (quant/exl3_gemv_fused.cuh; sm_60, 1-2 rows,
+# 4 bpw mul1). Off/on A/B via EXL3_GEMV_FUSED=0/1.
+_GEMV_FUSE = __import__("os").environ.get("EXL3_GEMV_FUSED", "1") != "0"
+
+
 class Attention(Module):
 
     def __init__(
@@ -422,6 +427,40 @@ class Attention(Module):
 
 
     @override
+    def gemv_kv_fused(self, x):
+        """k_proj + v_proj through ONE fused GEMV launch. Returns (k, v) or None when the
+        configuration does not qualify (the caller then runs the two linears). P100 only, 1-2
+        rows, 4 bpw mul1; the pair is bit-identical to the separate calls because both take the
+        same GEMV config (tests/kernels/gemm, tmp/dbg_fused2.py)."""
+        if not _GEMV_FUSE or self.k_proj is None or self.v_proj is None or self.use_k_as_v:
+            return None
+        ik, iv = self.k_proj.inner, self.v_proj.inner
+        if getattr(ik, "trellis", None) is None or getattr(iv, "trellis", None) is None:
+            return None
+        if not (ik.mul1 and iv.mul1) or ik.mcg or iv.mcg or ik.K != 4 or iv.K != 4:
+            return None
+        if getattr(ik, "bias", None) is not None or getattr(iv, "bias", None) is not None:
+            return None
+        if self.k_proj.trim_padded_out or self.v_proj.trim_padded_out:
+            return None
+        xf = x.reshape(-1, x.shape[-1])
+        if xf.shape[0] > 2 or xf.shape[1] != ik.in_features:
+            return None
+        if not xf.is_contiguous():
+            xf = xf.contiguous()
+        if xf.dtype != torch.half:
+            xf = xf.to(torch.half)
+        rows, kk = xf.shape
+        nk, nv = ik.out_features, iv.out_features
+        ck = torch.empty((rows, nk), dtype = self.k_proj.out_dtype or torch.half, device = xf.device)
+        cv = torch.empty((rows, nv), dtype = self.v_proj.out_dtype or torch.half, device = xf.device)
+        had = getattr(self, "_gemv_had", None)
+        if had is None or had.numel() < 2 * rows * kk or had.device != xf.device:
+            had = self._gemv_had = torch.empty(2 * rows * kk, dtype = torch.half, device = xf.device)
+        ext.exl3_gemv_fused(xf, [ik.trellis, iv.trellis], [ck, cv], [ik.suh, iv.suh], had,
+                            [ik.svh, iv.svh], False, True)
+        return ck.view(*x.shape[:-1], nk), cv.view(*x.shape[:-1], nv)
+
     def optimizer_targets(self):
         q = self.q_proj.optimizer_targets()
         k = self.k_proj.optimizer_targets()
@@ -693,8 +732,12 @@ class Attention(Module):
             g = qg[1].view(bsz, q_len, self.num_q_heads * self.head_dim)
 
         if self.multi_kv is None or bsz * q_len > 32:
-            k = self.k_proj.forward(x, params)
-            v = self.v_proj.forward(x, params) if not self.use_k_as_v else k
+            fused = None if self.use_k_as_v else self.gemv_kv_fused(x)
+            if fused is not None:
+                k, v = fused
+            else:
+                k = self.k_proj.forward(x, params)
+                v = self.v_proj.forward(x, params) if not self.use_k_as_v else k
 
         else:
             if x.shape[-1] < self.k_proj.in_features:
