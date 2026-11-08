@@ -1003,9 +1003,13 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
 // token's slots (rotation * svh, down bias, routing weight) in a fixed order, merges the shared
 // expert and stores the trimmed row
 
+// sh_wait: shared-down items the epilogue waits for; < 0 takes p.f_sh_wait (the launcher's count, which is the
+// no-duplicate grid). The dual kernel's compact queue runs fewer shared items and passes its own count.
 template <int bits, int cb, bool WIDE, bool HALF, bool FUSED>
-__device__ __forceinline__ void b_item(const MoeCoopParams& p, const int item, uint32_t* smem_dyn, ItemShared& ss)
+__device__ __forceinline__ void b_item(const MoeCoopParams& p, const int item, uint32_t* smem_dyn, ItemShared& ss,
+                                       int sh_wait = -1)
 {
+    const int shw = sh_wait >= 0 ? sh_wait : p.f_sh_wait;
     constexpr int TCOLS = tile_cols<WIDE>();
     constexpr int GPC = tile_gpc<WIDE>();
     constexpr int CPB = tile_cpb<WIDE>();
@@ -1077,9 +1081,9 @@ __device__ __forceinline__ void b_item(const MoeCoopParams& p, const int item, u
         if constexpr (FUSED)
         {
             // Dual kernel: the shared expert's output (merged below) comes from earlier queue items
-            if (p.f_sh_wait)
+            if (shw)
             {
-                if (threadIdx.x == 0) while (ld_volatile_s32(p.f_sh_done) < p.f_sh_wait) {}
+                if (threadIdx.x == 0) while (ld_volatile_s32(p.f_sh_done) < shw) {}
                 __syncthreads();
                 __threadfence();
             }
@@ -1238,7 +1242,19 @@ void exl3_moe_coop_d_kernel(const MoeCoopParams p, const MoeCoopParams ps)
     extern __shared__ uint32_t smem_dyn[];
     __shared__ ItemShared ss;
     const int n_sa = ps.f_items_a, n_ra = p.f_items_a, n_sb = ps.f_items_b;
-    const int n_items = n_sa + n_ra + n_sb + p.f_items_b;
+    // The item grids are sized for the no-duplicate case (slots = bsz * topk runs), but the run table usually
+    // has fewer runs: the "hole" items exit at once, and their tickets let blocks run ahead of the gate/up
+    // stage and spin on the ready counters for the rest of a wave (measured: 19 us of the 183 us call in the
+    // down stage). With the compact queue the existing runs' items are contiguous, the gate/up items fill the
+    // first wave and the down items find their activations ready. Dispatch order only: same items, same
+    // arithmetic, bit-identical results (EXL3_MOE_COOP_COMPACT=0 keeps the old queue for A/B).
+    const int slots_s = ps.bsz * ps.topk, slots_r = p.bsz * p.topk;
+    const int n_rs = p.compact && ps.a_global && slots_s ? ps.runs[0] : slots_s;
+    const int n_rr = p.compact && p.a_global && slots_r ? p.runs[0] : slots_r;
+    const int ar_s = slots_s ? ps.f_items_a / slots_s : 0, br_s = slots_s ? ps.f_items_b / slots_s : 0;
+    const int ar_r = slots_r ? p.f_items_a / slots_r : 0, br_r = slots_r ? p.f_items_b / slots_r : 0;
+    const int nA_s = n_rs * ar_s, nA_r = n_rr * ar_r, nB_s = n_rs * br_s;
+    const int n_items = p.compact ? nA_s + nA_r + nB_s + n_rr * br_r : n_sa + n_ra + n_sb + p.f_items_b;
     // EXL3_MOE_TRACE: one record per queue item (start, end in globaltimer ns, smid | kind | block | item)
     unsigned long long tr_t0 = 0, tr_meta = 0;
     bool tr_have = false;
@@ -1261,22 +1277,22 @@ void exl3_moe_coop_d_kernel(const MoeCoopParams p, const MoeCoopParams ps)
         if (p.trace && threadIdx.x == 0 && t < n_items)
         {
             unsigned sm; asm volatile("mov.u32 %0, %%smid;" : "=r"(sm));
-            const unsigned kind = t < n_sa ? 0 : t < n_sa + n_ra ? 1 : t < n_sa + n_ra + n_sb ? 2 : 3;
+            const unsigned kind = t < nA_s ? 0 : t < nA_s + nA_r ? 1 : t < nA_s + nA_r + nB_s ? 2 : 3;
             ss.tw1 = 0; ss.tw2 = 0;
             tr_meta = (unsigned long long) sm | ((unsigned long long) kind << 8) | ((unsigned long long) blockIdx.x << 16) | ((unsigned long long) t << 32);
             tr_have = true;
         }
         if (t >= n_items) break;
-        if (t < n_sa) { a_item<bitsS, cb, true, false, true>(ps, t, smem_dyn, ss); continue; }
-        t -= n_sa;
-        if (t < n_ra) { a_item<bitsR, cb, true, HALF_R, true>(p, t, smem_dyn, ss); continue; }
-        t -= n_ra;
-        if (t < n_sb)
+        if (t < nA_s) { a_item<bitsS, cb, true, false, true>(ps, t, smem_dyn, ss); continue; }
+        t -= nA_s;
+        if (t < nA_r) { a_item<bitsR, cb, true, HALF_R, true>(p, t, smem_dyn, ss); continue; }
+        t -= nA_r;
+        if (t < nB_s)
         {
             b_item<bitsS, cb, true, false, true>(ps, t, smem_dyn, ss);
             __threadfence();
             __syncthreads();
-            if (threadIdx.x == 0) ss.flag = atomicAdd(p.f_sh_done, 1) == n_sb - 1;
+            if (threadIdx.x == 0) ss.flag = atomicAdd(p.f_sh_done, 1) == nB_s - 1;
             __syncthreads();
             if (ss.flag)
             {
@@ -1287,8 +1303,8 @@ void exl3_moe_coop_d_kernel(const MoeCoopParams p, const MoeCoopParams ps)
             __syncthreads();
             continue;
         }
-        t -= n_sb;
-        b_item<bitsR, cb, true, HALF_R, true>(p, t, smem_dyn, ss);
+        t -= nB_s;
+        b_item<bitsR, cb, true, HALF_R, true>(p, t, smem_dyn, ss, nB_s);
     }
     if (threadIdx.x == 0)
     {

@@ -1,12 +1,14 @@
 import sys, os, time, collections
 os.environ["EXL3_MOE_TRACE"] = "1"
-WT = "/home/nicola/exllamav3/.claude/worktrees/ornith-hgemv-hfma2"
-sys.path.insert(0, WT)
+ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../.."))
+OUT = os.environ.get("COOP_TRACE_DIR", os.path.join(ROOT, "tmp", "coop_trace"))
+os.makedirs(OUT, exist_ok=True)
+sys.path.insert(0, ROOT)
 import torch, argparse
 import numpy as np
 from exllamav3 import model_init, Generator, Job
 import exllamav3_ext as ext
-assert ext.__file__.startswith(WT), ext.__file__
+assert ext.__file__.startswith(ROOT), ext.__file__
 
 KIND = ["sharedA", "routedA", "sharedB", "routedB"]
 
@@ -21,9 +23,9 @@ def analyze(rec, name):
     starts = np.nonzero(item == 0)[0]
     calls = []
     for i, s in enumerate(starts):
-        e = starts[i + 1] if i + 1 < len(starts) else len(t0)
+        e = starts[i + 1] if i + 1 < len(t0) else len(t0)
         calls.append(slice(s, e))
-    print(f"{name}: {len(calls)} kernel calls, {len(t0)} records, min dt {np.min(np.diff(np.unique(t0))) if len(t0)>1 else 0} ns")
+    print(f"{name}: {len(calls)} kernel calls, {len(t0)} records")
     agg = collections.defaultdict(list)
     for c in calls:
         a0, a1, k, b = t0[c], t1[c], kind[c], blk[c]
@@ -52,7 +54,7 @@ def analyze(rec, name):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     model_init.add_args(parser, cache=True, add_draft_model_args=True, add_sampling_args=True)
-    args = parser.parse_args(["-m", "/home/nicola/exllamav3/models/Ornith-1.5-35B-A3B-EXL3-4bpw", "-gs", "4.0,15.0",
+    args = parser.parse_args(["-m", os.path.join(ROOT, "models", "Ornith-1.5-35B-A3B-EXL3-4bpw"), "-gs", "4.0,15.0",
                               "-cs", "32768", "-cq", "4", "-mtp", "-ndt", "1", "-sdh", "16384",
                               "-temp", "0.7", "-topp", "0.8", "-topk", "20", "-minp", "0", "-presp", "1.5"])
     torch.set_grad_enabled(False); _im = torch.inference_mode(); _im.__enter__()
@@ -79,5 +81,5 @@ if __name__ == "__main__":
     print(f"traced run: {its} iterations, {1000*dt/its:.1f} ms/iter", flush=True)
     for d, nm in ((1, "P100"), (0, "RTX2060")):
         rec = ext.exl3_moe_coop_trace_dump(d).numpy()
-        np.save(os.environ["CLAUDE_JOB_DIR"] + f"/tmp/coop_trace_{nm}.npy", rec)
+        np.save(os.path.join(OUT, f"coop_trace_{nm}.npy"), rec)
         analyze(rec, nm)

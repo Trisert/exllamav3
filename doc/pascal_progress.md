@@ -1464,3 +1464,55 @@ expectation: -22.7 us x 30 GDN layers = -0.68 ms on the P100, and the attention 
 -11.9 us x 10 (-0.12 ms) once wired. Not done: the 2060's GEMV (sm_75 MMA path, the direct-dot fused
 kernel does not apply) and the attention k+v wiring; the lm_head split across the GPUs is the lead's
 call as a later lever.
+## Ornith decode MoE (`coop_d`) at m = 2: per-item budget, and three queue/decomposition experiments that did not pay (Nov 8, branch `ornith-moe`)
+
+Task: cut `exl3_moe_coop_d_kernel` (6.69 ms/iter on the P100 = 32 calls x 209 us, 1.69 ms on the 2060, ~37% of the
+step) by 1.5-2.0 ms/iter towards the 100 t/s target. Result of this round: **no measurable win yet**, but the cost is
+now decomposed per item and three plausible levers are ruled out by measurement. Tooling added: a model-free
+microbenchmark of the kernel pair and a fixed per-item trace.
+
+**Model-free benchmark** (`tests/kernels/moe/coop_trace/bench_dual.py`): synthetic 4 bpw mul1 experts at the Ornith
+serving shape (bsz 2 = m = 2, 256 experts, top-8, Hi 2048, I 512, Ho 2048, shared expert 4 bpw), calling the same
+`exl3_moe_coop_pair` entry point the model uses, with a configurable expert overlap between the two verification rows
+(0.5 by default: consecutive tokens route alike, which is what makes runs of 2 rows). It reproduces the real per-item
+times (routed gate/up 98 us against 90 in the Nov 7 trace) at a kernel wall of 183 us against the model's 209 (the
+bench lacks the model's exact routing and the MTP head's layer, so use it for A/B, not for absolute claims). The
+trace tools were adapted to the worktree and `ps.trace` is now set in `exl3_moe_coop_launch_pair`, so the shared
+expert's items are decomposed too (before, they recorded zeros).
+
+**Per call, P100, 112 blocks (2/SM), trace run wall 197.7 us including ~15 us of trace overhead (untraced 183 us):**
+
+| kind | block-time us/call | share | GEMV | wait | epilogue | per real item |
+| :--- | ---: | ---: | ---: | ---: | ---: | :--- |
+| routed gate/up | 82.3 | 42% | 77.0 | 0 | 5.3 | 98.0 us GEMV, 6.8 epi |
+| routed down | 61.2 | 31% | 34.2 | 18.9 | 8.2 | 21.8 us GEMV |
+| shared gate/up | 11.7 | 6% | 10.6 | 0 | 1.1 | 74.3 us (2-row run) |
+| shared down | 14.0 | 7% | 5.0 | 7.2 | 1.7 | 35.3 us (2-row run) |
+| queue / syncthreads / fences / trace | ~28.5 | 14% | | | | |
+
+- The GEMV cores run at 2.7-3.0 G weights/s per block (5.4-6.0 per SM with two blocks), i.e. **at or above the dense
+  `exl3_gemv` kernel's ~3 G/s/SM**: the inner loop is not the lever. The kernel is latency-bound (22% of the P100's
+  DRAM bandwidth, 18% of its ALU ceiling), and the register budget is already exhausted (128 registers with a 32-byte
+  spill at 2 blocks/SM, so 3 blocks/SM would spill heavily).
+- The waits are real but mostly overlapped: the down items spin 19 us on average for their slot's activations, yet
+  removing the cause of the early dispatch did not move the wall (see below).
+- The shared expert is 13% of the wall for 6.3% of the weights: its items are 2-row runs and the 2-row ("trans")
+  path costs ~35% more per row-weight than the single-row direct path (8 extra shuffles per fragment).
+
+**Experiments measured and rejected** (all with the model-free bench, ABAB in one process, 200 calls per point):
+
+| change | result |
+| :--- | :--- |
+| Compact dual queue (`EXL3_MOE_COOP_COMPACT=1`, default on): size the queue by the run table instead of the no-duplicate item grid, so the 34% "hole" items that exit at once no longer let blocks run ahead of the gate/up stage | **neutral**: 206.8 vs 208.0 us/call (-0.6%, inside noise). Kept (it dispatches 34% fewer items and the kernel tests pass 166/166) but it is not a win. |
+| Gate/up split-k 2 or 4 (`EXL3_MOE_COOP_KSPLIT_A`, new testing knob) to fill the 24 blocks that idle through the gate/up phase | **worse**: 208.7 (2) and 214.2 (4) vs 206.9 us/call. The extra items and the extra split-k partials cost more than the wave filling gains. |
+| Split-k for every stage (`EXL3_MOE_COOP_KSPLIT=1`, existing knob) | neutral-to-worse: 201.7 -> 209.5 us/call at 0.5 overlap (the earlier -13% reading at overlap 0 was an artefact of unrelated expert picks). |
+
+**Where the remaining time is, with estimates (not measured):** (a) a 2-row direct path in `gemv_tile` (both rows
+decoded from the same B registers, 8 HFMA2 per tile, no extra shuffles) would cut ~35% of the 2-row items' GEMV time,
+which is ~half the gate/up row work at m = 2 and all of the shared expert: ~-14 us/call; it changes the per-row
+summation order (accepted, like the 256-thread change) and the M34 bit-identity test would have to compare the new
+path instead of the emulated MMA. (b) Pre-issuing the per-expert epilogue tables (svh, bias, down suh) before the GEMV
+hides their L2 latency: ~-3/-5 us/call. (c) Overlapping the gate/up and down phases better needs the down items of a
+run dispatched as soon as that run's activations are ready, i.e. a work-stealing queue rather than a ticket order:
+the current order already overlaps them as much as the dependency allows.
+

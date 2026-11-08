@@ -225,8 +225,17 @@ static MoeCoopPlan moe_coop_plan(MoeCoopParams& p, int device)
     const int max_split = std::max(1, p.slots_max / slots);
     p.ksplit_a = moe_coop_pick_ksplit(base_a, p.Hi / 16, max_split, device);
     p.ksplit_b = moe_coop_pick_ksplit(base_b, p.I / 16, max_split, device);
+    {
+        // Testing / A-B: force the gate/up split-k only (the routed stage's items are 98 us long at m = 2 and
+        // only 88 of them exist, so 24 of the 112 resident blocks idle through the whole gate/up phase; a finer
+        // split fills them and lets the down stage overlap the tail). Read per call.
+        const char* env = std::getenv("EXL3_MOE_COOP_KSPLIT_A");
+        if (env && std::atoi(env) > 0)
+            p.ksplit_a = std::max(1, std::min(std::atoi(env), max_split));
+    }
     pl.grid_a = base_a * p.ksplit_a;
     pl.grid_b = base_b * p.ksplit_b;
+    p.compact = true;
     p.f_items_a = pl.grid_a;
     p.f_items_b = pl.grid_b;
     return pl;
@@ -404,7 +413,13 @@ void exl3_moe_coop_launch_pair
         if (ps.a_global) moe_coop_rot(ps, stream);
         if (p.a_global) moe_coop_rot(p, stream);
     }
+    {
+        const char* env = std::getenv("EXL3_MOE_COOP_COMPACT");
+        p.compact = !env || std::atoi(env) != 0;
+    }
+    ps.compact = p.compact;
     p.trace = moe_coop_trace_buf(device);
+    ps.trace = p.trace;   // EXL3_MOE_TRACE: the shared expert's items record their wait / GEMV / epilogue too
     void* args[] = { (void*) &p, (void*) &ps };
     const int grid = std::min(resident, pl.grid_a + pl.grid_b + pls.grid_a + pls.grid_b);
     cuda_check(cudaLaunchKernel(kd.kernel, dim3(grid), dim3(MOE_COOP_THREADS), args, kd.smem, stream));
