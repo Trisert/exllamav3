@@ -15,7 +15,7 @@ session. Prints per-turn lines and a summary with the session-average decode/pre
 fraction of session wall time spent in prefill.
 """
 import sys, os, time, json, argparse, subprocess, glob
-src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+src = os.environ.get("EXL_SRC") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, src)
 sys.path.insert(0, os.path.join(src, "examples"))
 
