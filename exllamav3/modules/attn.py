@@ -148,8 +148,11 @@ def prepare_for_attn(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
 
 
 # k_proj + v_proj through one fused GEMV launch (quant/exl3_gemv_fused.cuh; sm_60, 1-2 rows,
-# 4 bpw mul1). Off/on A/B via EXL3_GEMV_FUSED=0/1.
-_GEMV_FUSE = __import__("os").environ.get("EXL3_GEMV_FUSED", "1") != "0"
+# 4 bpw mul1). EXL3_GEMV_FUSED=0 disables every fused GEMV group; EXL3_GEMV_FUSED_KV=0 disables
+# only this pair, so the final battery can separate qkv+z from k+v (the k+v increment is ~0.12 ms,
+# below single-load noise).
+_GEMV_FUSE = (__import__("os").environ.get("EXL3_GEMV_FUSED", "1") != "0"
+              and __import__("os").environ.get("EXL3_GEMV_FUSED_KV", "1") != "0")
 
 
 class Attention(Module):
