@@ -24,6 +24,13 @@ config wins 15-60% at attention-projection sizes (n <= 4096), the wide config wi
 large-n/small-k FFN sizes. Big-k x big-n shapes lose slightly and fall through to the regular
 kernel, as do other architectures (Ada/Blackwell are memory-bound here and keep the regular
 kernel), bpw != 4, and m > 8.
+
+m = 9..16 (MMODE 5, EXL3_GEMV_M16=0 disables): the m16n8k16 fragments already span 16 rows, so the
+second row group costs one more A load per k-slice, one more fold accumulator and 16 instead of 8
+smem rows. On sm_60 the emulated MMA pays 8 more shuffles per k-slice for that group. Instances
+exist for 4 / 5 / 6 bpw mul1 only (the dense projections of the Flash-Next class) and the path is
+taken on Pascal and Turing only; anything else at m > 8 keeps the tile GEMM, which on sm_60 is
+several times off the roofline there.
 */
 
 static int exl3_gemv_env_mode()
@@ -39,6 +46,14 @@ static int exl3_gemv_env_smem()
     const char* env = std::getenv("EXL3_GEMV_SMEM");
     if (!env) return -1;
     return atoi(env);
+}
+
+// m = 9..16 (MMODE 5): on by default, EXL3_GEMV_M16=0 disables it (A/B testing, read per call). Only
+// consulted for size_m > EXL3_GEMV_MAX_M, so the m <= 8 paths do not pay the getenv
+static bool exl3_gemv_env_m16()
+{
+    const char* env = std::getenv("EXL3_GEMV_M16");
+    return !env || atoi(env) != 0;
 }
 
 // Turing sm_75 (RTX 2060): every eligible K <= 4 shape takes the GEMV unless EXL3_GEMV_SM75=0
@@ -64,7 +79,7 @@ static int exl3_gemv_cfg(int cc, bool sm75, int size_m, int size_k, int size_n, 
     if (mode == 0) return -1;
     if (K < 2 || K > 6) return -1;
     if (K != 4 && cb == 0) return -1;
-    if (size_m > EXL3_GEMV_MAX_M) return -1;
+    if (size_m > EXL3_GEMV_MAX_M16) return -1;
     if (size_k % 128 || size_n % 128) return -1;
     //if (cc != CC_AMPERE) return -1;  // measured win on Ampere; Ada/Blackwell are memory-bound here
     if (mode == 2) return size_n <= 8192 ? 0 : 1;
@@ -114,7 +129,16 @@ static void* exl3_gemv_select_kernel(int bits, int cb, bool c_fp32, int mmode, i
         SEL(bits_, cb_, true,  2, 0, sm_) SEL(bits_, cb_, true,  2, 1, sm_) \
         SEL(bits_, cb_, false, 4, 0, sm_) SEL(bits_, cb_, false, 4, 1, sm_) \
         SEL(bits_, cb_, true,  4, 0, sm_) SEL(bits_, cb_, true,  4, 1, sm_)
+    // MMODE 5 (m = 9..16) instances: the dense tensors of the Flash-Next class, 4 / 5 / 6 bpw mul1. Other
+    // widths and codebooks keep the tile-GEMM fallback at m > 8 (unchanged behaviour)
+    #define SEL_GRID_M5(bits_, cb_, sm_) \
+        SEL(bits_, cb_, false, 5, 0, sm_) SEL(bits_, cb_, false, 5, 1, sm_) \
+        SEL(bits_, cb_, true,  5, 0, sm_) SEL(bits_, cb_, true,  5, 1, sm_)
     SEL_GRID(4, 0, false) SEL_GRID(4, 1, false) SEL_GRID(4, 2, false)
+    SEL_GRID_M5(4, 2, false)    // 4 bpw mul1, shuffle extraction: lm_head
+    SEL_GRID_M5(5, 2, true)     // 5 bpw mul1, staged words: attention / GDN projections
+    SEL_GRID_M5(6, 2, true)     // 6 bpw mul1, staged words: MTP fc_hidden / fc_embedding
+    #undef SEL_GRID_M5
     SEL_GRID(2, 1, false) SEL_GRID(2, 2, false) SEL_GRID(2, 1, true) SEL_GRID(2, 2, true)
     SEL_GRID(3, 1, false) SEL_GRID(3, 2, false) SEL_GRID(3, 1, true) SEL_GRID(3, 2, true)
     SEL_GRID(5, 1, true) SEL_GRID(5, 2, true)
@@ -153,17 +177,25 @@ bool exl3_gemv_try_launch
         if (K < 2 || K > 6) return false;
         if (K != 4 && cb == 0) return false;
     }
-    if (size_m > EXL3_GEMV_MAX_M) return false;
+    // m = 9..16 (MMODE 5) uses the second row group of the m16n8k16 fragments. Instantiated for the integer mul1
+    // rates the dense projections of this class use and enabled where it is measured (Pascal, Turing); every other
+    // width, codebook, half-integer rate and m > 16 keeps the tile-GEMM fallback it had
+    const bool m16 = size_m > EXL3_GEMV_MAX_M;
+    if (size_m > EXL3_GEMV_MAX_M16) return false;
+    if (m16 && (half_k || cb != 2)) return false;
     if (size_k % 128 || size_n % 128) return false;
 
     int mode = force ? 2 : exl3_gemv_env_mode();
     if (mode == 0) return false;
     int cc = DevCtx::instance().get_cc(device);
+    const bool sm75 = cc == CC_OLD && exl3_gemv_sm75(device);
+    if (m16 && !(cc == CC_PASCAL || sm75)) return false;
+    if (m16 && !exl3_gemv_env_m16()) return false;
     // if (cc != CC_AMPERE) return false;
     // Pascal, m = 2 (an MTP verify step): direct dot products with two rows (MMODE 2). m = 3..4: the emulated MMA's
     // arithmetic with one output per lane (MMODE 4, bit-identical to MMODE 1; EXL3_GEMV_M34=0 restores MMODE 1).
-    // Every other m > 1 keeps the MMA path (MMODE 1)
-    int mmode = size_m == 1 ? 0 : ((cc == CC_PASCAL && size_m == 2 && !half_k) ? 2 : 1);
+    // Every other m > 1 keeps the MMA path (MMODE 1); m = 9..16 takes the 16-row MMA path (MMODE 5)
+    int mmode = size_m == 1 ? 0 : (m16 ? 5 : ((cc == CC_PASCAL && size_m == 2 && !half_k) ? 2 : 1));
     if (mmode == 1 && cc == CC_PASCAL && size_m <= 4 && !half_k)
     {
         const char* env = std::getenv("EXL3_GEMV_M34");
@@ -199,7 +231,7 @@ bool exl3_gemv_try_launch
 
     // Shape heuristic: a half-integer rate K + 0.5 is handled like the integer rate above it (its tile is
     // between the two in bytes; unmeasured, so it inherits the K + 1 envelope)
-    int cfg = exl3_gemv_cfg(cc, cc == CC_OLD && exl3_gemv_sm75(device), size_m, size_k, size_n, half_k ? K + 1 : K, cb, mode, narrow_coresident);
+    int cfg = exl3_gemv_cfg(cc, sm75, size_m, size_k, size_n, half_k ? K + 1 : K, cb, mode, narrow_coresident);
     if (cfg < 0) return false;
 
     void* kernel = cfg == 0 ? narrow_kernel : select(cfg);
