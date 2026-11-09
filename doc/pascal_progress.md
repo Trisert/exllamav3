@@ -1702,8 +1702,24 @@ the decode). The target's layer split therefore moves with whatever the desktop 
 `df2_7` config measured 26.0 t/s on its very first (cold) load against 38.6-38.8 on the later ones. To make it
 deterministic, `exllamav3/model_init.py` now accepts `-dgs/--draft_gpu_split <per-device GB>` (default: the
 `--gpu_split` list; `0` disables a device) so the drafter can be pinned to the P100 (`-dgs 0,3.0`), giving the 2060
-its space back for target layers. Implemented and compile-checked, **not measured yet** - the next step is
-`-dgs 0,3.0` against the default with 2 loads per side.
+its space back for target layers. Measured the next morning (5 loads, same protocol, P100 cold: 31 C at the start of
+the first arm):
+
+| arm | `-gs` | drafter on | t/s | tok/step | ms/step |
+| :--- | :--- | :--- | ---: | ---: | ---: |
+| ref | 4.0,15.0 | 2060 | 39.64 / 40.94 | 5.75 / 5.98 | 145.1 / 146.1 |
+| `-dgs 0,3.0` | 4.0,15.0 | P100 | 39.98 | 5.86 | 146.6 |
+| `-dgs 0,3.0` | 4.4,15.0 | P100 | 37.91 / 38.59 | 5.54 | 146.1 / 143.6 |
+
+**Neutral in ms/step** (143.6-146.6, +-1%): the drafter's 1.4 GB read is not a measurable part of the 145 ms step, and
+the 2060's *budget* (not the freed VRAM) was already the binding constraint on the target's layer count (3.9-4.0 GB of
+target weights on the 2060 in every arm, i.e. the same number of layers). It is kept for the deterministic placement:
+with the drafter off the 2060 the card sits at 4.4-4.9 of its 5.73 GiB instead of 5.70 (99.6%) and the OOM retries during
+the load disappear (0 warnings against 6-16). Note that the t/s column moves +-3% between loads at the same ms/step
+because the layer split - hence the greedy text and the draft acceptance, 63.6-69.7% - changes with the desktop's VRAM
+use: compare ms/step across loads, not t/s. Also, the same config measured 39.6-40.9 t/s this morning with the P100 at
+31-51 C against 38.6-38.8 last night at 62-68 C: the dense 27B is thermally sensitive well below the 78 C throttle point,
+so keep the card cool for the headline number.
 
 Where the time goes at the full block (estimates from the m-scaling of the Nov 5 dense-27B profile, to be measured with
 a profile trace): the P100's 48-layer share is ~2.3 ms/layer at m = 8 against ~1.3 ms/layer on the 2060 (its MMODE 1
