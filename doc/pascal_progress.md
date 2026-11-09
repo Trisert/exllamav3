@@ -1773,17 +1773,22 @@ fold as MMODE 1, so the result is bit-identical. 12 instances (4/5/6 bpw mul1 x 
 `cc == CC_PASCAL && 5 <= size_m <= 8 && !half_k && cb == 2` and K in {4,5,6} (K = 3 mul1 falls back to the tile GEMM,
 which the regressions caught), knob `EXL3_GEMV_M58` (default on).
 
-| A/B, 4 loads ABBA, greedy, P100 cooled each, one arm per load | t/s | ms/step |
+| A/B, one load per arm, greedy, P100 cooled each (final, gated build) | t/s | ms/step |
 | :--- | ---: | ---: |
-| `EXL3_GEMV_M58=1` | **42.50 / 42.49** | **140.71 / 140.74** |
-| `EXL3_GEMV_M58=0` | 40.94 / 40.90 | 146.07 / 146.21 |
+| `EXL3_GEMV_M58=1` | 43.20 / 42.73 | 138.43 / 139.95 |
+| `EXL3_GEMV_M58=0` | 40.86 (plus 40.94 / 40.90 earlier) | 146.35 / 146.07 / 146.21 |
 
-**-5.42 ms/step (-3.7%), +3.85% t/s**, and the greedy trajectory is bit-identical in all four loads (draft 249/357 =
-69.7%, 5.98 tok/step, 300/300 tokens), so the delta is pure kernel time. Trace attribution: `<4,false,2,1,1>` cfg1
-33.5 -> 27.95 ms/iter, `<4,true,2,1,1>` cfg1 14.1 -> 11.96; `<4,true,2,1,0>` cfg0 23.5 -> 24.72 (+1.22, a per-shape
-gate is being measured). Model-free microbench (P100, per call, m = 8): 4 bpw 5120x17408 343.3 vs 395.2 us (+13.1%),
-m = 5/6/7 +11.6/+12.7/+12.9%; 6 bpw 5120x4096 +4.7%; **5 bpw head 5120x248320 +0.6% only** - the head runs the staged-word
-path with a single wave (grid [56,1,1] over a 248320-wide output), so its cost is parallelism, not arithmetic (task-8).
+**-7.02 ms/step (-4.8%), +5.05% t/s**, greedy trajectory bit-identical in every load (249/357 = 69.7%, 5.98 tok/step,
+300/300 tokens). The **per-(K, cfg) gate** is what makes the difference: MMODE 6 for every wide (cfg 1) shape and, for
+cfg 0, only at K >= 5; 4 bpw cfg0 (the 87-call group) stays MMODE 1 because on the real shapes it measured neutral
+(-0.8 / -0.1 / +0.2% fp16, -0.5 / -1.3 / +0.1% fp32, model-free, m = 8) while cfg 1 gains +13.9% (fp16) / +9.9% (fp32).
+Without the gate the same build measured 140.72, so the gate is worth **-1.53 ms/step** on top. Trace attribution on the
+ungated build: `<4,false,2,1,1>` cfg1 33.5 -> 27.95 ms/iter, `<4,true,2,1,1>` cfg1 14.1 -> 11.96; `<4,true,2,1,0>` cfg0
+23.5 -> 24.72 before the gate. Model-free microbench (P100, per call, m = 8): 4 bpw 5120x17408 343.3 vs 395.2 us
+(+13.1%), m = 5/6/7 +11.6/+12.7/+12.9%; 6 bpw 5120x4096 +4.7%; **5 bpw head 5120x248320 +0.6% only** - the head runs the
+staged-word path with a single wave (grid [56,1,1] over a 248320-wide output), so its cost is parallelism, not arithmetic
+(task-8). Kernel tests: 84 passed, 1 skipped on the P100 (bit-identity at m = 5..8 over 4/5/6 bpw, both configs, fp16 and
+fp32, padded rows, the cfg gate and the real dispatch, plus the existing GEMV suites).
 
 **Graph-capture caveat, for anyone repeating this**: the decode forward runs captured launch graphs, so the GEMV kernel
 choice is baked at load and an in-process env toggle does NOT change it (an in-process ABAB measured "139.45 vs 139.64"
