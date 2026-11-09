@@ -234,8 +234,13 @@ __device__ __forceinline__ void gather_a_rows16(const FragB& a01, const FragB& a
 // ptxas spends 81-85 registers on them on sm_86/sm_89 (one 512-thread block per SM instead of two, measured
 // 18-28% slower at attention-projection shapes on the 3090). They are packed into one register (see x_pack) and
 // the bound keeps the compiler at the integer instances' 64
+// 5 / 6 bpw wide (the staged-word path): 137 registers limit it to one 256-thread block per SM on sm_60, and the
+// cooperative launch caps the grid at co-residency, so a head-sized shape runs 56 CTAs over the whole n range
+// (119 GB/s at m = 8 against 282 GB/s at m = 1, where the direct path's 92 registers allow two blocks per SM and
+// 112 CTAs). The 2-block bound keeps ptxas at 128 registers (blockLimitSharedMem is already 3) and doubles the
+// CTAs; the arithmetic is unchanged.
 template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF = false>
-__global__ __launch_bounds__(CFG == 0 ? 512 : 256, HALF && CFG == 0 ? 2 : 1)
+__global__ __launch_bounds__(CFG == 0 ? 512 : 256, HALF && CFG == 0 ? 2 : ((bits >= 5 && CFG == 1) ? 2 : 1))
 void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 {
     static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2) : (bits >= 2 && bits <= 6),
