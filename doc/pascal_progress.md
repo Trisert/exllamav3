@@ -1764,3 +1764,41 @@ Two findings frame the next work:
 accept) on the code prompt with `-gs 4.0,15.0 -cs 32768 -cq 4`; prefill (`examples/bench_prefill.py`, cold corpus, same
 config) **204.5 t/s at 512 tokens, 236.9 at 2048, 222.2 at 8192** (P100 73 -> 79 C and 860 MHz at the end of the 8192
 run, i.e. thermally limited there).
+### MMODE 6 (m = 5..8 GEMV) and the sparse draft head: measured (Nov 9, task-7, branch `qwen38-27b-dflash2-gemv`)
+
+**MMODE 6** (implemented on `exl3_gemv_kernel.cuh`, dispatch in `exl3_gemv.cu`): the MMODE 4 arithmetic ("one output
+per lane") with **two row groups per lane** - rows `lane%4` and `lane%4+4`, the B columns of the lane's quad gathered
+once and reused by both groups, 16 HFMA2 per fragment, then the same per-output HFMA2 chain / pair sum / fp16 run sum /
+fold as MMODE 1, so the result is bit-identical. 12 instances (4/5/6 bpw mul1 x cfg 0/1 x fp16/fp32), dispatch gated to
+`cc == CC_PASCAL && 5 <= size_m <= 8 && !half_k && cb == 2` and K in {4,5,6} (K = 3 mul1 falls back to the tile GEMM,
+which the regressions caught), knob `EXL3_GEMV_M58` (default on).
+
+| A/B, 4 loads ABBA, greedy, P100 cooled each, one arm per load | t/s | ms/step |
+| :--- | ---: | ---: |
+| `EXL3_GEMV_M58=1` | **42.50 / 42.49** | **140.71 / 140.74** |
+| `EXL3_GEMV_M58=0` | 40.94 / 40.90 | 146.07 / 146.21 |
+
+**-5.42 ms/step (-3.7%), +3.85% t/s**, and the greedy trajectory is bit-identical in all four loads (draft 249/357 =
+69.7%, 5.98 tok/step, 300/300 tokens), so the delta is pure kernel time. Trace attribution: `<4,false,2,1,1>` cfg1
+33.5 -> 27.95 ms/iter, `<4,true,2,1,1>` cfg1 14.1 -> 11.96; `<4,true,2,1,0>` cfg0 23.5 -> 24.72 (+1.22, a per-shape
+gate is being measured). Model-free microbench (P100, per call, m = 8): 4 bpw 5120x17408 343.3 vs 395.2 us (+13.1%),
+m = 5/6/7 +11.6/+12.7/+12.9%; 6 bpw 5120x4096 +4.7%; **5 bpw head 5120x248320 +0.6% only** - the head runs the staged-word
+path with a single wave (grid [56,1,1] over a 248320-wide output), so its cost is parallelism, not arithmetic (task-8).
+
+**Graph-capture caveat, for anyone repeating this**: the decode forward runs captured launch graphs, so the GEMV kernel
+choice is baked at load and an in-process env toggle does NOT change it (an in-process ABAB measured "139.45 vs 139.64"
+with both arms on MMODE 6). Every `EXL3_GEMV_M58` comparison needs one load per arm.
+
+**Sparse draft head with DFlash2** (`-sdh 16384`): the drafter's `sample_from_state` runs the target's lm_head over the
+whole 8-row block, and that call can use the dynamic sparse vocabulary subset instead of the full head. 4 loads (same
+protocol; `EXL3_GEMV_M58` off, i.e. the pre-task-7 tree):
+
+| arm | t/s | tok/step | accept | ms/step |
+| :--- | ---: | ---: | ---: | ---: |
+| no `-sdh` | 40.94 | 5.98 | 69.7% | 146.07 |
+| `-sdh 16384` | 41.73 / 41.96 | 5.86 | 68.1% | 140.42 / 139.66 |
+| `-sdh 32768` | 41.92 | 5.86 | 68.1% | 139.79 |
+
+**-6.1 ms/step of kernel time (-4.2%) but -1.6 points of draft acceptance** (the selector walk loses some candidates
+from the sparse subset even with a 0.0% miss rate on the argmax), so the net is +2.0-2.5% t/s; 16384 and 32768 are
+identical. Keep `-sdh 16384` for DFlash2 when t/s is what matters.
