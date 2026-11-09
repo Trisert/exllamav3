@@ -1807,3 +1807,30 @@ protocol; `EXL3_GEMV_M58` off, i.e. the pre-task-7 tree):
 **-6.1 ms/step of kernel time (-4.2%) but -1.6 points of draft acceptance** (the selector walk loses some candidates
 from the sparse subset even with a 0.0% miss rate on the argmax), so the net is +2.0-2.5% t/s; 16384 and 32768 are
 identical. Keep `-sdh 16384` for DFlash2 when t/s is what matters.
+### CUDA graphs: active and numerically exact on this model (Nov 9, verification)
+
+Question asked: do the decode launch graphs actually work on the 27B + DFlash2 pair? Two loads, same config
+(`-gs 3.6,15.0 -dgs 0,3.0 -cs 32768 -cq 4 -sdh 16384`, which also pins the split deterministically), one with
+`EXL3_GRAPHS=1` and one with `0`; a 200-token warm-up job then the same 300-token greedy job, plus a profiler trace each
+(`tmp/graph_run.py`, `tmp/graph_analyze.py`, `tmp/graph_on_trace.json` / `tmp/graph_off_trace.json`).
+
+| | `EXL3_GRAPHS=1` | `EXL3_GRAPHS=0` |
+| :--- | ---: | ---: |
+| greedy 300-token ids | md5 `e79ffdc3a96f` | **identical** |
+| kernels per captured step (P100 / 2060) | 920 / 202 | 920 / 202 |
+| kernel busy per step (P100 / 2060) | 114.42 / 15.49 ms | 115.25 / 15.39 ms |
+| `cudaGraphLaunch` per step | **138** | 0 |
+| `cudaLaunchKernel` / `cudaLaunchCooperativeKernel` | 239 / 12 | 617 / 440 |
+| `cudaGraphExecKernelNodeSetParams` | 48 | 0 |
+| ms/iter (300 greedy tokens) | 130.87 | 132.81 |
+
+The graphs are **active** (138 replays per step), they submit **exactly the same kernels** (same count and same total
+kernel time per device, so only host submission changes, as the docs say), and they are **numerically exact**: the 300
+greedy token ids are bit-identical to the eager path. The 1.46% wall difference is inside the thermal noise of the two
+loads (the graph arm ended 9 C cooler), consistent with the documented "a few percent". The 48
+`cudaGraphExecKernelNodeSetParams` calls are the per-step parameter updates (cache pointers / sequence lengths) inside
+the exec, which is what keeps replay correct across steps and job transitions - and the reason an in-process env toggle
+cannot change a graphed kernel choice (`EXL3_GEMV_M58` and friends must be set before load).
+
+**Best decode number on this pair so far**: 130.87 ms/iter, 5.74 tok/iter = **43.9 t/s** (cold P100, MMODE 6 +
+`-sdh 16384` + the deterministic `-gs 3.6,15.0 -dgs 0,3.0` split), against 38.8 t/s at the start of the round.
