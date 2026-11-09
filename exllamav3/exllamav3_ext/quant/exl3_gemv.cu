@@ -49,6 +49,14 @@ static int exl3_gemv_env_smem()
     return atoi(env);
 }
 
+// m = 5..8 on Pascal (MMODE 6): on by default, EXL3_GEMV_M58=0 restores MMODE 1 (A/B testing, read per call).
+// Only consulted for 5 <= size_m <= 8
+static bool exl3_gemv_env_m58()
+{
+    const char* env = std::getenv("EXL3_GEMV_M58");
+    return !env || atoi(env) != 0;
+}
+
 // m = 9..16 (MMODE 5): on by default, EXL3_GEMV_M16=0 disables it (A/B testing, read per call). Only
 // consulted for size_m > EXL3_GEMV_MAX_M, so the m <= 8 paths do not pay the getenv
 static bool exl3_gemv_env_m16()
@@ -140,6 +148,14 @@ static void* exl3_gemv_select_kernel(int bits, int cb, bool c_fp32, int mmode, i
     SEL_GRID_M5(5, 2, true)     // 5 bpw mul1, staged words: attention / GDN projections
     SEL_GRID_M5(6, 2, true)     // 6 bpw mul1, staged words: MTP fc_hidden / fc_embedding
     #undef SEL_GRID_M5
+    // MMODE 6 (m = 5..8 on Pascal): the same 4 / 5 / 6 bpw mul1 classes as MMODE 5
+    #define SEL_GRID_M6(bits_, cb_, sm_) \
+        SEL(bits_, cb_, false, 6, 0, sm_) SEL(bits_, cb_, false, 6, 1, sm_) \
+        SEL(bits_, cb_, true,  6, 0, sm_) SEL(bits_, cb_, true,  6, 1, sm_)
+    SEL_GRID_M6(4, 2, false)
+    SEL_GRID_M6(5, 2, true)
+    SEL_GRID_M6(6, 2, true)
+    #undef SEL_GRID_M6
     SEL_GRID(2, 1, false) SEL_GRID(2, 2, false) SEL_GRID(2, 1, true) SEL_GRID(2, 2, true)
     SEL_GRID(3, 1, false) SEL_GRID(3, 2, false) SEL_GRID(3, 1, true) SEL_GRID(3, 2, true)
     SEL_GRID(5, 1, true) SEL_GRID(5, 2, true)
@@ -202,6 +218,22 @@ bool exl3_gemv_try_launch
         const char* env = std::getenv("EXL3_GEMV_M34");
         if (!env || atoi(env) != 0) mmode = 4;
     }
+    // m = 5..8 on Pascal: MMODE 4's arithmetic with two row groups per lane (MMODE 6), one weight read applied to
+    // all 8 rows. Instances exist for 4 / 5 / 6 bpw mul1 only (the rates the dense tensors of this class use);
+    // every other width and codebook stays on MMODE 1, whose instances cover the whole eligible envelope.
+    // One measured exception: 4 bpw in the narrow config. The shuffle-extracted 4 bpw path has no smem staging,
+    // and in a 512-thread block MMODE 6's second row group (2x the A rows, 16 half2 accumulators) costs more than
+    // the halved B gather saves: 5-10% slower at m = 8 on every cfg0 shape (6144 x 5120, 17408 x 5120,
+    // 5120 x 1024, fp16 and fp32 out), while 4 bpw wide gains 12-13% and the staged 5 / 6 bpw paths gain 2.6-6%
+    // in cfg0 too. So: MMODE 6 for every wide shape, and for cfg0 only at K >= 5.
+    // m58_wide mirrors exl3_gemv_cfg's Pascal branch (keep the two in sync; mode 3 / 4 are the force-narrow /
+    // force-wide testing knobs)
+    const bool m58 = K == 4 || K == 5 || K == 6;
+    const bool m58_wide = mode == 4 || (mode != 3 && (mode == 2 ? size_n > 8192 : !(size_n <= 8192 && size_n <= size_k)));
+    const bool m58_cfg = m58_wide || K != 4;
+    if (mmode == 1 && cc == CC_PASCAL && !half_k && cb == 2 && m58 && m58_cfg && size_m >= 5 && size_m <= 8 &&
+        exl3_gemv_env_m58())
+        mmode = 6;
     int num_sms = DevCtx::instance().get_num_sms(device);
 
     // Cooperative launch: grids are capped at full co-residency (cached per kernel), and the
