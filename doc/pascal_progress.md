@@ -1721,7 +1721,46 @@ use: compare ms/step across loads, not t/s. Also, the same config measured 39.6-
 31-51 C against 38.6-38.8 last night at 62-68 C: the dense 27B is thermally sensitive well below the 78 C throttle point,
 so keep the card cool for the headline number.
 
-Where the time goes at the full block (estimates from the m-scaling of the Nov 5 dense-27B profile, to be measured with
-a profile trace): the P100's 48-layer share is ~2.3 ms/layer at m = 8 against ~1.3 ms/layer on the 2060 (its MMODE 1
-GEMV is flat in m), so at this verify width the 2060 is the fast card per layer and the interesting lever is moving
-target layers onto it (i.e. exactly what `-dgs` enables).
+### Where the 145 ms step goes (measured, torch.profiler; trace `tmp/d27df2_trace.json`)
+
+Unprofiled 146.3 ms/iter, 5.40 tok/iter. The trace covers exactly 2 iterations (it contains 2 `dflash2_selector_walk`
+calls) but its per-device sums reproduce the wall: **P100 119.9 ms/iter + 2060 24.9 ms/iter = 144.8 ms**, so at this
+configuration there are no significant host gaps - both cards are busy back to back and the layer chain is the whole step.
+
+| P100, ms/iter | kernel |
+| ---: | :--- |
+| 33.5 | `exl3_gemv_kernel<4,false,2,1,1>` (83 calls, 404 us each) |
+| 23.5 | `exl3_gemv_kernel<4,true,2,1,0>` (87 calls) |
+| **14.3** | **5 bpw lm_head GEMV, 2 calls of 7.0-7.3 ms** (794 MB each = 111 GB/s) |
+| 14.1 | `exl3_gemv_kernel<4,true,2,1,1>` (66 calls) |
+| 9.1 | `exl3_gemv_kernel<3,...>` (18 calls) |
+| 4.0 | GDN recurrence (37 calls) |
+| 2.1 + 2.1 | paged attention split / 3 bpw GEMV |
+| 1.3 | 5 bpw GEMV (drafter-side layers) |
+| ~4 | conv, norms, gated rms, act_mul, BA rows, rope, scan replay, ... |
+| **119.9** | total |
+
+| 2060, ms/iter | kernel |
+| ---: | :--- |
+| 8.4 | `exl3_gemm_kernel<5,...>` tile GEMMs, 44 calls (the drafter's 5 bpw layers: sm_75 mul1 has no 5 bpw GEMV) |
+| 5.0 | `exl3_gemv_kernel<4,false,...>` (25 calls) |
+| 3.8 | `exl3_gemv_kernel<4,true,...>` (27) |
+| 1.9 | `exl3_mgemm_kernel<5,...>` (10) |
+| ~6 | GDN, attention, drafter selector/dynconv, rms, rope, ... |
+| **24.9** | total |
+
+Two findings frame the next work:
+1. **Every P100 GEMV in the step runs MMODE 1**: the 4th template argument is MMODE, and 1 is the shuffle-emulated MMA
+   path. The fast Pascal paths stop at m = 4 (MMODE 2 covers m = 2, MMODE 4 covers m = 3..4), while `size_m = 5..8` -
+   exactly the DFlash2 verify width - keeps MMODE 1. The EXL3 GEMVs are ~103 of the 120 P100 ms, so an m = 5..8 path in
+   the MMODE 4 style ("one output per lane", one weight read applied to all rows, bit-identical to MMODE 1) is the
+   largest single lever on this model (delegated as task-7).
+2. **The 5 bpw lm_head is called twice per step and costs 14.3 ms**: once for the 8-row verify, once inside the drafter's
+   `sample_from_state` (it runs the target's head over the whole block). At m = 8 it runs at 111 GB/s against the
+   289 GB/s the same head reaches at m = 1, i.e. the same m-dispatch problem; a fast m = 5..8 5 bpw instance covers it,
+   and the draft-side call can also be replaced by a sparse vocabulary head (`-sdh`, measured next).
+
+**Current numbers, for the record**: decode 39.6-40.9 t/s (143.6-146.6 ms/step, 5.54-5.98 tok/step, 63.6-69.7% draft
+accept) on the code prompt with `-gs 4.0,15.0 -cs 32768 -cq 4`; prefill (`examples/bench_prefill.py`, cold corpus, same
+config) **204.5 t/s at 512 tokens, 236.9 at 2048, 222.2 at 8192** (P100 73 -> 79 C and 860 MHz at the end of the 8192
+run, i.e. thermally limited there).
