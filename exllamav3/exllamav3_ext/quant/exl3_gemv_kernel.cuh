@@ -251,10 +251,14 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
     // MMODE 4: m = 3..4 on sm_60, the same arithmetic as the emulated MMA of MMODE 1 (bit-identical) with one output
     // (column lane / 4, row lane % 4) per lane and fragment: 8 shuffles + 8 HFMA2 per fragment instead of 16 + 32
     // MMODE 5: m = 9..16, MMODE 1's MMA path with both row groups of the fragment live (16 smem rows)
+    // MMODE 6: m = 5..8 on sm_60, the MMODE 4 arithmetic extended to two row groups per lane (rows lane % 4 and
+    // lane % 4 + 4, one output per lane and fragment): the B columns are gathered with the same 8 shuffles and
+    // reused by both groups, 16 HFMA2 per fragment, same per-output chain/pair sum/fold as MMODE 1 (bit-identical)
     constexpr int ROWS = MMODE == 0 ? 1 : (MMODE == 2 ? 2 : (MMODE == 3 || MMODE == 4 ? 4 :
                          (MMODE == 5 ? EXL3_GEMV_MAX_M16 : EXL3_GEMV_MAX_M)));
     constexpr int COLS = WNT * 16;
     constexpr bool TRANS = MMODE == 4;
+    constexpr bool TRANS8 = MMODE == 6;
     // sm_60 has no tensor cores and the shuffle-emulated MMA wastes 15 of 16 A rows at m = 1: take the dot product
     // directly instead (see the A fragment loads and the quad reduction below)
     constexpr bool DIRECT = (EXL3_SM60 != 0) && (MMODE == 0 || MMODE == 2 || MMODE == 3);
@@ -395,6 +399,22 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                     ta[t][f] = 0.0f;
                 }
         }
+        // MMODE 6: the same per row group (rows lane % 4 + 4 g)
+        [[maybe_unused]] half th8[WNT][2][2];
+        [[maybe_unused]] float ta8[WNT][2][2];
+        if constexpr (TRANS8)
+        {
+            #pragma unroll
+            for (int t = 0; t < WNT; ++t)
+                #pragma unroll
+                for (int f = 0; f < 2; ++f)
+                    #pragma unroll
+                    for (int g = 0; g < 2; ++g)
+                    {
+                        th8[t][f][g] = __ushort_as_half(0);
+                        ta8[t][f][g] = 0.0f;
+                    }
+        }
         // Direct path: one half2 partial sum (even / odd k) per tile, fragment and row
         [[maybe_unused]] half2 dh[WNT][2][NR];
         [[maybe_unused]] float2 da[WNT][2][NR];
@@ -449,7 +469,32 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             [[maybe_unused]] FragB a01, a23;
             [[maybe_unused]] half2 a_rows[2][8];
             [[maybe_unused]] half2 at[8];
-            if constexpr (TRANS)
+            [[maybe_unused]] half2 at8[2][8];
+            if constexpr (TRANS8)
+            {
+                // Rows lane % 4 and lane % 4 + 4, k pairs 0..7 of the slice (the a_rows[0] of MMODE 1 for those rows)
+                const int r = lane & 3;
+                #pragma unroll
+                for (int g = 0; g < 2; ++g)
+                {
+                    const int rg = r + 4 * g;
+                    if (rg < size_m)
+                    {
+                        const uint4* ap = (const uint4*) (A2 + (size_t) rg * (size_k / 2) + (size_t) (ks0 + i) * 8);
+                        const uint4 u0 = ap[0];
+                        const uint4 u1 = ap[1];
+                        const uint32_t uw[8] = {u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w};
+                        #pragma unroll
+                        for (int j = 0; j < 8; ++j) at8[g][j] = *reinterpret_cast<const half2*>(&uw[j]);
+                    }
+                    else
+                    {
+                        #pragma unroll
+                        for (int j = 0; j < 8; ++j) at8[g][j] = hzero;
+                    }
+                }
+            }
+            else if constexpr (TRANS)
             {
                 // Row lane % 4, k pairs 0..7 of the slice: the a_rows[0] of MMODE 1 for that row, loaded directly
                 const int r = lane & 3;
@@ -555,7 +600,41 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                     exl3_gemv_ns::dq8_regs_3bits<cb>(awv, bwv, x_s2, f0, f1);
                 }
 
-                if constexpr (TRANS)
+                if constexpr (TRANS8)
+                {
+                    // Same per-lane layout as MMODE 4, two rows: the 8 B half2 of the lane's quad are gathered once
+                    // and reused by both row groups; each group's chain is the MMODE 1 one for that row
+                    const int qb = lane & ~3;
+                    #pragma unroll
+                    for (int f = 0; f < 2; ++f)
+                    {
+                        const FragB& fr = f ? f1 : f0;
+                        const uint32_t e0 = *reinterpret_cast<const uint32_t*>(&fr.elems[0]);
+                        const uint32_t e1 = *reinterpret_cast<const uint32_t*>(&fr.elems[1]);
+                        half2 bu[8];
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j)
+                        {
+                            const uint32_t u = __shfl_sync(0xffffffffu, e0, qb + j);
+                            bu[j] = *reinterpret_cast<const half2*>(&u);
+                        }
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j)
+                        {
+                            const uint32_t u = __shfl_sync(0xffffffffu, e1, qb + j);
+                            bu[4 + j] = *reinterpret_cast<const half2*>(&u);
+                        }
+                        #pragma unroll
+                        for (int g = 0; g < 2; ++g)
+                        {
+                            half2 dd = hzero;
+                            #pragma unroll
+                            for (int j = 0; j < 8; ++j) dd = __hfma2(at8[g][j], bu[j], dd);
+                            th8[t][f][g] = __hadd(th8[t][f][g], __hadd(__low2half(dd), __high2half(dd)));
+                        }
+                    }
+                }
+                else if constexpr (TRANS)
                 {
                     // Column lane / 4 of each n8 fragment lives in this lane's quad (lane 4n + j: k = 2j, 2j + 1 in
                     // [0], 2j + 8, 2j + 9 in [1]); same HFMA2 chain order, pair sum and fp16 add as
@@ -607,7 +686,20 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
             if ((d + 1) % FOLD == 0 || i + 1 == myn)
             {
-                if constexpr (TRANS)
+                if constexpr (TRANS8)
+                {
+                    #pragma unroll
+                    for (int t = 0; t < WNT; ++t)
+                        #pragma unroll
+                        for (int f = 0; f < 2; ++f)
+                            #pragma unroll
+                            for (int g = 0; g < 2; ++g)
+                            {
+                                ta8[t][f][g] += __half2float(th8[t][f][g]);
+                                th8[t][f][g] = __ushort_as_half(0);
+                            }
+                }
+                else if constexpr (TRANS)
                 {
                     #pragma unroll
                     for (int t = 0; t < WNT; ++t)
@@ -656,7 +748,24 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
         // Cross-warp reduction over the k splits. Lane l holds row l/4, cols
         // tile*16 + frag*8 + 2*(l%4) (+1)
-        if constexpr (TRANS)
+        if constexpr (TRANS8)
+        {
+            const int r = lane & 3;
+            #pragma unroll
+            for (int g = 0; g < 2; ++g)
+            {
+                const int rg = r + 4 * g;
+                if (rg < size_m)
+                {
+                    #pragma unroll
+                    for (int t = 0; t < WNT; ++t)
+                        #pragma unroll
+                        for (int f = 0; f < 2; ++f)
+                            sh_red[warp][rg][t * 16 + f * 8 + (lane >> 2)] = ta8[t][f][g];
+                }
+            }
+        }
+        else if constexpr (TRANS)
         {
             const int r = lane & 3;
             if (r < size_m)
