@@ -38,6 +38,7 @@ BATCH_RECON = MOE_BATCH_RECON
 # launch
 MTILE = MOE_MTILE
 MTILE_T1, MTILE_T2 = 16, 32
+MTILE_SM60 = os.environ.get("EXL3_MOE_MTILE_SM60", "0") != "0"
 # Fused-kernel row capacity per expert when the wide tiles apply: with them the fused kernel
 # beats the batched reconstruct tier up to 256 rows (Qwen3.8 4k chunk: 128 -> 256 rows +3%)
 FUSED_ROWS_WIDE = int(os.environ.get("EXL3_MOE_FUSED_ROWS_WIDE", 256))
@@ -745,8 +746,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             if self.support_fused:
                 dev_idx = torch.device(device).index or 0
                 cc = torch.cuda.get_device_capability(dev_idx) if not torch.version.hip else (0, 0)
-                self.mtile_ok = MTILE and bool(self.multi_up.mul1) and cc >= (7, 0)
-                self.fused_rows = FUSED_ROWS_WIDE if self.mtile_ok else TEMP_ROWS_FUSED
+                # sm_60 (EXL3_MOE_MTILE_SM60=1, default off until measured): the 32-row instance runs on Pascal
+                # (exl3_moe clamps the 64-row request to 32); the fused row capacity stays at the plain
+                # value there, so heavier experts keep the reconstruct tier
+                mtile_sm60 = cc == (6, 0) and MTILE_SM60
+                self.mtile_ok = MTILE and bool(self.multi_up.mul1) and (cc >= (7, 0) or mtile_sm60)
+                self.fused_rows = FUSED_ROWS_WIDE if (self.mtile_ok and cc >= (7, 0)) else TEMP_ROWS_FUSED
                 R = self.fused_rows
                 C = ext.exl3_moe_max_concurrency(torch.device(device).index)
                 self.fused_mode_buffers = FusedBuffers(

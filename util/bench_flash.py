@@ -230,6 +230,13 @@ def main(args):
               f"len {len(out)} | {out[:80]!r}", flush = True)
         rec.add(dict(kind = "textcheck", n = n, offset = offset, text = out))
 
+    def text_check_mtile(n, offset, rounds):
+        """Identity gate for the sm_60 wide tiles: the same cold chunk continued greedily once per
+        round, flipping mtile_ok between rounds, inside one process"""
+        for i, on in enumerate(rounds):
+            print(f"MTILE round {i} mtile={int(on)} ({set_mtile(bool(on))} modules)", flush = True)
+            text_check(n, offset)
+
     def text_check_toggle(n, offset, rounds):
         """Identity gate for a copy-path change: the same cold chunk prefilled and continued
         greedily several times inside ONE process, alternating TUNING.async_dma. Same load and
@@ -241,6 +248,22 @@ def main(args):
             TUNING.async_dma = bool(on)
             print(f"TOGGLE round {i} async_dma={int(on)}", flush = True)
             text_check(n, offset)
+
+    def set_mtile(on):
+        """Flip the resident fused tier between the single 16-row launch and the 16/32-row tiers. The
+        fused row capacity is not touched, so the temp buffers stay valid in both arms"""
+        from exllamav3.modules.block_sparse_mlp import BlockSparseMLP
+        n = 0
+        def walk(mod):
+            nonlocal n
+            if isinstance(mod, BlockSparseMLP):
+                if getattr(mod, "fused_mode_buffers", None) is not None and mod.multi_up.mul1:
+                    mod.mtile_ok = bool(on)
+                    n += 1
+            for sub in getattr(mod, "modules", []) or []:
+                walk(sub)
+        walk(model)
+        return n
 
     def profile(kind, fn):
         with torch.profiler.profile(
@@ -312,11 +335,16 @@ def main(args):
         abba = [int(c) for c in args.abba_async.split(",")] if args.abba_async else None
         if abba:
             from exllamav3.model.moe_cpu_host import TUNING as _T
+        abba_mt = [int(c) for c in args.abba_mtile.split(",")] if args.abba_mtile else None
         for n in args.lengths:
             for r in range(args.repeat):
                 # Within-load A/B of the streamed-copy path: same process, same expert placement,
                 # so only the copy mechanism differs between adjacent runs; the alternation
                 # pattern spreads thermal drift over both modes
+                if abba_mt:
+                    on = bool(abba_mt[(k - 1) % len(abba_mt)])
+                    nmod = set_mtile(on)
+                    print(f"ABBA run {k}: mtile={int(on)} ({nmod} modules)", flush = True)
                 if abba:
                     _T.async_dma = bool(abba[(k - 1) % len(abba)])
                     print(f"ABBA run {k}: async_dma={int(_T.async_dma)}", flush = True)
@@ -340,6 +368,9 @@ def main(args):
             print_hooks("prefill")
         if args.check_text:
             text_check(args.check_text, k * stride + 7)
+        if args.check_text_mtile:
+            text_check_mtile(args.check_text or 1024, k * stride + 7,
+                             [int(c) for c in args.check_text_mtile.split(",")])
         if args.check_text_toggle:
             text_check_toggle(args.check_text or 1024, k * stride + 7,
                               [int(c) for c in args.check_text_toggle.split(",")])
@@ -355,7 +386,7 @@ def main(args):
     if args.json:
         with open(args.json, "w") as f:
             hooks_json = {f"{k[0]}.{k[1]}" if isinstance(k, tuple) else str(k): v for k, v in HOOKS.items()}
-        json.dump(dict(tag = args.tag, load_s = load_s, rows = rec.rows, hooks = hooks_json), f, indent = 1)
+            json.dump(dict(tag = args.tag, load_s = load_s, rows = rec.rows, hooks = hooks_json), f, indent = 1)
         print(f"JSON {args.json}")
 
 
@@ -375,6 +406,11 @@ if __name__ == "__main__":
     parser.add_argument("-profile_file", "--profile_file", type = str, default = None)
     parser.add_argument("-record_shapes", "--record_shapes", action = "store_true",
                         help = "torch.profiler record_shapes (aten op input shapes, e.g. the fallback GEMM shapes)")
+    parser.add_argument("-check_text_mtile", "--check_text_mtile", type = str, default = None,
+                        help = "comma-separated 0/1: one text check per round, flipping mtile_ok")
+    parser.add_argument("-abba_mtile", "--abba_mtile", type = str, default = None,
+                        help = "comma-separated 0/1, one per prefill run: toggle BlockSparseMLP.mtile_ok "
+                               "(wide row tiles in the resident fused tier) inside one load")
     parser.add_argument("-abba_async", "--abba_async", type = str, default = None,
                         help = "comma-separated moe_cpu_host.TUNING.async_dma values, one per prefill run "
                                "(within-load A/B of the streamed copy path: same process, same placement, "
