@@ -1368,3 +1368,31 @@ decode row is inside the +-5-10% run-to-run spread: MMODE 5 does not touch m <= 
    pair with the fixed harness is the outstanding check.
 6. **Chunk plans**: greedy text across differing chunk plans was not compared; whoever enables the ramp should run the
    one-load md5 check first.
+
+### Qwen3.8-Flash-Next: coverage curve of a hot-row cache for the n-gram table (Nov 11, offline, CPU only)
+
+Question: how many of a prompt's cold n-gram row reads would a pinned cache of the most frequent rows remove? The first
+gather of a cold 4096-token prefill is the largest single stall of the trace taken on `flash-opt` (Nov 10: 2060 idle 5.1 s
+and P100 idle 5.9 s at the start of a 20.8 s window; 21 k unique rows at ~240 us each, see the ngram-io section).
+`util/ngram_cov.py` reads only the three hash tensors from the table header (`head_offsets`, `head_vocab_sizes`,
+`layer_multipliers`: 16 heads x 20 M rows, 62 B each, 320 M rows, one table under `layers.1.ple`), tokenizes a training corpus,
+computes the row ids with the reference hash (`NGramEmbedding.compute_ngram_ids`), counts for each row in how many 4096-token
+training prompts it appears, and reports the share of a held-out prompt's unique rows covered by the N most frequent rows.
+Train: python files of `.venv/site-packages` (12 M / 59 M tokens); test: `exllamav3/` (549 prompts, 28.3 k unique rows per prompt:
+11.7 k bigram heads, 16.6 k trigram heads) and `doc/*.md` (21 prompts, 44.2 k unique rows).
+
+| cache rows | size | code, 12 M train tokens | code, 59 M train tokens | doc prose, 12 M |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 M | 62 MB | 28.7% | 29.2% | 19.1% |
+| 4 M | 0.25 GB | 38.7% | 40.0% | 27.8% |
+| 8 M | 0.5 GB | 43.3% | 46.0% | 32.3% |
+| 16 M | 1.0 GB | 53.3% | 54.2% | 42.9% |
+| 32 M | 2.0 GB | 53.3% (corpus saturated) | 60.2% | 42.9% |
+
+Bigram heads are covered much better than trigram heads (59 M train, 0.5 GB: 62% against 35%). Returns diminish: 5x more training
+data adds 2-7 points. Estimate, not measured end to end: a 0.5-1 GB pinned hot pack would remove about half of the cold reads, so
+the exposed first gather would drop from ~5 s to ~2.5-3 s on a cold page cache (about -2.3...-2.8 s of a 20 s prefill); the
+effect shrinks once the kernel page cache is warm (later turns), and the corpus here is code (real agentic traffic has more
+prose and JSON, which covers worse). The rows are copied byte for byte, so outputs stay bit-identical. Building the pack needs
+one sequential scan of the 19.8 GB file (~100 s at 197 MiB/s; the hash-scattered rows cannot be fetched by random reads).
+The model dir already sits on the Kingston, so the pack would too.
