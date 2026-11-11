@@ -137,6 +137,7 @@ def main(args):
         num_draft_tokens = args.num_draft_tokens, dynamic_draft_tokens = args.dynamic_draft,
         draft_confidence = args.draft_confidence, sparse_draft_head = args.sparse_draft_head,
         hybrid_draft_tokens = args.hybrid_draft_tokens,
+        **({} if args.chunk is None else dict(max_chunk_size = args.chunk)),
     )
     fmt = prompt_formats[args.mode]("User", "Assistant")
     system_prompt = fmt.default_system_prompt(False)
@@ -335,6 +336,92 @@ def main(args):
     ids_all = tokenizer.encode(corpus(), add_bos = False)[0]
     print(f"CORPUS {ids_all.shape[0]} tokens", flush = True)
 
+    def timed_prefill(ids, label):
+        """One prefill job over a 1-D id tensor on a possibly cached prefix; returns (new tokens, seconds, cached depth)"""
+        pre = smi(args.smi_index)
+        job = Job(input_ids = ids.unsqueeze(0), max_new_tokens = 1, stop_conditions = [], sampler = ArgmaxSampler())
+        generator.enqueue(job)
+        last = {}
+        while generator.num_remaining_jobs():
+            for r in generator.iterate():
+                if r.get("eos"):
+                    last = r
+        post = smi(args.smi_index)
+        cached = last.get("cached_tokens", 0)
+        new_ctx = ids.shape[0] - cached
+        t = last.get("time_prefill", 1e-6) or 1e-6
+        print(f"INCR {label}: {new_ctx} new at depth {cached} in {t:.2f} s = {new_ctx / t:.1f} t/s | P100 {pre} -> {post}", flush = True)
+        return new_ctx, t, cached
+
+    def report_prof(prof, label):
+        """Per-device GPU kernel time of a profiled window, grouped into attention / indexer / rest"""
+        import re
+        tot = {}
+        for e in prof.events():
+            if e.device_type != torch.autograd.DeviceType.CUDA:
+                continue
+            t = getattr(e, "self_device_time_total", None)
+            if t is None:
+                t = getattr(e, "self_cuda_time_total", 0)
+            d = tot.setdefault(e.device_index, {})
+            d[e.name] = d.get(e.name, 0.0) + t
+        pat = re.compile(r"attn|attention|qsa|dsa|indexer|sdpa|flash|softmax|combine|rope", re.I)
+        for dev in sorted(tot):
+            allt = sum(tot[dev].values())
+            att = sum(v for k, v in tot[dev].items() if pat.search(k))
+            print(f"PROF {label} cuda:{dev}: kernels {allt / 1000:.1f} ms, attention-ish {att / 1000:.1f} ms ({100 * att / max(allt, 1):.1f} %)", flush = True)
+            for k, v in sorted(tot[dev].items(), key = lambda kv: -kv[1])[:14]:
+                print(f"PROF {label} cuda:{dev}   {v / 1000:8.2f} ms  {k[:110]}", flush = True)
+        tab = prof.key_averages().table(sort_by = "self_cpu_time_total", row_limit = 26)
+        for ln in tab.splitlines():
+            print(f"PROFCPU {label} {ln[:200]}", flush = True)
+
+    def incr_bench():
+        """Prefix of `depth` tokens cached, then increments of different sizes with novel text (novel n-gram rows).
+        Depths are run from the deepest to the shallowest so the shallow prefix is already cached; depth 0 = cold prompt."""
+        total = ids_all.shape[0]
+        ptr = total // 2
+        res = []
+        sizes = list(args.incr_sizes)
+        order = sizes + sizes[::-1]
+        for D in sorted(args.incr_depths, reverse = True):
+            assert D % 256 == 0, "depth must be a multiple of the page size"
+            base = ids_all[:D]
+            if D:
+                timed_prefill(base, f"depth{D} base (single shot over {D} tokens)")
+            if D and args.incr_profile:
+                extra = ids_all[ptr:ptr + 2048]
+                ptr += 2048
+                with torch.profiler.profile(activities = [torch.profiler.ProfilerActivity.CPU,
+                                                          torch.profiler.ProfilerActivity.CUDA]) as prof:
+                    timed_prefill(torch.cat([base, extra]), f"depth{D} PROFILED inc2048")
+                report_prof(prof, f"depth{D}")
+            chunk_list = list(args.incr_chunks) if args.incr_chunks else [None]
+            for r in range(args.incr_reps):
+                # ABBA over the chunk sizes inside one load: the generator reads max_chunk_size on every step
+                for ch in (chunk_list if r % 2 == 0 else chunk_list[::-1]):
+                    if ch is not None:
+                        generator.max_chunk_size = ch
+                        generator.shared_chunk_size = ch
+                    for inc in order:
+                        assert ptr + inc < total, "corpus too short for the increments"
+                        extra = ids_all[ptr:ptr + inc]
+                        ptr += inc
+                        new, t, cached = timed_prefill(torch.cat([base, extra]), f"depth{D} chunk{ch} inc{inc}")
+                        res.append(dict(depth = D, chunk = ch, inc = inc, new = new, cached = cached, seconds = t, t_s = new / t))
+        print("INCR SUMMARY (median seconds and t/s per depth and size)", flush = True)
+        import statistics
+        for D in sorted(args.incr_depths):
+            for ch in (list(args.incr_chunks) if args.incr_chunks else [None]):
+                for inc in sizes:
+                    xs = [x for x in res if x["depth"] == D and x["inc"] == inc and x.get("chunk") == ch]
+                    if xs:
+                        print(f"  depth {D:6d} chunk {str(ch):>5s} inc {inc:5d}: {statistics.median(x['seconds'] for x in xs):6.2f} s  "
+                              f"{statistics.median(x['t_s'] for x in xs):6.1f} t/s  (n={len(xs)})", flush = True)
+        if args.json:
+            json.dump(res, open(args.json, "w"), indent = 1)
+
+
     if args.run == "prefill" or args.run == "both":
         need = max(args.lengths) + 4096 * (len(args.lengths) * args.repeat + 2)
         assert ids_all.shape[0] >= need // 4, f"corpus too short: {ids_all.shape[0]} tokens"
@@ -344,6 +431,9 @@ def main(args):
     prefill_run(256, 0)
     if args.hooks:
         print_hooks("warmup")
+    if args.incr_depths is not None:
+        incr_bench()
+        return
 
     if args.run == "decode" or args.run == "both":
         if args.profile_decode:
@@ -482,6 +572,16 @@ if __name__ == "__main__":
                                "(identity gate for the copy-path change)")
     parser.add_argument("-trace", "--trace", type = str, default = None,
                         help = "export the torch.profiler window as a chrome trace to <prefix>.<kind>.json")
+    parser.add_argument("-incr_depths", "--incr_depths", type = int, nargs = "+", default = None,
+                        help = "increment bench: cached prefix depths (multiples of 256; 0 = cold prompt)")
+    parser.add_argument("-incr_sizes", "--incr_sizes", type = int, nargs = "+", default = [256, 1024, 2048, 2400, 4096])
+    parser.add_argument("-incr_reps", "--incr_reps", type = int, default = 2)
+    parser.add_argument("-incr_chunks", "--incr_chunks", type = int, nargs = "+", default = None,
+                        help = "increment bench: ABBA over these max_chunk_size values inside one load")
+    parser.add_argument("-chunk", "--chunk", type = int, default = None,
+                        help = "Generator max_chunk_size (prompt ingestion chunk, default 2048)")
+    parser.add_argument("-incr_profile", "--incr_profile", action = "store_true",
+                        help = "profile one 2048-token increment per depth, per-device attention share")
     parser.add_argument("-profile_decode", "--profile_decode", action = "store_true")
     parser.add_argument("-profile_prefill", "--profile_prefill", action = "store_true")
     parser.add_argument("-profile_from", "--profile_from", type = int, default = 60)

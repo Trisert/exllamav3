@@ -1448,3 +1448,26 @@ retry hits the prefix cache). The P100 was at 100 % utilisation with `sw_thermal
 thermal throttling against a software cliff near 65536. Flash-Next showed no such collapse to 119k.
 
 Decision (user, Nov 11): continue with Flash-Next. Harness (fixtures C / Rust / long, runners, checkers) lives in the job directory, not in the repo.
+
+### Flash-Next prefill at depth: where the time goes (Nov 11, measured; `util/bench_flash.py -incr_depths ... -incr_profile -incr_chunks`)
+
+Config `-gs 4.0,15.8 -cs 131072 -cq 4 -mcs 288 -mtp -ndt 3 -sdh 16384`, repo-code corpus (2.47 M tokens, novel text for every increment), P100 at 79 C and
+900-1330 MHz (sw thermal slowdown) during every run except the first minutes.
+
+- **Log-mined model** (159 Tabby requests of the agentic sessions, 2-119k depth): seconds = 1.8 s per request + 5.56 ms per new token + 14 us per cached token per
+  2048-chunk. At depth 0 that is 180 t/s, a 2048-token chunk at 100k costs 12.7 s (161 t/s, -11 %).
+- **In-process increments on a cached prefix** (median of 4): 2048 new tokens 172 / 146 / 144 t/s at depth 0 / 8k / 82k, 2400 new 158 / 148 / 151, 4096 new 179 / 174 / 166,
+  1024 new 130 / 119 / 126, 256 new 107 / 94 / 94. A single-shot prefill of 82k tokens: 204 / 189 / 187 t/s (three runs, starting at 1328 MHz and ending throttled).
+  Tabby serves the same shapes at the same speed, so the server adds nothing.
+- **Request shape**: with a recurrent cache the prefill loop cuts a chunk at the last full page and ingests the partial page as a forward of its own (`_next_chunk_end`), so
+  2400 new tokens are three forwards (2048 + 256 + ~95) and pay the per-layer fixed cost three times: 2048 new tokens (one chunk) 172 t/s against 158 t/s at 2400.
+- **Per-device kernel time of one 2304-token chunk** (torch profiler; cuda:0 = RTX 2060, cuda:1 = P100): depth 8k: P100 8.1 s, 2060 1.1 s, wall 12.8-14.0 s; depth 82k: P100 9.1 s,
+  2060 1.3 s, wall 15.5-15.7 s. Neither device is busy for 28-34 % of the wall. P100 top kernels: MoE `exl3_moe_kernel<1,128,2,16,true,false>` 2.25 s, `hfma2::gemm_kernel` ~2 s,
+  `_qsa_sparse_split_kernel` 0.96 s (+0.26 s on the 2060, the same at 8k and 82k), `_dsa_indexer_kernel` 0.50 s at 82k (+0.15 s on the 2060, ~0 at 8k), GDN chunk kernels ~0.4 s.
+  Attention plus indexer is ~17 % of P100 kernel time; the depth-dependent part is only the indexer (+0.65 s per chunk at 82k).
+- **Host side** (CPU op table of the same chunk): 92 % of the 12-13 s of CPU time is `cudaMemcpyAsync` blocking (~4800 calls: the per-layer syncs and streamed copies), identical at 8k and
+  82k; nothing on the host grows with depth.
+- **Chunk size 4096 against 2048** (same load, ABBA, n = 4): 2400 new tokens 14.73 vs 15.28 s (depth 0) and 14.65 vs 15.90 s (8k), 4096 new equal, 1024 new +-5 %. No VRAM failure at 4096.
+  Within the thermal noise (a 2400-token request ranges 13.2-17.7 s with the P100 between 898 and 1328 MHz): not conclusive.
+
+Levers left, each estimated below 10 % of the prefill: the CPU-tail waits (~1.1-1.7 s per chunk), the QSA sparse kernel (~1.2 s fixed per chunk), the extra small forwards per request, chunk size 4096.
