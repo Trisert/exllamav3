@@ -177,6 +177,9 @@ class MoeCpuTuning:
 
         # --- debug / kill switches ---
         self.stream_debug = bool(os.environ.get("EXL3_MOE_STREAM_DEBUG"))
+        # Debug: CUDA events around the stream-side flag wait of every collected CPU job, i.e. how long the compute
+        # stream sits blocked on the CPU worker (summed per device by wait_prof_report)
+        self.wait_prof = bool(os.environ.get("EXL3_MOE_WAIT_PROF"))
         self.cpu_prof = bool(os.environ.get("EXL3_MOE_CPU_PROF"))
         self.memops = os.environ.get("EXL3_MOE_MEMOPS", "1") != "0"
 
@@ -1619,7 +1622,17 @@ class MoeCpuHost:
     def _collect_one(self, job, out, rtmp, h):
         seq, slot_idx, a, b, n = job
         slot = self.slots[slot_idx]
-        ext.exl3_moe_flag_wait(slot["done"], seq, self.gpu_base_ptr + 128)
+        if TUNING.wait_prof:
+            ev0 = torch.cuda.Event(enable_timing = True)
+            ev1 = torch.cuda.Event(enable_timing = True)
+            ev0.record()
+            ext.exl3_moe_flag_wait(slot["done"], seq, self.gpu_base_ptr + 128)
+            ev1.record()
+            if not hasattr(self, "_wait_ev"):
+                self._wait_ev = []
+            self._wait_ev.append((torch.cuda.current_device(), ev0, ev1))
+        else:
+            ext.exl3_moe_flag_wait(slot["done"], seq, self.gpu_base_ptr + 128)
         if rtmp is None:
             self._copy(out[a:b], slot["out"][:n], 1)
         else:
@@ -1628,6 +1641,21 @@ class MoeCpuHost:
         # Publish consumption AFTER the readback on this same stream: the slot's next tenant
         # (possibly issuing from another device) gates on this
         ext.exl3_moe_flag_write(slot["consumed"], seq)
+
+    def wait_prof_report(self):
+        """EXL3_MOE_WAIT_PROF: synchronize, return {device: (calls, total ms, max ms)} of the stream-side waits on the CPU
+        worker since the last call, and clear"""
+        evs = getattr(self, "_wait_ev", None)
+        if not evs:
+            return {}
+        res = {}
+        for dev, e0, e1 in evs:
+            e1.synchronize()
+            ms = e0.elapsed_time(e1)
+            n, tot, mx = res.get(dev, (0, 0.0, 0.0))
+            res[dev] = (n + 1, tot + ms, max(mx, ms))
+        self._wait_ev = []
+        return res
 
     def _collect_compute(self, jobs, out, rtmp, h):
         """Wait for each still-pending job and read its output back; the padded width is

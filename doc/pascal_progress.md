@@ -1412,3 +1412,39 @@ Within-arm spread is +-0.15 s, well below the differences. The gain is linear (~
 matches the ~5 s exposed first gather of the Nov 10 trace. With the coverage table above: a 0.5 GB pack (~46 % on code) is worth about
 -2.2 s, 1 GB (~54 %) about -2.6 s, 2 GB (~60 %) about -3.0 s of a cold 4096-token prefill. Page-cache hits stand in for hot-pack hits
 (both are memory reads); the pack adds an index lookup and a copy per unique row, not measured. Valid for a cold page cache only.
+
+### Agentic A/B, Flash-Next vs Qwen3.8-27B through Pi + TabbyAPI (Nov 11, one run each, thinking off)
+
+Setup: TabbyAPI main with the fork (its minimum compute capability patched to 6.0), Pi 1.5.2 as the agent (custom provider in `models.json`),
+sampling 0.7 / 0.8 / 20, presence penalty 1.5. Flash-Next `-gs 4.0,15.0 -mcs 256`, cache Q4, MTP ndt 3; 27B 4.00bpw, cache Q8 (Q4 in the
+first Python run), MTP ndt 3. Four tasks per language (fix three bugs, implement a documented function, rename a function across files,
+read-only questions), checked by the project tests and by file hashes.
+
+| suite | Flash-Next | 27B | wall (Flash-Next / 27B) |
+|---|---|---|---|
+| Python | 4/4 | 4/4 | 591 s / 500 s (Q8; 549 s with Q4) |
+| C | 4/4 | 4/4 | 774 s / 1036 s |
+| Rust | 4/4 | 4/4 | 497 s / 798 s |
+
+Decode ~29 t/s against ~15 t/s, prefill 110-133 t/s against 70-100 t/s (short contexts, 2-14k). The two models are indistinguishable on
+these tasks; the first Python t1 "failure" of both was a checker bug (it ran the whole suite, including tests of the not yet implemented
+function).
+
+**Long context (119k).** Synthetic package of 45 modules (105.8 k tokens with the model tokenizer), every module carries the same eight
+constants with different values. Pi reads every file with the read tool, answers ten "value of X in the Y module" questions without
+reopening anything (needles at 2 to 95 % depth), then adds a currency across three distant files. Pi compaction off, context 131072.
+
+| | Flash-Next (`-gs 4.0,15.8 -mcs 288 -cs 131072`, Q4) | 27B (Q8, 131072) |
+|---|---|---|
+| peak prompt | 119 025 tokens | 72 585 (stopped, invalid) |
+| needles | 10 / 10 | not reached |
+| edit task | tests pass, tests untouched | not reached |
+| wall | 1013 s | stopped after 3144 s |
+| prefill | 142 t/s average (129-147 at 73-85k) | ~64 t/s up to 65k |
+| decode | 27.4 t/s above 60k, 32.6 below 30k | 10-15 t/s |
+
+The 27B session was healthy up to 65k tokens, then every read of ~2.4 k new tokens stalled for ~8 minutes (Pi times out and retries, the
+retry hits the prefix cache). The P100 was at 100 % utilisation with `sw_thermal_slowdown` active (405-974 MHz at 79 C). Not separated:
+thermal throttling against a software cliff near 65536. Flash-Next showed no such collapse to 119k.
+
+Decision (user, Nov 11): continue with Flash-Next. Harness (fixtures C / Rust / long, runners, checkers) lives in the job directory, not in the repo.

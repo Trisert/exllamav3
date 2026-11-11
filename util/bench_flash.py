@@ -251,6 +251,14 @@ def main(args):
                  smi = f"{pre} -> {post}", async_dma = async_dma)
         rec.add(d)
         d["warm"] = warm
+        if os.environ.get("EXL3_MOE_WAIT_PROF"):
+            tot = {}
+            for host in (getattr(config, "moe_cpu_hosts", None) or {}).values():
+                for dev, v in host.wait_prof_report().items():
+                    a = tot.get(dev, (0, 0.0, 0.0))
+                    tot[dev] = (a[0] + v[0], a[1] + v[1], max(a[2], v[2]))
+            print("WAITPROF " + " | ".join(f"cuda:{k} {v[0]} waits, {v[1]/1000:.2f} s total, max {v[2]:.1f} ms"
+                                           for k, v in sorted(tot.items())), flush = True)
         print(f"PREFILL {n} tok: {new_ctx} uncached at {d['t_s']:.1f} t/s ({t:.2f} s) | "
               f"async_dma={async_dma} | P100 {pre} -> {post}{winfo}", flush = True)
 
