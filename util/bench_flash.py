@@ -189,8 +189,48 @@ def main(args):
               + f" | prefill {new_ctx} tok at {d['prefill_t_s']:.0f} t/s | P100 {pre} -> {post}", flush = True)
         return d
 
-    def prefill_run(n, offset):
+    def ngram_module():
+        from exllamav3.modules.ngram_embedding import NGramEmbedding
+        found = []
+        def walk(mod):
+            if isinstance(mod, NGramEmbedding):
+                found.append(mod)
+            for sub in getattr(mod, "modules", []) or []:
+                walk(sub)
+        walk(model)
+        return found[0]
+
+    def prewarm(ids, frac, seed):
+        """Evict the n-gram table from the page cache, then read `frac` of the prompt's unique rows (a random subset)
+        so they are warm. Emulates a hot-row cache that covers `frac` of a cold prompt's rows"""
+        ple = ngram_module()
+        handle = ple.table.stores[0]
+        fd = os.open(handle.filename, os.O_RDONLY)
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+        if frac <= 0:
+            return 0, 0
+        hist = torch.cat([torch.full((ple.context_len,), ple.eos_token_id, dtype = torch.long), ids[0].cpu().long()]).unsqueeze(0)
+        uids = torch.unique(ple.compute_ngram_ids(hist, ids.shape[1]).reshape(-1))
+        g = torch.Generator().manual_seed(seed)
+        keep = uids[torch.rand(uids.numel(), generator = g) < frac]
+        t = time.time()
+        handle.read_rows(keep)
+        return uids.numel(), keep.numel(), time.time() - t
+
+    def prefill_run(n, offset, first_token = None, warm = None):
         ids = ids_all[offset:offset + n].unsqueeze(0)
+        winfo = ""
+        if first_token is not None:
+            # distinct first token: no prefix-cache hit, the n-gram rows of the rest are the same
+            ids = ids.clone()
+            ids[0, 0] = first_token
+        if warm is not None:
+            w = prewarm(ids, warm, seed = 1234)
+            winfo = f" | warm {warm:.2f}: " + (f"{w[1]}/{w[0]} rows in {w[2]:.1f}s" if len(w) > 2 else "evicted")
+            print(f"WARM {winfo}", flush = True)
         try:
             from exllamav3.model.moe_cpu_host import TUNING as _T
             async_dma = int(_T.async_dma)
@@ -210,8 +250,9 @@ def main(args):
         d = dict(kind = "prefill", n = n, new_ctx = new_ctx, t_s = new_ctx / t, seconds = t,
                  smi = f"{pre} -> {post}", async_dma = async_dma)
         rec.add(d)
+        d["warm"] = warm
         print(f"PREFILL {n} tok: {new_ctx} uncached at {d['t_s']:.1f} t/s ({t:.2f} s) | "
-              f"async_dma={async_dma} | P100 {pre} -> {post}", flush = True)
+              f"async_dma={async_dma} | P100 {pre} -> {post}{winfo}", flush = True)
 
     def text_check(n, offset):
         """Greedy continuation of a cold n-token chunk, printed as an md5: A/B runs that must be
@@ -336,8 +377,14 @@ def main(args):
         if abba:
             from exllamav3.model.moe_cpu_host import TUNING as _T
         abba_mt = [int(c) for c in args.abba_mtile.split(",")] if args.abba_mtile else None
+        warm_ab = [float(c) for c in args.warm_ab.split(",")] if args.warm_ab else None
         for n in args.lengths:
             for r in range(args.repeat):
+                if warm_ab:
+                    w = warm_ab[(k - 1) % len(warm_ab)]
+                    prefill_run(n, 3 * stride + 7, first_token = 5000 + k, warm = w)
+                    k += 1
+                    continue
                 # Within-load A/B of the streamed-copy path: same process, same expert placement,
                 # so only the copy mechanism differs between adjacent runs; the alternation
                 # pattern spreads thermal drift over both modes
@@ -408,6 +455,10 @@ if __name__ == "__main__":
                         help = "torch.profiler record_shapes (aten op input shapes, e.g. the fallback GEMM shapes)")
     parser.add_argument("-check_text_mtile", "--check_text_mtile", type = str, default = None,
                         help = "comma-separated 0/1: one text check per round, flipping mtile_ok")
+    parser.add_argument("-warm_ab", "--warm_ab", type = str, default = None,
+                        help = "comma-separated fractions, one per prefill run: same prompt (distinct first token), "
+                               "n-gram table evicted from the page cache, then this fraction of the prompt's unique "
+                               "rows pre-read (emulates a hot-row cache covering that share)")
     parser.add_argument("-abba_mtile", "--abba_mtile", type = str, default = None,
                         help = "comma-separated 0/1, one per prefill run: toggle BlockSparseMLP.mtile_ok "
                                "(wide row tiles in the resident fused tier) inside one load")

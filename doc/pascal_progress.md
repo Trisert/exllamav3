@@ -1396,3 +1396,19 @@ effect shrinks once the kernel page cache is warm (later turns), and the corpus 
 prose and JSON, which covers worse). The rows are copied byte for byte, so outputs stay bit-identical. Building the pack needs
 one sequential scan of the 19.8 GB file (~100 s at 197 MiB/s; the hash-scattered rows cannot be fetched by random reads).
 The model dir already sits on the Kingston, so the pack would too.
+
+**Emulation of the hot-row cache (Nov 11, measured; `util/bench_flash.py -warm_ab`).** One load, the same cold 4096-token prompt in every run
+(first token replaced by a distinct id so the prefix cache never hits; the rows of the rest are identical), the n-gram table evicted from
+the kernel page cache (`posix_fadvise DONTNEED`) before each run, then a random fraction of the prompt's 38.9 k unique rows pre-read
+(0 / 46 / 100 %). ABBA order, 13 runs (the first of them is the 0 % arm and is kept), P100 52-75 C at 1328 MHz, `-gs 4.0,15.0 -cs 24576 -cq 4 -mcs 256`:
+
+| rows warm | wall (4 or 5 runs) | t/s | vs cold |
+| ---: | ---: | ---: | ---: |
+| 0 % | 19.59 s (19.37 / 19.59 / 19.64 / 19.76) | 209.1 | |
+| 46 % | 17.43 s (17.19 / 17.35 / 17.45 / 17.56 / 17.60) | 235.0 | -2.16 s (-11 %) |
+| 100 % | 14.61 s (14.51 / 14.50 / 14.70 / 14.72) | 280.5 | -4.98 s (-25 %) |
+
+Within-arm spread is +-0.15 s, well below the differences. The gain is linear (~0.5 s per 10 % of rows warm) and the 100 % arm
+matches the ~5 s exposed first gather of the Nov 10 trace. With the coverage table above: a 0.5 GB pack (~46 % on code) is worth about
+-2.2 s, 1 GB (~54 %) about -2.6 s, 2 GB (~60 %) about -3.0 s of a cold 4096-token prefill. Page-cache hits stand in for hot-pack hits
+(both are memory reads); the pack adds an index lookup and a copy per unique row, not measured. Valid for a cold page cache only.
