@@ -1486,3 +1486,15 @@ resident (RAM available with the model loaded: ~9.6 GB; `ngram_ram` needs 19.8 G
 does not do the pack's job. The pack on/off ABBA `packab2` was confounded (the two arms of one text always ran off-then-on, so the second found the rows in the page cache,
 -7 % not usable); `packab3` (alternating order, table evicted before every job) was stopped on request before finishing. Upper bounds measured with evicted-vs-pre-read rows:
 -12 % (50 % of the rows warm) and -22 % (all warm) at 2400 new tokens, a fully cold table, not a session gain.
+
+### exl3 vs GGUF for Qwen3.8-27B, and llama.cpp on P100 + RTX 2060 (Nov 11) — closed, decision: continue with Flash-Next (QNF)
+
+Pi agent suites (py/c/rs, 4 tasks each), same harness. exl3 27B 4.00bpw, cache Q8: py 4/4 500 s, c 4/4 1036 s, rs 4/4 798 s. llama.cpp (build 12302) GGUF UD-Q4_K_M, KV q8_0,
+embedded MTP + `-md` MTP gguf, n-max 3, `-ts 27,73`: py 3/4 748 s, c 3/4 1325 s, rs 4/4 1188 s (t2 failed in py and c; cause not established; P100 at 79 °C / 544 MHz during these, so timings are thermally inflated).
+GGUF decode ~9-10 t/s (21 on one short task), draft acceptance 65-85 %, prefill 60-65 t/s steady.
+
+`llama-bench` pp512 / tg128 (27B UD-Q4_K_M, `-ts 27/73`, KV q8_0, full clocks, P100 52-60 °C, one pass each): mainline 12302 172.8 / 13.16; v0.6.0 + 43 shinbunbun P100 patches
+167.7 / 16.19 (+23 % decode, -3 % prefill, older base so partly confounded); fork `pascal-opt` flags off 173.2 / 12.99. `GGML_CUDA_GRAPHS_PASCAL=1` (CUDA graphs on cc 6.0): 13.06 / 12.72 vs 12.93 off = no effect.
+nsys decode: >90 % `mul_mat_vec_q` (Q5_K, IQ4_XS, Q4_K, Q6_K); the patches cut IQ4_XS -42 %, Q4_K -34 %, Q5_K -24 %, Q6_K -4 %; P100 ~66 % busy, ~270 GB/s effective of 732.
+Tensor-parallel (`-sm tensor`) and the P100 mmvq kernel work were NOT started. Kinetic (Veloresearch) read: not usable here (CUDA from sm_75, single GPU, no EXL3).
+Decision: QNF for long-context agentic work (119k needle 10/10); the 27B was not compared with QNF on the same suites. llama.cpp experiments removed from disk (models-gguf, p100 worktree/patch clone, builds).
