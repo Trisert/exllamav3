@@ -39,6 +39,9 @@ INLINE_MAX_ROWS = 16        # rows of a table that gets read-ahead hints, below 
 # Before a large gather from disk, ask the kernel for every row at once (posix_fadvise WILLNEED) so the device
 # sees a deep queue of random reads instead of the gather threads' few outstanding ones (slow SATA/USB SSDs)
 FADVISE_ALL = os.environ.get("EXL3_NGRAM_FADVISE_ALL", "0") != "0"
+# Dense hot-row pack (util/ngram_pack.py): the most frequent rows of the n-gram table, copied byte for byte, kept in RAM and
+# served by a sorted-id lookup before any disk read. Off unless the path is given; a table whose row geometry differs ignores it
+HOT_PACK = os.environ.get("EXL3_NGRAM_PACK", "")
 ADVISE_THREAD = os.environ.get("EXL3_ROW_ADVISE_THREAD", "1") != "0"   # issue advise() read-ahead hints on a worker
 
 
@@ -95,6 +98,7 @@ class RowTable:
         self.prefetch_stats = {"hit": 0, "miss": 0, "retired": 0}
         self.stage_stats = {"gathers": 0, "rows": 0, "t": 0.0, "resolve_t": 0.0}
         self.hinted = False         # the owner announces rows ahead of their lookup (advise())
+        self.hot = None             # hot-row pack: namespace(uids, rows, n, hit, miss), see load_hot_pack()
 
     @staticmethod
     def find(stc, key: str, suffix: str) -> RowTable | None:
@@ -176,6 +180,23 @@ class RowTable:
             self._set_stores([slab])
         if lock:
             self._locked = lock_host_tensors(self.stores, f"Locking {self.key} in RAM")
+        if HOT_PACK and self.on_disk:
+            self.load_hot_pack(HOT_PACK)
+
+    def load_hot_pack(self, path: str) -> bool:
+        """Load a hot-row pack (util/ngram_pack.py). Ignored, with a note, when it was built for another row geometry"""
+        from types import SimpleNamespace
+        if not os.path.exists(path):
+            print(f" !! hot-row pack {path} not found, ignored")
+            return False
+        pk = torch.load(path, map_location = "cpu", weights_only = False)
+        uids, rows = pk["uids"], pk["rows"]
+        if rows.shape[1] != self.row_words or rows.dtype != self.row_dtype or int(uids.max()) >= self.num_rows:
+            return False        # another table (e.g. an embedding table): not ours
+        assert bool((uids[1:] > uids[:-1]).all()), "hot-row pack ids must be strictly increasing"
+        self.hot = SimpleNamespace(uids = uids.contiguous(), rows = rows.contiguous(), n = uids.numel(), hit = 0, miss = 0)
+        print(f" -- hot-row pack for {self.key[-30:]}: {self.hot.n} rows, {rows.numel() * rows.element_size() / 1e9:.2f} GB")
+        return True
 
     def close(self):
         self.drain_prefetch()       # queued workers still read the table; first
@@ -331,6 +352,27 @@ class RowTable:
         return None
 
     def _gather_rows(self, uids: torch.Tensor, out: torch.Tensor):
+        """Gather rows into the pinned staging buffer. Rows held by the hot-row pack are copied from RAM, the others go
+        through the disk path (_gather_rows_disk)."""
+        hot = self.hot
+        if hot is None or not self.on_disk or uids.numel() == 0:
+            return self._gather_rows_disk(uids, out)
+        pos = torch.searchsorted(hot.uids, uids).clamp_(max = hot.n - 1)
+        hit = hot.uids[pos] == uids
+        n_hit = int(hit.sum())
+        hot.hit += n_hit
+        hot.miss += uids.numel() - n_hit
+        if n_hit == 0:
+            return self._gather_rows_disk(uids, out)
+        hi = hit.nonzero().squeeze(1)
+        out[hi] = hot.rows[pos[hi]]
+        if n_hit < uids.numel():
+            mi = (~hit).nonzero().squeeze(1)
+            tmp = torch.empty((mi.numel(), out.shape[1]), dtype = out.dtype)
+            self._gather_rows_disk(uids[mi].contiguous(), tmp)
+            out[mi] = tmp
+
+    def _gather_rows_disk(self, uids: torch.Tensor, out: torch.Tensor):
         """Gather rows into the pinned staging buffer, routing shard segments (contiguous in
         the list, which must be sorted for a table of several shards) to their tensor/handle."""
         stores = self.stores

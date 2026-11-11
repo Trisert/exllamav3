@@ -351,6 +351,19 @@ def main(args):
         new_ctx = ids.shape[0] - cached
         t = last.get("time_prefill", 1e-6) or 1e-6
         print(f"INCR {label}: {new_ctx} new at depth {cached} in {t:.2f} s = {new_ctx / t:.1f} t/s | P100 {pre} -> {post}", flush = True)
+        if args.incr_fincore:
+            r_mb, t_mb = table_resident()
+            print(f"RESIDENT {label}: n-gram table {r_mb:.0f} of {t_mb:.0f} MB in the page cache", flush = True)
+        if os.environ.get("EXL3_MOE_WAIT_PROF"):
+            tot = {}
+            for host in (getattr(config, "moe_cpu_hosts", None) or {}).values():
+                for dev, v in host.wait_prof_report().items():
+                    a = tot.get(dev, (0, 0.0, 0.0))
+                    tot[dev] = (a[0] + v[0], a[1] + v[1], max(a[2], v[2]))
+            print("WAITPROF " + " | ".join(f"cuda:{k} {v[0]} waits, {v[1] / 1000:.2f} s total, max {v[2]:.1f} ms"
+                                           for k, v in sorted(tot.items())), flush = True)
+        if args.hooks:
+            print_hooks(label)
         return new_ctx, t, cached
 
     def report_prof(prof, label):
@@ -376,12 +389,22 @@ def main(args):
         for ln in tab.splitlines():
             print(f"PROFCPU {label} {ln[:200]}", flush = True)
 
+    def table_resident():
+        """(resident MB, total MB) of the n-gram table file in the kernel page cache (fincore)"""
+        try:
+            fn = ngram_module().table.stores[0].filename
+            out = subprocess.run(["fincore", "-b", "-n", "-o", "RES,SIZE", fn], capture_output = True, text = True).stdout.split()
+            return int(out[0]) / 2 ** 20, int(out[1]) / 2 ** 20
+        except Exception:
+            return -1.0, -1.0
+
     def incr_bench():
         """Prefix of `depth` tokens cached, then increments of different sizes with novel text (novel n-gram rows).
         Depths are run from the deepest to the shallowest so the shallow prefix is already cached; depth 0 = cold prompt."""
         total = ids_all.shape[0]
         ptr = total // 2
         res = []
+        pack_obj = ngram_module().table.hot
         sizes = list(args.incr_sizes)
         order = sizes + sizes[::-1]
         for D in sorted(args.incr_depths, reverse = True):
@@ -396,28 +419,74 @@ def main(args):
                                                           torch.profiler.ProfilerActivity.CUDA]) as prof:
                     timed_prefill(torch.cat([base, extra]), f"depth{D} PROFILED inc2048")
                 report_prof(prof, f"depth{D}")
+            if args.incr_pack_toggle:
+                # the rows the pack serves must be byte-identical to the rows on disk
+                ple = ngram_module()
+                tab = ple.table
+                ids = torch.cat([base[-8:], ids_all[ptr:ptr + 4096]]).unsqueeze(0)
+                hist = torch.cat([torch.full((ple.context_len,), ple.eos_token_id, dtype = torch.long), ids[0].cpu().long()]).unsqueeze(0)
+                u = torch.unique(ple.compute_ngram_ids(hist, ids.shape[1]).reshape(-1))
+                a = torch.empty((u.numel(), tab.row_words), dtype = tab.row_dtype)
+                b = torch.empty_like(a)
+                tab.hot = None
+                tab._gather_rows(u, a)
+                tab.hot = pack_obj
+                h0, m0 = pack_obj.hit, pack_obj.miss
+                tab._gather_rows(u, b)
+                print(f"PACKCHECK {u.numel()} rows, pack served {pack_obj.hit - h0}, disk {pack_obj.miss - m0}, "
+                      f"identical: {torch.equal(a, b)}", flush = True)
+                assert torch.equal(a, b)
+            if args.incr_evict0:
+                prewarm(torch.cat([base[-8:], ids_all[ptr:ptr + 8]]).unsqueeze(0), 0.0, seed = 0)
+                print("EVICT table dropped from the page cache once", flush = True)
             chunk_list = list(args.incr_chunks) if args.incr_chunks else [None]
+            warm_list = list(args.incr_warm) if args.incr_warm else [None]
+            if args.incr_pack_toggle:
+                assert pack_obj is not None, "set EXL3_NGRAM_PACK to a pack built by util/ngram_pack.py"
+                pack_list = [0, 1]
+            else:
+                pack_list = [None]
+            arms = [(ch, w, pk) for ch in chunk_list for w in warm_list for pk in pack_list]
+            j = 0
+            n_inc = 0
             for r in range(args.incr_reps):
-                # ABBA over the chunk sizes inside one load: the generator reads max_chunk_size on every step
-                for ch in (chunk_list if r % 2 == 0 else chunk_list[::-1]):
-                    if ch is not None:
-                        generator.max_chunk_size = ch
-                        generator.shared_chunk_size = ch
-                    for inc in order:
-                        assert ptr + inc < total, "corpus too short for the increments"
-                        extra = ids_all[ptr:ptr + inc]
-                        ptr += inc
-                        new, t, cached = timed_prefill(torch.cat([base, extra]), f"depth{D} chunk{ch} inc{inc}")
-                        res.append(dict(depth = D, chunk = ch, inc = inc, new = new, cached = cached, seconds = t, t_s = new / t))
+                for inc in order:
+                    assert ptr + inc < total, "corpus too short for the increments"
+                    extra0 = ids_all[ptr:ptr + inc]
+                    ptr += inc
+                    # every arm ingests the same text; a distinct first token keeps the prefix cache from matching
+                    # between arms while the n-gram rows of all the other positions stay the same
+                    n_inc += 1
+                    for ch, w, pk in (arms if n_inc % 2 == 0 else arms[::-1]):
+                        j += 1
+                        extra = extra0.clone()
+                        extra[0] = 5000 + j
+                        if ch is not None:
+                            generator.max_chunk_size = ch
+                            generator.shared_chunk_size = ch
+                        winfo = ""
+                        if pk is not None:
+                            ngram_module().table.hot = pack_obj if pk else None
+                            winfo += f" pack{pk}"
+                        if w is not None:
+                            wres = prewarm(torch.cat([base[-8:], extra]).unsqueeze(0), w, seed = 1234 + j)
+                            winfo += f" warm{w:g}" + (f"({wres[1]}/{wres[0]} rows in {wres[2]:.1f}s)" if len(wres) > 2 else "(evicted)")
+                        new, t, cached = timed_prefill(torch.cat([base, extra]), f"depth{D} chunk{ch} inc{inc}{winfo}")
+                        res.append(dict(depth = D, chunk = ch, warm = w, pack = pk, inc = inc, new = new, cached = cached,
+                                        seconds = t, t_s = new / t))
         print("INCR SUMMARY (median seconds and t/s per depth and size)", flush = True)
         import statistics
         for D in sorted(args.incr_depths):
             for ch in (list(args.incr_chunks) if args.incr_chunks else [None]):
-                for inc in sizes:
-                    xs = [x for x in res if x["depth"] == D and x["inc"] == inc and x.get("chunk") == ch]
-                    if xs:
-                        print(f"  depth {D:6d} chunk {str(ch):>5s} inc {inc:5d}: {statistics.median(x['seconds'] for x in xs):6.2f} s  "
-                              f"{statistics.median(x['t_s'] for x in xs):6.1f} t/s  (n={len(xs)})", flush = True)
+                for w in (list(args.incr_warm) if args.incr_warm else [None]):
+                  for pk in ([0, 1] if args.incr_pack_toggle else [None]):
+                    for inc in sizes:
+                        xs = [x for x in res if x["depth"] == D and x["inc"] == inc and x.get("chunk") == ch
+                              and x.get("warm") == w and x.get("pack") == pk]
+                        if xs:
+                            print(f"  depth {D:6d} chunk {str(ch):>5s} warm {str(w):>4s} pack {str(pk):>4s} inc {inc:5d}: "
+                                  f"{statistics.median(x['seconds'] for x in xs):6.2f} s  "
+                                  f"{statistics.median(x['t_s'] for x in xs):6.1f} t/s  (n={len(xs)})", flush = True)
         if args.json:
             json.dump(res, open(args.json, "w"), indent = 1)
 
@@ -576,6 +645,14 @@ if __name__ == "__main__":
                         help = "increment bench: cached prefix depths (multiples of 256; 0 = cold prompt)")
     parser.add_argument("-incr_sizes", "--incr_sizes", type = int, nargs = "+", default = [256, 1024, 2048, 2400, 4096])
     parser.add_argument("-incr_reps", "--incr_reps", type = int, default = 2)
+    parser.add_argument("-incr_pack_toggle", "--incr_pack_toggle", action = "store_true",
+                        help = "increment bench: ABBA with the hot-row pack on and off (EXL3_NGRAM_PACK set)")
+    parser.add_argument("-incr_fincore", "--incr_fincore", action = "store_true",
+                        help = "print the resident fraction of the n-gram table after every job")
+    parser.add_argument("-incr_evict0", "--incr_evict0", action = "store_true",
+                        help = "evict the n-gram table from the page cache once before the increments")
+    parser.add_argument("-incr_warm", "--incr_warm", type = float, nargs = "+", default = None,
+                        help = "increment bench: ABBA over n-gram row warm fractions (table evicted from the page cache first, then this fraction of the increment's unique rows pre-read)")
     parser.add_argument("-incr_chunks", "--incr_chunks", type = int, nargs = "+", default = None,
                         help = "increment bench: ABBA over these max_chunk_size values inside one load")
     parser.add_argument("-chunk", "--chunk", type = int, default = None,

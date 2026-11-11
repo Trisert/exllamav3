@@ -1471,3 +1471,18 @@ Config `-gs 4.0,15.8 -cs 131072 -cq 4 -mcs 288 -mtp -ndt 3 -sdh 16384`, repo-cod
   Within the thermal noise (a 2400-token request ranges 13.2-17.7 s with the P100 between 898 and 1328 MHz): not conclusive.
 
 Levers left, each estimated below 10 % of the prefill: the CPU-tail waits (~1.1-1.7 s per chunk), the QSA sparse kernel (~1.2 s fixed per chunk), the extra small forwards per request, chunk size 4096.
+
+### Flash-Next n-gram hot-row pack: implemented, exactness measured, timing gain NOT yet established (Nov 11)
+
+`util/ngram_pack.py` builds a dense pack of the most frequent rows (document frequency over 4096-token training prompts, one sequential scan of the
+19.8 GB table, ~2 min; 8 M rows = 0.5 GB, trained on 12 M tokens of `.venv/site-packages`). `RowTable.load_hot_pack` (`EXL3_NGRAM_PACK=<file>`, off by default) keeps the
+pack in RAM and `_gather_rows` serves the rows it holds by a sorted-id `searchsorted` before any disk read; the misses take the unchanged disk path.
+
+Measured: on a held-out 4096-token increment of the repo corpus (33 463 unique rows) the pack served 11 536 rows (34.5 %, below the 43-46 % of the offline curve: the
+increment mixes code and prose) and the gathered rows were identical to the disk rows (`PACKCHECK ... identical: True`, `bench_flash.py -incr_pack_toggle`).
+
+Not established: the timing gain. A 30-job natural-warming run (table evicted once, 30 novel 2400-token increments, no eviction between jobs) kept only 100-600 MB of the table
+resident (RAM available with the model loaded: ~9.6 GB; `ngram_ram` needs 19.8 GB, excluded) and the job time stayed at 16.3 s (cold 16.9 s, fully warm 12.7 s): the page cache
+does not do the pack's job. The pack on/off ABBA `packab2` was confounded (the two arms of one text always ran off-then-on, so the second found the rows in the page cache,
+-7 % not usable); `packab3` (alternating order, table evicted before every job) was stopped on request before finishing. Upper bounds measured with evicted-vs-pre-read rows:
+-12 % (50 % of the rows warm) and -22 % (all warm) at 2400 new tokens, a fully cold table, not a session gain.
