@@ -54,6 +54,22 @@ Pair-trellis LUT (Q = 12, Lloyd-trained): K=2 11.61-11.69, K=3 17.38-17.42, K=4 
   share x realistic saving in tokens/s. Cheap falsification of the model: K=4 wide, k=2560, n=7168 (balanced) should
   take ~40 us against 56 us measured at n=8192.
 
+## End-to-end share of the GEMV in the QNF decode window (from existing logs, `tmp/w1/{d0,d65k,g0d0}.log`)
+
+Share of the profiled decode window wall time (60 iterate() calls; per-kernel lists are the top ~15 only, so the
+GEMV figures are lower bounds):
+
+| window | wall / iterate | P100 kernel time | P100 GEMV | P100 MoE coop | 2060 kernel time |
+|---|---:|---:|---:|---:|---:|
+| depth 0 | 119 ms | 43 % | >= 10.7 % | 16 % | 11 % |
+| depth 65k | 153 ms | 55 % | >= 12.0 % | 22 % | 13 % |
+| depth 0, graphs off | 115 ms | 44 % | >= 11.0 % | 18 % | 11 % |
+
+K = 5 dominates (`exl3_gemv_kernel<5,...>` 677 of 764 ms at depth 0, K = 4 86 ms). Consequence: even the full
+modelled +25 % on the GEMV (time -20 %) is about **2 % of an iterate**, and a 2x faster GEMV at most ~5-6 %. The P100
+is idle 45-57 % of the window and the 2060 ~88 %: the idle time and the MoE coop kernels (16-22 %) are bigger levers
+than the dense GEMV. R1 is therefore **not worth it for QNF decode** on these numbers.
+
 ## Recommendation
 
 GO: R1 (split-k + wide heuristic), stop if the 8-shape suite (K = 4, 5; m = 1, 2) does not show >= 15 %
