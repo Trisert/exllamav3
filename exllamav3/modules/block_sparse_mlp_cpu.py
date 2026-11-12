@@ -481,6 +481,11 @@ class BlockSparseMLP_CPU:
         split_layers = int(os.environ.get("EXL3_MOE_CPU_SPLIT_LAYERS", 0))
         if split_layers and getattr(ip, "moe_cpu_split_assigned", 0) >= split_layers:
             split_k = 0
+        # EXL3_MOE_CPU_SPLIT_MTP=0: the MTP head's experts stay whole on the GPU (every draft pass then avoids
+        # the CPU worker round trip); the main model's layers keep their split
+        if split_k and os.environ.get("EXL3_MOE_CPU_SPLIT_MTP", "1") == "0" and \
+                getattr(ip, "moe_cpu_component", "text") == "mtp":
+            split_k = 0
         # The split keeps at least one expert on the GPU (the module's GPU slice cannot be
         # empty); a larger request is capped rather than silently turning the split off
         if split_k >= self.num_experts > 1:
