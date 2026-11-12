@@ -55,7 +55,8 @@ def row_views(ids: torch.Tensor, lengths: list[int] | None) -> list[torch.Tensor
 
 
 def apply_mult_noise(x: torch.Tensor, eps: float, gen: torch.Generator) -> torch.Tensor:
-    n = torch.randn(x.shape, generator = gen, device = x.device, dtype = torch.float)
+    # x may live on another device than the generator (embeddings prefer the CPU on some architectures)
+    n = torch.randn(x.shape, generator = gen, device = gen.device, dtype = torch.float).to(x.device)
     return (x.float() * (1.0 + eps * n)).to(x.dtype)
 
 
