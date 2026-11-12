@@ -16,10 +16,19 @@
 
 // Smallest K whose two cost arrays (2 * (65536 >> K) halves) are kept in shared memory; below it they live in
 // the caller's global scratch. RDNA's 64 KB of LDS per workgroup cannot hold K = 2's arrays next to the tile
+// CUDA below sm_80 (Pascal 48 KB, Turing 64 KB of shared memory per block) cannot hold K = 2's arrays (64 KB) next
+// to the input tile either (cudaFuncSetAttribute then fails with "invalid argument"), so there K = 2 keeps them in
+// global scratch too. QT_SHARED_COSTS_MIN_K_FOR(major) is the host-side mirror of the device-side rule.
 #if defined(USE_ROCM)
     #define QT_SHARED_COSTS_MIN_K 3
+    #define QT_SHARED_COSTS_MIN_K_FOR(major) 3
 #else
-    #define QT_SHARED_COSTS_MIN_K 2
+    #define QT_SHARED_COSTS_MIN_K_FOR(major) ((major) < 8 ? 3 : 2)
+    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+        #define QT_SHARED_COSTS_MIN_K 3
+    #else
+        #define QT_SHARED_COSTS_MIN_K 2
+    #endif
 #endif
 
 // Shared-memory layout of the dense kernels. CUDA keeps the measured layout (input tile staged in

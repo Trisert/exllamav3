@@ -127,7 +127,7 @@ static QtLaunch qt_launch(int device, int K, int cb, int L)
     const auto* props = at::cuda::getDeviceProperties(device);
     const bool optimized = quantize_tiles_use_optimized(props->major, props->minor, K, cb);
     const int edges = 65536 >> K;
-    const int cost_arrays = optimized ? (K == 1 ? 1 : 2) : (K >= QT_SHARED_COSTS_MIN_K ? 2 : 0);
+    const int cost_arrays = optimized ? (K == 1 ? 1 : 2) : (K >= QT_SHARED_COSTS_MIN_K_FOR(props->major) ? 2 : 0);
     // The costs-only layout (ROCm) drops the staged input tile and the argmin scratch from the
     // optimized kernels' shared memory; the generic kernels keep their layout
     const int shmem = cost_arrays * edges * sizeof(half)
