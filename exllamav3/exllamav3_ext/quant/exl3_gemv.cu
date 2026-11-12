@@ -72,6 +72,12 @@ static bool exl3_gemv_sm75(int device)
     return is_sm75[device] == 2;
 }
 
+static bool exl3_gemv_env_sm75_wide()
+{
+    static const bool on = [] { const char* env = std::getenv("EXL3_GEMV_SM75_WIDE"); return !env || atoi(env) != 0; }();
+    return on;
+}
+
 static bool exl3_gemv_env_sm75_k5()
 {
     static const bool on = [] { const char* env = std::getenv("EXL3_GEMV_SM75_K5"); return !env || atoi(env) != 0; }();
@@ -114,7 +120,13 @@ static int exl3_gemv_cfg(int cc, bool sm75, int size_m, int size_k, int size_n, 
 
     // Turing (measured on the RTX 2060, mul1, K = 2..4, m = 1..8, k / n from 512 to 17408): the GEMV beats the
     // autotuned tile kernel at every measured shape, 1.04-1.70x (K = 4: 1.18-1.68x). mcg / 3INST are unmeasured
-    if (sm75 && K <= 4 && cb == 2) return size_n <= 8192 ? 0 : 1;
+    // The wide config wins where n > k and n >= 4096 (2048 x 7680: 43 -> 36 us, 2048 x 6144: 37 -> 34 us); narrow
+    // stays ahead for n <= k and small n. EXL3_GEMV_SM75_WIDE=0 restores narrow for every n <= 8192
+    if (sm75 && K <= 4 && cb == 2)
+    {
+        if (size_m == 1 && size_n > size_k && size_n >= 4096 && exl3_gemv_env_sm75_wide()) return 1;
+        return size_n <= 8192 ? 0 : 1;
+    }
 
     // The narrow config wins (up to ~30%) whenever its grid fits in a single co-resident wave;
     // in the 1..2-wave zone the trailing partial wave costs more than the kernel gains unless
