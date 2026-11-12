@@ -72,6 +72,12 @@ static bool exl3_gemv_sm75(int device)
     return is_sm75[device] == 2;
 }
 
+static bool exl3_gemv_env_sm75_k5()
+{
+    static const bool on = [] { const char* env = std::getenv("EXL3_GEMV_SM75_K5"); return !env || atoi(env) != 0; }();
+    return on;
+}
+
 // -1: not eligible, 0: narrow config, 1: wide config. narrow_coresident = number of narrow-config
 // blocks that fit on the device at once (its grid is one block per 32 output columns)
 static int exl3_gemv_cfg(int cc, bool sm75, int size_m, int size_k, int size_n, int K, int cb, int mode, int narrow_coresident)
@@ -85,7 +91,16 @@ static int exl3_gemv_cfg(int cc, bool sm75, int size_m, int size_k, int size_n, 
     if (mode == 2) return size_n <= 8192 ? 0 : 1;
     if (mode == 3) return 0;   // testing: force narrow config
     if (mode == 4) return 1;   // testing: force wide config
-    if (K >= 5 && cc != CC_PASCAL) return -1;   // staged 5 / 6 bpw GEMV is only measured on Pascal
+    // Staged 5 / 6 bpw GEMV: measured on Pascal (b1e28727) and on the RTX 2060 (mul1, m = 1, k / n 2048..7680 and the
+    // 2048 x 128000 lm_head). The gate was "only measured on Pascal", not a Turing defect: forced on the 2060 the
+    // GEMV matches the tile GEMM within fp16 error. Wide beats narrow from n = 2048 up (6 bpw lm_head 672 vs 973 us,
+    // tile GEMM 1038 us), narrow wins at n = 512 (9 vs 14 us). mcg / 3INST stay on Pascal
+    if (K >= 5 && cc != CC_PASCAL)
+    {
+        // m = 1 only (measured); EXL3_GEMV_SM75_K5=0 restores the tile GEMM for K >= 5 (A/B testing)
+        if (!(sm75 && cb == 2 && size_m == 1 && exl3_gemv_env_sm75_k5())) return -1;
+        return size_n >= 2048 ? 1 : 0;
+    }
 
     // Pascal has no tensor cores and no cp.async: the block-pipelined tile kernel is 10-50x off the memory roofline
     // there at m <= 8 (a 5120 x 17408 K=3 projection takes ~4.8 ms against ~0.3 ms through this kernel), so every
