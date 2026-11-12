@@ -510,8 +510,23 @@ def main(args):
             context = [(args.prompts[0], "")]
             text = fmt.format(system_prompt, context, False)
             ids = tokenizer.encode(text, add_bos = fmt.add_bos(), encode_special_tokens = True)
-            job = Job(input_ids = ids, max_new_tokens = args.profile_from + 70, stop_conditions = [], sampler = sampler)
+            if args.decode_depth:
+                # decode at depth: a corpus prefix of decode_depth tokens (cached by a timed prefill) precedes the prompt
+                D = args.decode_depth
+                timed_prefill(ids_all[:D], f"decode depth {D} prefix")
+                ids = torch.cat([ids_all[:D].unsqueeze(0), ids], dim = -1)
+            job = Job(input_ids = ids, max_new_tokens = 4 * (args.profile_from + 70), stop_conditions = [], sampler = sampler)
             generator.enqueue(job)
+            def _wait_collect():
+                tot = {}
+                for host in (getattr(config, "moe_cpu_hosts", None) or {}).values():
+                    for dev, v in host.wait_prof_report().items():
+                        a = tot.get(dev, (0, 0.0, 0.0))
+                        tot[dev] = (a[0] + v[0], a[1] + v[1], max(a[2], v[2]))
+                return tot
+            step_i = 0
+            t_win0 = None
+            smi_pre = smi(args.smi_index)
             with torch.profiler.profile(
                 activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
                 schedule = torch.profiler.schedule(wait = 0, warmup = args.profile_from, active = 60, repeat = 1),
@@ -520,6 +535,20 @@ def main(args):
                     for r in generator.iterate():
                         pass
                     prof.step()
+                    step_i += 1
+                    if step_i == args.profile_from:
+                        _wait_collect()                     # clear: the window starts here
+                        t_win0 = time.perf_counter()
+                    if step_i == args.profile_from + 60:
+                        t_win1 = time.perf_counter()
+            if t_win0 is not None and step_i >= args.profile_from + 60:
+                win = 1000 * (t_win1 - t_win0) / 60
+                print(f"WINDOW decode: {win:.1f} ms per iterate() over 60 profiled iterations | smi {smi_pre} -> {smi(args.smi_index)}", flush = True)
+                w = _wait_collect()
+                if w:
+                    print("WAITPROF window (per iterate, ms) " + " | ".join(
+                        f"cuda:{k} {v[1] / 60:.2f} ms ({v[0] / 60:.1f} waits, max {v[2]:.1f})" for k, v in sorted(w.items())), flush = True)
+                report_prof(prof, "decode-window")
             print("PROFILE decode top CUDA:")
             print(prof.key_averages().table(sort_by = "self_cuda_time_total", row_limit = 45))
             print("PROFILE decode top CPU:")
@@ -662,6 +691,8 @@ if __name__ == "__main__":
     parser.add_argument("-profile_decode", "--profile_decode", action = "store_true")
     parser.add_argument("-profile_prefill", "--profile_prefill", action = "store_true")
     parser.add_argument("-profile_from", "--profile_from", type = int, default = 60)
+    parser.add_argument("-decode_depth", "--decode_depth", type = int, default = 0,
+                        help = "with -profile_decode: cache this many corpus tokens first, so the profiled decode runs at that depth")
     parser.add_argument("-hooks", "--hooks", action = "store_true")
     parser.add_argument("-check_text", "--check_text", type = int, default = 0,
                         help = "after the prefill runs, prefill this many tokens of a cold chunk and print the "
