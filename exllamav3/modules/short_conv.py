@@ -1,11 +1,13 @@
 from __future__ import annotations
 from typing_extensions import override
+import os
 import torch
 import torch.nn.functional as F
 
 from ..cache import Cache
 from ..model.config import Config
 from ..util.tensor import get_for_device, to2
+from ..ext import exllamav3_ext as ext
 from . import Module, Linear
 from ..cache.recurrent import (
     mp_cache_recurrent_stash,
@@ -15,6 +17,9 @@ from ..cache.recurrent import (
     host_copy,
 )
 
+
+# EXL3_SHORT_CONV_FUSED=0 keeps the PyTorch glue path (A/B testing)
+_FUSED = os.environ.get("EXL3_SHORT_CONV_FUSED", "1") != "0"
 
 
 def mp_cache_short_conv_recurrent_rewind(local_context: dict, cache_id: int, slot: int, last_history, num_tokens):
@@ -256,6 +261,7 @@ class ShortConv(Module):
 
         self.conv1d_weight = None
         self.conv1d_bias = None
+        self.conv1d_weight_flat = None
         self.key_conv1d_weight = f"{key}.{key_conv}.weight"
         self.key_conv1d_bias = f"{key}.{key_conv}.bias"
 
@@ -290,6 +296,7 @@ class ShortConv(Module):
     def unload(self):
         self.conv1d_weight = None
         self.conv1d_bias = None
+        self.conv1d_weight_flat = None
         for cl in self.recurrent_layers:
             cl.free()
         super().unload()
@@ -355,6 +362,37 @@ class ShortConv(Module):
             save_history = False
 
         bc_x = self.in_proj.forward(x, params)
+
+        # Decode / short verify windows: one fused kernel for the whole glue chain (see _causal_conv1d)
+        if (
+            conv_state is not None
+            and _FUSED
+            and seqlen <= 16
+            and bc_x.is_cuda
+            and bc_x.dtype == torch.half
+            and bc_x.is_contiguous()
+            and conv_state.dtype == torch.half
+            and conv_state.is_contiguous()
+            and self.conv1d_weight.dtype in (torch.bfloat16, torch.half)
+            and self.conv_kernel_size <= 8
+            and (
+                self.conv1d_bias is None
+                or (self.conv1d_bias.dtype == self.conv1d_weight.dtype == torch.bfloat16)   # fp16 + bias is not bit-identical
+            )
+            and recurrent_slots.shape[0] == bsz
+        ):
+            if self.conv1d_weight_flat is None:
+                self.conv1d_weight_flat = self.conv1d_weight.squeeze(1).contiguous()
+            y = torch.empty((bsz, seqlen, self.hidden_size), dtype = torch.half, device = bc_x.device)
+            ext.short_conv_decode(
+                bc_x, conv_state, recurrent_slots, self.conv1d_weight_flat, self.conv1d_bias, y,
+                bsz, seqlen, bool(save_history),
+            )
+            y = self.out_proj.forward(y, params)
+            if self.tp_reduce:
+                params["backend"].all_reduce(y)
+            return to2(y, out_dtype, self.out_dtype)
+
         b, c, x = bc_x.chunk(3, dim = -1)
         conv_input = (b * x).transpose(1, 2).contiguous()
         conv_out = self._causal_conv1d(conv_input, conv_state, recurrent_slots, save_history, params)
