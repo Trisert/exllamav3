@@ -1528,3 +1528,12 @@ Prefill of the 65k prefix: 202 t/s (323.7 s) from a P100 at 65 C. Harness: `-dec
 `-ndt` fits a line of ~44 ms fixed + ~13.5 ms per draft token per iterate.
 `EXL3_MOE_CPU_SPLIT_MTP=0` (new, off by default, `block_sparse_mlp_cpu.cpu_maybe_split_load`) keeps the MTP head's experts whole on the GPU: it fails in the decode warmup with a raw `cudaErrorMemoryAllocation` at `-gs` 4.0,15.8 / 3.6,15.8 / 4.4,15.8 (`-gs 4.0,15.3` does not load: "Insufficient VRAM"),
 and runs with `EXL3_GRAPHS=0` (3 DECODE lines: 42.3 / 43.7 / 39.3 t/s, accept 81.7 %, 3.47 tok/step; baseline graphs on 43.0 / 38.5 / 37.2). Not distinguishable from the baseline (confounded: graphs off, P100 started 49 C vs 58-67 C); the mirrored A B B A with graphs off in both arms was not run. The graph capture of a whole-GPU 512-expert MoE layer is the failing step (hypothesis, allocation site not looked at).
+
+### P100 decode GEMV: why bandwidth is not the limit (Nov 12; `util/bench_gemv_decode.py` copy pointed at this worktree, `cuobjdump -arch sm_60 -sass`)
+
+Microbench on the P100 (`CUDA_VISIBLE_DEVICES=1`, 1328 MHz, 51 C), 2560x10240, m = 1 (us per call / GB/s over trellis bytes): K=2 65.8 / 100; K=3 72.0 / 137; K=4 61.7 / 212; K=5 77.7 / 211; K=6 74.9 / 262; K=8 289.5 / 91 (K=8 takes a slower path).
+Time is flat from K=2 to K=6 while the bytes triple: the kernel is decode-bound, not bandwidth-bound; peak 262 GB/s = 36 % of 732. A fixed ~20 us per call shows on small shapes (2560x2048: 27-33 us). m=4 costs +30-50 %.
+Static SASS mix of the instance used for K=4, m=1 (`exl3_gemv_kernel<4,false,2,0,1,false,false>`, 95 registers, 1388 static instructions, not weighted by the loop trip count): XMAD 25.9 % (Pascal has no native 32-bit multiply: the mul1 codebook's 32-bit multiply costs several 16-bit XMADs),
+FADD 8.1 %, SHFL 4.8 %, VABSDIFF4 4.6 % (byte sum), HFMA2 4.6 %, HADD2 3.0 %. Ratio XMAD : HFMA2 ~ 5.6 : 1, so HFMA2 is not where the time goes; the integer multiply of the codebook decode is a candidate. m=4 instance: 124 registers.
+Tooling: Nsight Compute 2025.2 supports Volta and later only (no gp100); `nvprof` collects nothing here even as root; the NVreg profiling restriction (ERR_NVGPUCTRPERM) blocks counters for non-root; py-spy is blocked by ptrace_scope=1. Static SASS and torch.profiler kernel names work without privileges.
+Not tested: a Pascal-friendly codebook (16-bit multiplier = one XMAD) would need a new codebook in every kernel and a re-quantization of the model.
