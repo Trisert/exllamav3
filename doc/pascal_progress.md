@@ -1498,3 +1498,12 @@ GGUF decode ~9-10 t/s (21 on one short task), draft acceptance 65-85 %, prefill 
 nsys decode: >90 % `mul_mat_vec_q` (Q5_K, IQ4_XS, Q4_K, Q6_K); the patches cut IQ4_XS -42 %, Q4_K -34 %, Q5_K -24 %, Q6_K -4 %; P100 ~66 % busy, ~270 GB/s effective of 732.
 Tensor-parallel (`-sm tensor`) and the P100 mmvq kernel work were NOT started. Kinetic (Veloresearch) read: not usable here (CUDA from sm_75, single GPU, no EXL3).
 Decision: QNF for long-context agentic work (119k needle 10/10); the 27B was not compared with QNF on the same suites. llama.cpp experiments removed from disk (models-gguf, p100 worktree/patch clone, builds).
+
+### QNF decode: expert-placement hit rate and where the host main thread spends its time (Nov 12)
+
+Agentic py suite (4/4 pass, 564 s, decode 28-33 t/s, draft accept 62-68 %), `-mcs 288 --cpu-moe-pinned-arena` (promote-on-miss) from a cool start, `EXL3_MOE_CPU_SWAP_DEBUG=1`, 25 windows of 128 steps (3200 steps):
+hit rate mean 77.7 % (min 57.0 %, max 90.4 %; first third 74.2 %, last two thirds ~79 %), ~1458 routed experts/step of which ~329 on the CPU, ~5.9 promotions/step, hook 3.66 ms/step (3.32-3.75).
+Main-thread stack sample (in-process sampler, 10 ms, 20 s window, one 1500-token decode at 27.8 t/s, draft 904/1797 accepted; py-spy was refused by ptrace_scope=1 even on a child process, so a `sys._current_frames()` sampler was used via `sitecustomize`):
+62.8 % of MainThread samples sit in `torch.cuda.synchronize` called from `generator.py:iterate_gen:2045` (host waiting for the GPUs: the ~95 % core in htop is mostly a CUDA sync spin-wait, not work); Python `forward` (kernel launches) 30.9 % inclusive;
+n-gram row gather (`row_table._gather_rows`) 9.2 %; MTP draft loop 6.7 %; hyperconnections 6.5 %; `_split_promote_step` / `cpu_split_submit` 3.9 %; `cpu_split_combine` 1.8 %.
+Conclusion: decode is GPU-bound (P100); the promote hook and the host-side imbalance do not limit it. The sampler sees only Python-level frames (a C loop that holds the GIL would be under-counted).
