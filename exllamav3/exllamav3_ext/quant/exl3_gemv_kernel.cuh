@@ -238,9 +238,9 @@ template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bo
 __global__ __launch_bounds__(CFG == 0 ? 512 : 256, HALF && CFG == 0 ? 2 : 1)
 void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 {
-    static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2) : (bits >= 2 && bits <= 6),
-                  "exl3_gemv_kernel supports 2..6 bpw, and 1.5, 2.5 and 3.5 bpw with mul1");
-    static_assert(bits < 5 || (SMEM_STAGE && !HALF), "5 and 6 bpw run through the staged tile words only");
+    static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2) : (bits >= 2 && bits <= 8),
+                  "exl3_gemv_kernel supports 2..8 bpw, and 1.5, 2.5 and 3.5 bpw with mul1");
+    static_assert(bits < 5 || (SMEM_STAGE && !HALF), "5..8 bpw run through the staged tile words only");
     constexpr int WK   = CFG == 0 ? 16 : 8;     // k-split (warps per block)
     constexpr int WNT  = CFG == 0 ? 2 : 4;      // adjacent n-tiles per warp
     constexpr int PF   = CFG == 0 ? 4 : 2;      // prefetch ring depth

@@ -83,7 +83,7 @@ static bool exl3_gemv_env_sm75_k5()
 static int exl3_gemv_cfg(int cc, bool sm75, int size_m, int size_k, int size_n, int K, int cb, int mode, int narrow_coresident)
 {
     if (mode == 0) return -1;
-    if (K < 2 || K > 6) return -1;
+    if (K < 2 || K > 8) return -1;
     if (K != 4 && cb == 0) return -1;
     if (size_m > EXL3_GEMV_MAX_M16) return -1;
     if (size_k % 128 || size_n % 128) return -1;
@@ -95,6 +95,8 @@ static int exl3_gemv_cfg(int cc, bool sm75, int size_m, int size_k, int size_n, 
     // 2048 x 128000 lm_head). The gate was "only measured on Pascal", not a Turing defect: forced on the 2060 the
     // GEMV matches the tile GEMM within fp16 error. Wide beats narrow from n = 2048 up (6 bpw lm_head 672 vs 973 us,
     // tile GEMM 1038 us), narrow wins at n = 512 (9 vs 14 us). mcg / 3INST stay on Pascal
+    // 7 / 8 bpw (same staged form) are enabled on sm_75 only, where they are measured
+    if (K >= 7 && !sm75) return -1;
     if (K >= 5 && cc != CC_PASCAL)
     {
         // m = 1 only (measured); EXL3_GEMV_SM75_K5=0 restores the tile GEMM for K >= 5 (A/B testing)
@@ -158,6 +160,7 @@ static void* exl3_gemv_select_kernel(int bits, int cb, bool c_fp32, int mmode, i
     SEL_GRID(3, 1, false) SEL_GRID(3, 2, false) SEL_GRID(3, 1, true) SEL_GRID(3, 2, true)
     SEL_GRID(5, 1, true) SEL_GRID(5, 2, true)
     SEL_GRID(6, 1, true) SEL_GRID(6, 2, true)
+    SEL_GRID(7, 2, true) SEL_GRID(8, 2, true)
     #undef SEL_GRID
     #undef SEL
     return nullptr;
@@ -189,7 +192,7 @@ bool exl3_gemv_try_launch
     }
     else
     {
-        if (K < 2 || K > 6) return false;
+        if (K < 2 || K > 8) return false;
         if (K != 4 && cb == 0) return false;
     }
     // m = 9..16 (MMODE 5) uses the second row group of the m16n8k16 fragments. Instantiated for the integer mul1

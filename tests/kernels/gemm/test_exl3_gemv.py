@@ -5,7 +5,7 @@ that Config.use_mgemm keys its fuse/unfuse decision on.
 
 exl3_gemv contract: C (..., n) = A (..., k) @ W for W = diag(suh) H W_hat H diag(svh) (the EXL3 linear), every
 leading dim of A flattened into m <= 8 rows, C fp16 or fp32; A is not modified, nothing outside C is written, and
-repeat launches are bit-identical. Eligible: k, n multiples of 128; K = 2..6 with mcg / mul1 (5 and 6 bpw run through staged tile words), K = 4 with 3INST,
+repeat launches are bit-identical. Eligible: k, n multiples of 128; K = 2..6 with mcg / mul1 and K = 7, 8 with mul1 (5..8 bpw run through staged tile words), K = 4 with 3INST,
 K = 1.5 / 2.5 / 3.5 with mul1; suh, A_had (scratch) and svh all given. Everything else is rejected with an error.
 Both kernel configurations are exercised (n <= 8192 narrow, n > 8192 wide), and m = 1 (MMODE 0) and 2..8.
 
@@ -52,6 +52,10 @@ CASES = [
     (6, "mcg", 1, 256, 8320, True),         # wide config
     (6, "mul1", 2, 512, 8448, False),       # wide config (MTP verify shape class of a 6 bpw lm_head)
     (6, "mul1", 5, 256, 768, False),
+    (7, "mul1", 1, 512, 1024, False),
+    (8, "mul1", 1, 512, 1024, False),
+    (8, "mul1", 3, 384, 640, True),
+    (8, "mul1", 2, 512, 8448, False),       # wide config
     (1.5, "mul1", 1, 1024, 1024, False),
     (2.5, "mul1", 4, 512, 768, True),
     (3.5, "mul1", 8, 256, 8320, False),     # wide config
@@ -142,7 +146,7 @@ def test_gemv_rejects_ineligible(device):
     else:
         cases = [
             ((9, 256, 256, 3, False, True), "not eligible"),        # m > 8
-            ((1, 256, 256, 7, False, True), "not eligible"),        # K = 7
+            ((1, 256, 256, 9, False, True), "not eligible"),        # K = 9
             ((1, 256, 256, 1, False, True), "not eligible"),        # K = 1
             ((1, 256, 256, 3, False, False), "not eligible"),       # 3INST below K = 4
             ((1, 272, 256, 3, False, True), "not eligible"),        # k % 128
