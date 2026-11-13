@@ -72,6 +72,19 @@ static bool exl3_gemv_sm75(int device)
     return is_sm75[device] == 2;
 }
 
+// Balanced split of the m = 1 GEMV (see exl3_gemv_kernel.cuh, BAL): EXL3_GEMV_BALANCE = 0 disables, 1 / unset = shape
+// heuristic, 2 = every eligible call (testing). Read once
+static int exl3_gemv_env_balance()
+{
+    static const int mode = [] { const char* env = std::getenv("EXL3_GEMV_BALANCE"); return env ? atoi(env) : 1; }();
+    return mode;
+}
+
+// Heuristic: every warp of the full wave needs at least this many cells (measured: below ~8 the partial-sum stage and
+// the prefetch fill outweigh the balance gain), and the unbalanced grid must fill less than this share of its rounds
+#define EXL3_GEMV_BAL_MIN_CELLS_PER_WARP 8
+#define EXL3_GEMV_BAL_UTIL_TENTHS 9
+
 static bool exl3_gemv_env_sm75_wide()
 {
     static const bool on = [] { const char* env = std::getenv("EXL3_GEMV_SM75_WIDE"); return !env || atoi(env) != 0; }();
@@ -273,6 +286,41 @@ bool exl3_gemv_try_launch
     int max_blocks = occupancy(kernel, block_dim) * num_sms;
     int grid = MIN(size_n / cols, max_blocks);
     if (grid < 1) return false;
+
+    // Balanced split (m = 1, mul1): the grid is the full co-resident wave and the (column group, k-slice) cells are
+    // spread evenly over its warps instead of one column group per block per round. Taken when the one-group-per-block
+    // path leaves the wave under-filled (rounds not full, or fewer groups than blocks) and every warp still gets enough
+    // cells to hide the extra partial-sum stage (measured on the RTX 2060 and the P100, see doc/pascal_bandwidth_research.md)
+    if (mmode == 0 && !half_k && cb == 2 && !(exl3_gemv_env_smem() == 1 && K < 5))
+    {
+        // The forced entry point (tests) takes the balanced split only when EXL3_GEMV_BALANCE = 2 asks for it explicitly
+        const int bal_mode = force ? (exl3_gemv_env_balance() == 2 ? 2 : 0) : exl3_gemv_env_balance();
+        if (bal_mode)
+        {
+            void* bal_kernel = exl3_gemv_select_kernel_bal(K, c_fp32, 1);
+            if (bal_kernel)
+            {
+                const int bal_blocks = occupancy(bal_kernel, 256) * num_sms;
+                const int G = size_n / 64, ks = size_k / 16;
+                const long long cells = (long long) G * ks;
+                const int tw = bal_blocks * 8;
+                if (bal_blocks > 0 && cells < EXL3_GEMV_BAL_MAX_CELLS && (bal_mode == 2 || cells / tw >= EXL3_GEMV_BAL_MIN_CELLS_PER_WARP))
+                {
+                    const int groups_old = size_n / cols;
+                    const int rounds_old = (groups_old + max_blocks - 1) / max_blocks;
+                    const bool underfilled = groups_old * 10 < rounds_old * max_blocks * EXL3_GEMV_BAL_UTIL_TENTHS;
+                    const exl3_gemv_ns::BalPlan plan = exl3_gemv_ns::bal_plan(G, ks, tw);
+                    const bool fits = (size_t) exl3_gemv_ns::bal_max_slots(plan) * size_n <= (size_t) EXL3_GEMV_WS_FLOATS;
+                    if ((underfilled || bal_mode == 2) && fits)
+                    {
+                        kernel = bal_kernel;
+                        block_dim = 256;
+                        grid = bal_blocks;
+                    }
+                }
+            }
+        }
+    }
 
     cuda_check(cudaLaunchCooperativeKernel
     (
