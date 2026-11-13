@@ -30,6 +30,9 @@ bool exl3_gemv_try_launch
 // Kernel instances for the half-integer bitrates (comp_units/exl3_gemv_half_inst.cu)
 void* exl3_gemv_select_kernel_half(int bits, bool c_fp32, int mmode, int cfg, bool smem);
 
+// Balanced-split (m = 1) kernel instances, mul1 2..8 bpw (comp_units/exl3_gemv_bal_inst.cu)
+void* exl3_gemv_select_kernel_bal(int bits, bool c_fp32, int cfg);
+
 // Direct entry point (testing): errors if the call is not hard-eligible
 void exl3_gemv
 (

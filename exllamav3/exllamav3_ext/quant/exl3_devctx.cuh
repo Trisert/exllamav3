@@ -21,6 +21,17 @@
     #define EXL3_GRID_BARRIER_INTS 2
 #endif
 
+// Balanced GEMV partial-sum workspace (fp32), at the end of the lock buffer. Overwritten before every read, no
+// initialization needed. Offset rounded up to 16 bytes
+#ifndef EXL3_GEMV_WS_FLOATS
+#define EXL3_GEMV_WS_FLOATS (4 * 1024 * 1024)
+#endif
+#if defined(USE_ROCM)
+    #define EXL3_GEMV_WS_OFFSET (((EXL3_GRID_BARRIER_OFFSET + EXL3_GRID_BARRIER_INTS) + 3) / 4 * 4)
+#else
+    #define EXL3_GEMV_WS_OFFSET (((MOE_SCHED_OFFSET + MOE_SCHED_INTS) + 3) / 4 * 4)
+#endif
+
 // Workspace size
 #define WORKSPACE_SIZE (16*1024*1024)
 
