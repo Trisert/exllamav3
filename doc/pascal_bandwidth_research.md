@@ -70,6 +70,21 @@ modelled +25 % on the GEMV (time -20 %) is about **2 % of an iterate**, and a 2x
 is idle 45-57 % of the window and the 2060 ~88 %: the idle time and the MoE coop kernels (16-22 %) are bigger levers
 than the dense GEMV. R1 is therefore **not worth it for QNF decode** on these numbers.
 
+## LFM3 (dense, batch 1): grid-balance falsification (Nov 13)
+
+For LFM3 the K=4 GEMVs are ~75-80 % of the token, so the QNF verdict above does not apply. Time of one GEMV call is
+fixed cost (~6 us) + rounds x per-round time; the number of column groups vs resident blocks decides the rounds.
+- **RTX 2060**, narrow cfg (32 columns/group, 60 resident blocks), k = 7680: n = 1536 (48 groups) 31.8 us,
+  n = 1920 (60 groups) **36.4 us**, n = 1984 (62 groups) **47.5 us**, n = 2048 (64) 49.2 us, n = 2112 (66) 48.4 us,
+  n = 3840 (120) 65.5 us. A step of ~11 us for 2 more groups.
+- **Tesla P100**, real kernel, k = 2048: n = 6144 (96 groups) 32.2 us, n = 7168 (112 groups on 112 blocks) **32.7 us**,
+  n = 7680 (120 groups) **45.6 us** (+39 % time for +7 % bytes), n = 8192 (128) 45.5 us; 7680x2048 56.7 us (139 GB/s),
+  2048x2048 22.5 us, 2048x512 13.6 us.
+- The first split-k prototype (experimental copy, 1 block/SM, 30 blocks) was slower than the baseline on the 2060
+  (50-58 us vs 43-50 us) and neutral with the wide config: a proper balanced split (units = column group x k chunk on
+  all resident blocks, fixed-order reduction) is still to be written. Expected: gate/up (7680 columns) on the P100
+  ~46 -> ~35 us per call (48 calls/token, ~0.5 ms of ~7.3 ms).
+
 ## Recommendation
 
 GO: R1 (split-k + wide heuristic), stop if the 8-shape suite (K = 4, 5; m = 1, 2) does not show >= 15 %
