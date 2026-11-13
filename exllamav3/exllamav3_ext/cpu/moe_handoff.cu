@@ -223,7 +223,34 @@ inline void flag_write_on(cudaStream_t stream, uintptr_t flag, int64_t value)
     moe_flag_write_kernel<<<1, 1, 0, stream>>>(reinterpret_cast<moe_flag_t*>(flag), static_cast<moe_flag_t>(value));
 }
 
-inline void flag_wait_on(cudaStream_t stream, uintptr_t flag, int64_t value, uintptr_t abort_flag)
+// EXL3_MOE_WAIT_TS=1: time the stream-side flag waits of the fused split path on the GPU itself, so it also works
+// inside CUDA graphs (no events, no allocation). A kernel before the wait stores %globaltimer, a kernel after it
+// adds the difference to a per-device counter; waits on one stream are serialised, so one scratch slot per kind
+// is enough. The span includes two tiny kernel launches (a few us), report calls * that as the floor.
+struct WaitTs { unsigned long long t0[2]; unsigned long long total_ns[2]; unsigned long long calls[2]; unsigned long long max_ns[2]; };
+__device__ WaitTs g_wait_ts;
+
+__device__ __forceinline__ unsigned long long wts_now()
+{
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+__global__ void wait_ts_begin_kernel(int kind) { g_wait_ts.t0[kind] = wts_now(); }
+__global__ void wait_ts_end_kernel(int kind)
+{
+    unsigned long long d = wts_now() - g_wait_ts.t0[kind];
+    g_wait_ts.total_ns[kind] += d;
+    g_wait_ts.calls[kind] += 1;
+    if (d > g_wait_ts.max_ns[kind]) g_wait_ts.max_ns[kind] = d;
+}
+inline bool wait_ts_on()
+{
+    static const bool on = getenv("EXL3_MOE_WAIT_TS") != nullptr;
+    return on;
+}
+
+inline void flag_wait_on_raw(cudaStream_t stream, uintptr_t flag, int64_t value, uintptr_t abort_flag)
 {
     MemOps& m = memops();
     if (m.resolved && g_memops_enabled.load(std::memory_order_relaxed)
@@ -238,6 +265,15 @@ inline void flag_wait_on(cudaStream_t stream, uintptr_t flag, int64_t value, uin
     }
     moe_flag_wait_kernel<<<1, 1, 0, stream>>>(
         reinterpret_cast<moe_flag_t*>(flag), static_cast<moe_flag_t>(value), reinterpret_cast<uint32_t*>(abort_flag));
+}
+
+// kind 0: wait on the CPU worker's done flag (collect), kind 1: wait on the previous tenant's consumed flag (issue)
+inline void flag_wait_on(cudaStream_t stream, uintptr_t flag, int64_t value, uintptr_t abort_flag, int kind = 0)
+{
+    if (!wait_ts_on()) { flag_wait_on_raw(stream, flag, value, abort_flag); return; }
+    wait_ts_begin_kernel<<<1, 1, 0, stream>>>(kind);
+    flag_wait_on_raw(stream, flag, value, abort_flag);
+    wait_ts_end_kernel<<<1, 1, 0, stream>>>(kind);
 }
 
 } // namespace
@@ -286,7 +322,7 @@ bool exl3_moe_split_issue_fused
 
     const at::cuda::OptionalCUDAGuard device_guard(y.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(y.get_device()).stream();
-    if (prev_seq) flag_wait_on(stream, consumed_flag, prev_seq, abort_flag);
+    if (prev_seq) flag_wait_on(stream, consumed_flag, prev_seq, abort_flag, 1);
     moe_split_issue(sel, map, hist, y, w, h_sel_ptr, h_x_ptr, h_w_ptr, dev_count, slot, hi, first_cpu);
     flag_write_on(stream, data_ready_flag, seq);
     return true;
@@ -312,6 +348,20 @@ void exl3_moe_split_collect_fused
     // Consumption is published AFTER the readback on this same stream: the slot's next tenant
     // (possibly issuing from another device) gates on it
     flag_write_on(stream, consumed_flag, seq);
+}
+
+// Returns [done_total_us, done_calls, done_max_us, consumed_total_us, consumed_calls, consumed_max_us] for the
+// device and clears them (EXL3_MOE_WAIT_TS)
+std::vector<double> exl3_moe_wait_ts_report(int64_t device)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(at::Device(at::kCUDA, (int) device));
+    cudaDeviceSynchronize();
+    WaitTs h;
+    cudaMemcpyFromSymbol(&h, g_wait_ts, sizeof(WaitTs));
+    WaitTs z = {};
+    cudaMemcpyToSymbol(g_wait_ts, &z, sizeof(WaitTs));
+    return { h.total_ns[0] / 1e3, (double) h.calls[0], h.max_ns[0] / 1e3,
+             h.total_ns[1] / 1e3, (double) h.calls[1], h.max_ns[1] / 1e3 };
 }
 
 // ---- child worker loop --------------------------------------------------------------------

@@ -109,6 +109,7 @@ struct MoeJob
 // only -- these ops are only ever issued from the process enqueueing the GPU work).
 void exl3_moe_flag_write(uintptr_t flag, int64_t value);
 void exl3_moe_flag_wait(uintptr_t flag, int64_t value, uintptr_t abort_flag);
+std::vector<double> exl3_moe_wait_ts_report(int64_t device);
 
 // Fused split-path handoff (see moe_handoff.cu): the job descriptor, the slot's consumed wait,
 // the issue kernel and the data_ready flag in one call; the done wait, the collect kernel and the
