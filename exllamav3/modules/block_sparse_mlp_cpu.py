@@ -606,6 +606,10 @@ class BlockSparseMLP_CPU:
             return None, self.cpu_host.submit_issue(
                 self.cpu_layer_idx, y, sel_cpu, routing_weights)
         sel_cpu = self._split_translate(selected_experts)
+        if self.cpu_host.defer_tail:
+            out, pending = self.cpu_host.submit_prefill(
+                self.cpu_layer_idx, y, sel_cpu, routing_weights, defer_tail = True)
+            return out, (("tail", pending) if pending is not None else None)
         return self.cpu_host.submit_prefill(
             self.cpu_layer_idx, y, sel_cpu, routing_weights), None
 
@@ -656,7 +660,10 @@ class BlockSparseMLP_CPU:
         exactly when it is ready). Fused handles add in place straight from the pinned slot
         (or skip the readback entirely for a job with no CPU-resident picks)."""
         if cpu_pending is not None:
-            if isinstance(cpu_pending, tuple) and cpu_pending[0] == "fused":
+            if isinstance(cpu_pending, tuple) and cpu_pending[0] == "tail":
+                # Deferred prefill tail: cpu_partial is the streamed output, the tail merges into it in place
+                self.cpu_host.collect_deferred_tail(cpu_pending[1])
+            elif isinstance(cpu_pending, tuple) and cpu_pending[0] == "fused":
                 f2 = final_hidden_states.view(-1, final_hidden_states.shape[-1])
                 if _split_prof:
                     _sprof_wrap("wait", self.cpu_layer_idx,
@@ -664,7 +671,8 @@ class BlockSparseMLP_CPU:
                 else:
                     self.cpu_host.submit_collect_fused(cpu_pending[1], f2)
                 return final_hidden_states
-            cpu_partial = self.cpu_host.submit_collect(cpu_pending)
+            else:
+                cpu_partial = self.cpu_host.submit_collect(cpu_pending)
         if cpu_partial is not None:
             # Whole-layer offload: the worker's output is the routed sum
             final_hidden_states = cpu_partial.view(shape) if final_hidden_states is None \

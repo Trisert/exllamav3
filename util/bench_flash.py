@@ -193,7 +193,7 @@ def main(args):
         ids = ids_all[offset:offset + n].unsqueeze(0)
         try:
             from exllamav3.model.moe_cpu_host import TUNING as _T
-            async_dma = int(_T.async_dma)
+            async_dma = int(getattr(_T, args.abba_attr))
         except Exception:
             async_dma = -1
         pre = smi(args.smi_index)
@@ -211,7 +211,7 @@ def main(args):
                  smi = f"{pre} -> {post}", async_dma = async_dma)
         rec.add(d)
         print(f"PREFILL {n} tok: {new_ctx} uncached at {d['t_s']:.1f} t/s ({t:.2f} s) | "
-              f"async_dma={async_dma} | P100 {pre} -> {post}", flush = True)
+              f"{args.abba_attr}={async_dma} | P100 {pre} -> {post}", flush = True)
 
     def text_check(n, offset):
         """Greedy continuation of a cold n-token chunk, printed as an md5: A/B runs that must be
@@ -238,8 +238,8 @@ def main(args):
         judged against it."""
         from exllamav3.model.moe_cpu_host import TUNING
         for i, on in enumerate(rounds):
-            TUNING.async_dma = bool(on)
-            print(f"TOGGLE round {i} async_dma={int(on)}", flush = True)
+            setattr(TUNING, args.abba_attr, bool(on))
+            print(f"TOGGLE round {i} {args.abba_attr}={int(on)}", flush = True)
             text_check(n, offset)
 
     def profile(kind, fn):
@@ -318,8 +318,8 @@ def main(args):
                 # so only the copy mechanism differs between adjacent runs; the alternation
                 # pattern spreads thermal drift over both modes
                 if abba:
-                    _T.async_dma = bool(abba[(k - 1) % len(abba)])
-                    print(f"ABBA run {k}: async_dma={int(_T.async_dma)}", flush = True)
+                    setattr(_T, args.abba_attr, bool(abba[(k - 1) % len(abba)]))
+                    print(f"ABBA run {k}: {args.abba_attr}={int(getattr(_T, args.abba_attr))}", flush = True)
                 if args.profile_prefill and k == 1:
                     with torch.profiler.profile(
                         activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
@@ -379,6 +379,9 @@ if __name__ == "__main__":
                         help = "comma-separated moe_cpu_host.TUNING.async_dma values, one per prefill run "
                                "(within-load A/B of the streamed copy path: same process, same placement, "
                                "no cross-load expert-placement confound)")
+    parser.add_argument("-abba_attr", "--abba_attr", type = str, default = "async_dma",
+                        help = "moe_cpu_host.TUNING attribute that -abba_async / -check_text_toggle flip "
+                               "(e.g. defer_tail)")
     parser.add_argument("-copy_sites", "--copy_sites", action = "store_true",
                         help = "print the Python call site of every distinct Tensor.copy_ pattern (first hit)")
     parser.add_argument("-check_text_toggle", "--check_text_toggle", type = str, default = None,

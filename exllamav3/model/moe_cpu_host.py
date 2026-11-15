@@ -139,6 +139,9 @@ class MoeCpuTuning:
         self.stream_t = int(os.environ.get("EXL3_MOE_STREAM_T", 8))
         self.stream_fused_t = int(os.environ.get("EXL3_MOE_STREAM_FUSED_T", 256))
         self.stream_min_rows = int(os.environ.get("EXL3_MOE_STREAM_MIN_ROWS", 32))
+        # EXL3_MOE_DEFER_TAIL=1: streamed prefill leaves the CPU tail's flag wait / readback / merge to
+        # cpu_split_combine, after the layer's resident-expert GPU work is queued (runtime-toggleable)
+        self.defer_tail = os.environ.get("EXL3_MOE_DEFER_TAIL", "0") != "0"
         self.batch_experts = max(1, min(
             int(os.environ.get("EXL3_MOE_STREAM_BATCH_EXPERTS", 24)), MOE_JOB_MAX_EXPERTS))
 
@@ -1945,7 +1948,11 @@ class MoeCpuHost:
         if msg[0] != "ok":
             raise RuntimeError(f"CPU MoE worker expert install failed: {msg[1] if len(msg) > 1 else msg}")
 
-    def submit_prefill(self, layer_idx, y, selected_experts, routing_weights):
+    @property
+    def defer_tail(self):
+        return TUNING.defer_tail
+
+    def submit_prefill(self, layer_idx, y, selected_experts, routing_weights, defer_tail = False):
         """
         Split the routed-expert workload by per-expert token count: hot experts (count >=
         stream_t) have their weights staged by the worker, DMA'd through the pinned ring to a
@@ -1954,12 +1961,18 @@ class MoeCpuHost:
         unmasked assignment. Tail jobs are issued before the streamed batches and collected
         after them, so the CPU works the tail while the GPU streams. Falls back to the plain CPU
         path when nothing qualifies.
+
+        defer_tail: return (out, pending) instead of out, leaving the tail's flag wait, readback and
+        merge to collect_deferred_tail (pending is None when there is no tail to collect). The caller
+        enqueues its other GPU work first, so the stream is not parked on the worker's done flag while
+        work that does not depend on the tail is still unqueued.
         """
         spec = self.specs[layer_idx]
         rows = y.shape[0]
         if (rows < self.stream_min_rows or spec.get("expert_bytes") is None
                 or spec["expert_bytes"] > self.wslot_size or layer_idx not in self.aux):
-            return self.submit(layer_idx, y, selected_experts, routing_weights)
+            out = self.submit(layer_idx, y, selected_experts, routing_weights)
+            return (out, None) if defer_tail else out
 
         with torch.cuda.device(y.device):
             st = self._ensure_stream_state(y.device)
@@ -1980,10 +1993,19 @@ class MoeCpuHost:
                 print(f" -- stream L{layer_idx}: rows {rows}, streamed experts "
                       f"{len(streamed)}/{E}, assignments {n_str}/{sum(counts_h)}")
             if not streamed:
-                return self.submit(layer_idx, y, selected_experts, routing_weights)
+                out = self.submit(layer_idx, y, selected_experts, routing_weights)
+                return (out, None) if defer_tail else out
             return self._submit_prefill_streamed(
                 layer_idx, y, selected_experts, routing_weights, spec, streamed, st,
-                counts_h, flat, shifted, neg)
+                counts_h, flat, shifted, neg, defer_tail)
+
+    def collect_deferred_tail(self, pending):
+        """Second half of submit_prefill(defer_tail = True): enqueue the flag wait and readback of the
+        CPU tail jobs and merge them into the output (same ops, same order as the inline collect)"""
+        tail_jobs, out_t, rtmp, tidx, h, out, dev = pending
+        with torch.cuda.device(dev):
+            self._collect_compute(tail_jobs, out_t, rtmp, h)
+            out.index_add_(0, tidx, out_t)
 
     def _stream_fused_t(self, spec, aux, h):
         """Fused-kernel row capacity for a streamed layer, 0 when the layer isn't eligible
@@ -2058,7 +2080,7 @@ class MoeCpuHost:
         return fixed, max(per_expert, batched)
 
     def _submit_prefill_streamed(self, layer_idx, y, selected_experts, routing_weights, spec,
-                                 streamed, st, counts_h, flat, shifted, neg):
+                                 streamed, st, counts_h, flat, shifted, neg, defer_tail = False):
         from ..modules.moe_batch_recon import plan_groups
         rows = y.shape[0]
         h = y.shape[1]
@@ -2335,11 +2357,14 @@ class MoeCpuHost:
                 out.index_add_(0, idx, dy[:, :h] * we)
             st["wconsumed_ev"][ws].record(torch.cuda.current_stream())
 
-        # Collect the CPU tail (by now usually complete) and merge
+        # Collect the CPU tail (by now usually complete) and merge; deferred, the caller does it after
+        # its own GPU work is queued (collect_deferred_tail)
         if tail_jobs:
+            if defer_tail:
+                return out, (tail_jobs, out_t, rtmp, tidx, h, out, y.device)
             self._collect_compute(tail_jobs, out_t, rtmp, h)
             out.index_add_(0, tidx, out_t)
-        return out
+        return (out, None) if defer_tail else out
 
     def unregister(self):
         # Called per offloaded layer on unload; shut down when the model releases the last
