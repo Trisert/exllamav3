@@ -78,8 +78,10 @@ def test_fused_row_tiles_match_single_launch(device, dims):
     """The 32 / 64-row tile instances, launched per expert range, produce the same per-slot outputs as one 16-row
     launch over every expert: the arithmetic per row is unchanged, only the B dequant is shared across row
     fragments"""
-    if torch.cuda.get_device_capability(device) < (7, 0):
-        pytest.skip("Wide 64-row MoE tiles require SM 7.0+ (> 48 KB shared memory)")
+    if torch.cuda.get_device_capability(device) < (6, 0):
+        pytest.skip("Wide MoE tiles require SM 6.0+")
+    # SM 6.x: the launcher clamps 64-row requests to the 32-row instance (48 KB shared memory), so the same
+    # calls exercise the 32-row tile; this is the equivalence check behind EXL3_MOE_MTILE_SM60
     Hd, Id = dims
     counts = [3, 16, 17, 24, 32, 33, 40, 48, 64, 96, 128, 1]
     E2 = len(counts)
