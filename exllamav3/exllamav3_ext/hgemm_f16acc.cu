@@ -565,7 +565,9 @@ constexpr int64_t MIN_BLOCKS_64 = 96;
 // BM = 64 (128 threads, three blocks per SM with STAGES = 1, two with STAGES = 2) or 128 (256 threads, one block per
 // SM) rows per block; the 64-row tile halves the grid granularity for narrow outputs (N = 512 projections, small
 // expert groups)
-template <bool OUT_F32, int BM, int STAGES>
+// B_NT: B is the weight in its natural [N][K] layout (K contiguous, row stride K) instead of [K][N]; only the first Nb
+// rows exist (Nb <= N, the rest of the last column tile reads row Nb - 1 and is written as don't-care columns)
+template <bool OUT_F32, int BM, int STAGES, bool B_NT = false>
 __global__ void __launch_bounds__(BM * 2, BM == 64 ? (STAGES == 1 ? 3 : 2) : 1)
 gemm_kernel
 (
@@ -578,7 +580,8 @@ gemm_kernel
     const int ldc,
     const int64_t a_bstride,
     const int64_t b_bstride,
-    const int64_t c_bstride
+    const int64_t c_bstride,
+    const int Nb = 0
 )
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 600
@@ -603,6 +606,24 @@ gemm_kernel
     const int b_k = tid >> 4, b_n = (tid & 15) * 8;
     const half* b_ptr = B + (size_t) b_k * N + n0 + b_n;
     const size_t b_step = (size_t) BK * N;
+    // NT: (n pair p, k chunk c) work items, item = tid + l * THREADS: two B rows (n = 2p, 2p + 1) x 8 k each, transposed
+    // into half2 (n pair) words exactly like A's row pairs, stored at pair p ^ 8c (same bank pattern)
+    constexpr int NI = LB / 2;
+    int b_off[NI][2];
+    int b_sp[NI];
+    if constexpr (B_NT)
+    {
+        #pragma unroll
+        for (int l = 0; l < NI; ++l)
+        {
+            const int item = tid + l * THREADS, p = item >> 2, c = item & 3;
+            const int n_a = min(n0 + 2 * p, Nb - 1), n_b = min(n0 + 2 * p + 1, Nb - 1);
+            b_off[l][0] = n_a * K + c * 8;
+            b_off[l][1] = n_b * K + c * 8;
+            b_sp[l] = (p ^ (c * 8)) * 2;
+        }
+    }
+    int b_koff = 0;
 
     half2 acc[8][4];
     float accf[8][8];
@@ -619,10 +640,24 @@ gemm_kernel
     {
         ra[0] = a_ok0 ? *reinterpret_cast<const uint4*>(a_ptr0) : make_uint4(0, 0, 0, 0);
         ra[1] = a_ok1 ? *reinterpret_cast<const uint4*>(a_ptr1) : make_uint4(0, 0, 0, 0);
-        #pragma unroll
-        for (int l = 0; l < LB; ++l)
-            rb[l] = *reinterpret_cast<const uint4*>(b_ptr + (size_t) l * (THREADS / 16) * N);
-        a_ptr0 += BK; a_ptr1 += BK; b_ptr += b_step;
+        if constexpr (B_NT)
+        {
+            #pragma unroll
+            for (int l = 0; l < NI; ++l)
+            {
+                rb[2 * l] = *reinterpret_cast<const uint4*>(B + b_off[l][0] + b_koff);
+                rb[2 * l + 1] = *reinterpret_cast<const uint4*>(B + b_off[l][1] + b_koff);
+            }
+            b_koff += BK;
+        }
+        else
+        {
+            #pragma unroll
+            for (int l = 0; l < LB; ++l)
+                rb[l] = *reinterpret_cast<const uint4*>(b_ptr + (size_t) l * (THREADS / 16) * N);
+            b_ptr += b_step;
+        }
+        a_ptr0 += BK; a_ptr1 += BK;
     };
     auto sstore = [&] (const int buf)
     {
@@ -634,9 +669,28 @@ gemm_kernel
             const uint32_t w = __byte_perm(r0[i / 2], r1[i / 2], (i & 1) ? 0x7632 : 0x5410);
             *reinterpret_cast<uint32_t*>(&As[buf][a_c * 8 + i][a_sp]) = w;
         }
-        #pragma unroll
-        for (int l = 0; l < LB; ++l)
-            *reinterpret_cast<uint4*>(&Bs[buf][l * (THREADS / 16) + b_k][b_n]) = rb[l];
+        if constexpr (B_NT)
+        {
+            #pragma unroll
+            for (int l = 0; l < NI; ++l)
+            {
+                const int c = (tid + l * THREADS) & 3;
+                const uint32_t* q0 = reinterpret_cast<const uint32_t*>(&rb[2 * l]);
+                const uint32_t* q1 = reinterpret_cast<const uint32_t*>(&rb[2 * l + 1]);
+                #pragma unroll
+                for (int i = 0; i < 8; ++i)
+                {
+                    const uint32_t w = __byte_perm(q0[i / 2], q1[i / 2], (i & 1) ? 0x7632 : 0x5410);
+                    *reinterpret_cast<uint32_t*>(&Bs[buf][c * 8 + i][b_sp[l]]) = w;
+                }
+            }
+        }
+        else
+        {
+            #pragma unroll
+            for (int l = 0; l < LB; ++l)
+                *reinterpret_cast<uint4*>(&Bs[buf][l * (THREADS / 16) + b_k][b_n]) = rb[l];
+        }
     };
 
     const int KT = K / BK;
@@ -661,7 +715,8 @@ gemm_kernel
         for (int k = 0; k < BK; ++k)
         {
             const uint4 a = *reinterpret_cast<const uint4*>(&As[buf][k][((ty * 4) ^ ((k >> 3) * 8)) * 2]);
-            const uint4 b = *reinterpret_cast<const uint4*>(&Bs[buf][k][tx * 8]);
+            const uint4 b = B_NT ? *reinterpret_cast<const uint4*>(&Bs[buf][k][((tx * 4) ^ ((k >> 3) * 8)) * 2])
+                                 : *reinterpret_cast<const uint4*>(&Bs[buf][k][tx * 8]);
             const half2* av = reinterpret_cast<const half2*>(&a);
             const half2* bv = reinterpret_cast<const half2*>(&b);
             #pragma unroll
@@ -860,6 +915,54 @@ static void launch(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c
     cuda_check(cudaPeekAtLastError());
 }
 
+// C[M, N] = A[M, K] @ Bt[Nb, K]^T with Bt the weight in its natural [N][K] layout. N = c.size(-1) is a multiple of 128
+// and may exceed Nb (columns Nb..N-1 of C are don't-care padding). Rows of A and Bt packed, 16-byte aligned
+static bool covered_nt(const at::Tensor& a, const at::Tensor& bt, const at::Tensor& c)
+{
+    if (!a.is_cuda() || a.device() != bt.device() || a.device() != c.device()) return false;
+    if (a.dtype() != at::kHalf || bt.dtype() != at::kHalf) return false;
+    if (c.dtype() != at::kHalf && c.dtype() != at::kFloat) return false;
+    if (a.dim() != 2 || bt.dim() != 2 || c.dim() != 2) return false;
+    const int64_t M = a.size(0), K = a.size(1), Nb = bt.size(0), N = c.size(1);
+    if (M < 1 || K < BK || K % BK || bt.size(1) != K || c.size(0) != M) return false;
+    if (N < BN || N % BN || Nb < 1 || Nb > N) return false;
+    if (!a.is_contiguous() || !bt.is_contiguous() || c.stride(1) != 1) return false;
+    if ((M + 63) / 64 > 65535 || Nb * K >= (int64_t) 1 << 31 || c.stride(0) < N || c.stride(0) % 4) return false;
+    const uintptr_t c_align = c.dtype() == at::kFloat ? 16 : 8;
+    if (((uintptr_t) a.data_ptr() & 15) || ((uintptr_t) bt.data_ptr() & 15) || ((uintptr_t) c.data_ptr() & (c_align - 1)))
+        return false;
+    return true;
+}
+
+static void launch_nt(const at::Tensor& a, const at::Tensor& bt, const at::Tensor& c, cudaStream_t stream, int bm)
+{
+    const int K = a.size(1), N = c.size(1), Nb = bt.size(0), M = a.size(0), ldc = (int) c.stride(0);
+    dim3 grid(N / BN, (M + bm - 1) / bm, 1);
+    const half* ap = (const half*) a.data_ptr();
+    const half* bp = (const half*) bt.data_ptr();
+    const bool f32 = c.dtype() == at::kFloat;
+    if (bm == 64)
+    {
+        const int sms = at::cuda::getDeviceProperties(a.device().index())->multiProcessorCount;
+        if (pick_stages((int64_t) grid.x * grid.y, sms) == 2)
+        {
+            if (f32) gemm_kernel<true, 64, 2, true><<<grid, 128, 0, stream>>>(ap, bp, c.data_ptr(), M, N, K, ldc, 0, 0, 0, Nb);
+            else gemm_kernel<false, 64, 2, true><<<grid, 128, 0, stream>>>(ap, bp, c.data_ptr(), M, N, K, ldc, 0, 0, 0, Nb);
+        }
+        else
+        {
+            if (f32) gemm_kernel<true, 64, 1, true><<<grid, 128, 0, stream>>>(ap, bp, c.data_ptr(), M, N, K, ldc, 0, 0, 0, Nb);
+            else gemm_kernel<false, 64, 1, true><<<grid, 128, 0, stream>>>(ap, bp, c.data_ptr(), M, N, K, ldc, 0, 0, 0, Nb);
+        }
+    }
+    else
+    {
+        if (f32) gemm_kernel<true, 128, 1, true><<<grid, 256, 0, stream>>>(ap, bp, c.data_ptr(), M, N, K, ldc, 0, 0, 0, Nb);
+        else gemm_kernel<false, 128, 1, true><<<grid, 256, 0, stream>>>(ap, bp, c.data_ptr(), M, N, K, ldc, 0, 0, 0, Nb);
+    }
+    cuda_check(cudaPeekAtLastError());
+}
+
 } // namespace hfma2
 
 // Pascal HFMA2 kernel for the reconstruct-path GEMMs; false = not sm_60, disabled or shape not covered
@@ -886,6 +989,31 @@ void hgemm_hfma2(at::Tensor a, at::Tensor b, at::Tensor c, int64_t bm)
     const at::cuda::OptionalCUDAGuard device_guard(a.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     hfma2::launch(a, b, c, stream, (int) bm);
+}
+
+// c[:, :Nb] = a @ bt^T (bt = [Nb, K] weight, natural layout), c has N = c.size(1) >= Nb columns, a multiple of 128.
+// Returns false (nothing launched) when not sm_60, disabled (EXL3_HGEMM_HFMA2=0), uncovered, or too few rows to pay off
+bool hgemm_hfma2_nt_try(const at::Tensor& a, const at::Tensor& bt, at::Tensor& c, int64_t min_rows)
+{
+    if (!a.is_cuda() || !hfma2::enabled(a.device().index())) return false;
+    if (a.dim() != 2 || a.size(0) < min_rows || !hfma2::covered_nt(a, bt, c)) return false;
+    const at::cuda::OptionalCUDAGuard device_guard(a.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    hfma2::launch_nt(a, bt, c, stream, 64);
+    return true;
+}
+
+// Force the kernel (tests / benchmarks): errors on other devices or uncovered shapes
+void hgemm_hfma2_nt(at::Tensor a, at::Tensor bt, at::Tensor c, int64_t bm)
+{
+    TORCH_CHECK(bm == 128 || bm == 64, "hgemm_hfma2_nt: row tile must be 128 or 64");
+    TORCH_CHECK(a.is_cuda(), "hgemm_hfma2_nt: CUDA tensors required");
+    const auto* props = at::cuda::getDeviceProperties(a.device().index());
+    TORCH_CHECK(props->major == 6 && props->minor == 0, "hgemm_hfma2_nt: sm_60 only");
+    TORCH_CHECK(hfma2::covered_nt(a, bt, c), "hgemm_hfma2_nt: unsupported shape, strides or alignment");
+    const at::cuda::OptionalCUDAGuard device_guard(a.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    hfma2::launch_nt(a, bt, c, stream, (int) bm);
 }
 
 // Try the fp16-accumulator kernel; false = caller should use cuBLAS

@@ -92,6 +92,19 @@ class Model(Model_TPMixin, Model_LSMixin):
                 prefetch(ids)
 
 
+    def advise_ngram(self, ids: torch.Tensor):
+        """
+        Hint for tables streamed from disk: ids (1, n) are the last tokens of a sequence and the final one
+        will be embedded by an upcoming forward. Starts reading its n-gram rows ahead (PLE layers only).
+        """
+        if self.loaded_tp:
+            return
+        for m in self._get_prefetch_layers:
+            advise = getattr(m, "advise", None)
+            if advise is not None:
+                advise(ids)
+
+
     def get_layer_instances(self, layer_idx):
         if not self.config.layer_map:
             return [(layer_idx, 0)]

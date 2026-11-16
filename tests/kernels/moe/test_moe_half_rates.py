@@ -51,7 +51,8 @@ def test_fused_prefill_instances(device, K, dims):
     torch.cuda.synchronize()
     assert (single - ref).abs().max().item() <= 3e-3 * scale, "single 16-row launch"
 
-    if torch.cuda.get_device_capability(device) >= (7, 0):
+    if torch.cuda.get_device_capability(device) in ((6, 0),) or torch.cuda.get_device_capability(device) >= (7, 0):
+        # sm_60: 64-row requests clamp to the 32-row instance (EXL3_MOE_MTILE_SM60)
         tiered = torch.zeros((A, H), dtype = torch.float, device = device)
         launch(tabs, K, 33, CAP, 64, tiered)
         launch(tabs, K, 17, 32, 32, tiered)

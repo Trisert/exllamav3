@@ -36,6 +36,12 @@ _NO_BATCH_READBACK = False
 # confidence stays on the device and is read once after verification (calibration labels only) instead of a
 # blocking readback inside the draft step. Same tokens, same calibration
 _MTP_DEFER_CONF = os.environ.get("EXL3_MTP_DEFER_CONF", "1") == "1"
+# EXL3_NGRAM_ADVISE (default OFF: it removes the stall but the time per round does not improve, see doc/pascal_progress.md): decode reads a few random n-gram table rows per step from a disk that
+# serves random reads one at a time (~0.3 ms each: 10-17 ms for a step's 35-64 cold rows). The generator announces
+# them (posix_fadvise) as soon as their tokens are known on the host: the leading token after a verification, each
+# drafted token when its copy lands, while the host would otherwise wait for the GPU. Hint only; never changes results
+_NGRAM_ADVISE = os.environ.get("EXL3_NGRAM_ADVISE", "0") != "0"
+_NGRAM_ADVISE_THREAD = os.environ.get("EXL3_NGRAM_ADVISE_THREAD", "0") == "1"
 
 class Generator:
 
@@ -1255,6 +1261,42 @@ class Generator:
         return penalize
 
 
+    def _ngram_tail(self, job, n: int = 8):
+        """Last n token ids of the job's first sequence (CPU, 1 x <= n), for n-gram read-ahead hints"""
+        ids = job.sequences[0].sequence_ids
+        L = ids.seq_len
+        return ids.torch_slice(max(0, L - n), L).clone()
+
+    def _ngram_advise_async(self, hist: torch.Tensor, pending: list | None = None):
+        """
+        Queue n-gram read-ahead hints on a worker thread: building the hashes and issuing the posix_fadvise calls
+        costs 0.6-2 ms a call, which must not sit on the decode thread. hist: last tokens of the sequence (clone);
+        pending: (pinned copy, event) of each drafted token in order, each waited for on the worker; without it,
+        the last token of hist leads the next forward
+        """
+        if not _NGRAM_ADVISE_THREAD:
+            # inline: the hash is ~20 us now, and the host is waiting for the GPU at these points anyway; a worker
+            # thread contends for the GIL with the decode thread and its hints land late (measured)
+            self._ngram_advise_task(hist, pending)
+            return
+        pool = getattr(self, "_advise_pool", None)
+        if pool is None:
+            pool = self._advise_pool = ThreadPoolExecutor(max_workers = 1, thread_name_prefix = "ngram_advise")
+        pool.submit(self._ngram_advise_task, hist, pending)
+
+    def _ngram_advise_task(self, hist: torch.Tensor, pending: list | None):
+        try:
+            with torch.inference_mode():
+                if not pending:
+                    self.model.advise_ngram(hist)
+                    return
+                for pb, ev in pending:
+                    ev.synchronize()
+                    hist = torch.cat((hist, pb.to(hist.dtype).view(1, 1)), dim = 1)
+                    self.model.advise_ngram(hist)
+        except Exception as e:
+            logging.getLogger(__name__).debug("ngram advise skipped: %s", e)
+
     def iterate_draftmodel_mtp_gen(self, results: list, window: int):
 
         self._draft_conf_round = None
@@ -1327,6 +1369,9 @@ class Generator:
             target_states = [job.recurrent_state.target for job in self.active_jobs if job.is_prefill_done()] \
                 if self.target_recurrent else None
         draft_pen_fn = self._draft_penalty_fn(draft_cols)
+        # n-gram read-ahead hints (see _NGRAM_ADVISE): one pinned copy + event per drafted token, drained below
+        advise_ng = [] if (_NGRAM_ADVISE and batch_size == 1 and not self.model.loaded_tp
+                           and self.model._get_prefetch_layers) else None
         for idx in range(window):
             params = {
                 "target_hidden": temp_hidden,
@@ -1352,6 +1397,12 @@ class Generator:
             batch_state = lm_head.prepare_for_device(batch_state, params)
             new_ids = self.draft_model.sample_from_state(batch_state, params)
             draft_cols.append(new_ids)
+            if advise_ng is not None and new_ids.is_cuda:
+                pb = torch.empty((new_ids.shape[0], 1), dtype = new_ids.dtype, pin_memory = True)
+                pb.copy_(new_ids[:, :1], non_blocking = True)
+                ev = torch.cuda.Event()
+                ev.record(torch.cuda.current_stream(new_ids.device))
+                advise_ng.append((pb, ev))
             draft_emb = params.get("draft_embedding")
             # Without a row from the sparse head, the next step looks the token up in the embedding table,
             # which wants the ids on its own device (a host round trip for a CPU-resident table, as before)
@@ -1371,6 +1422,12 @@ class Generator:
                     window = idx + 1
                     break
         self.draft_ids_pinned[:batch_size, :window].copy_(torch.cat(draft_cols, dim = 1))
+
+        # The whole draft is enqueued; while the GPU finishes it, announce each drafted token's n-gram rows as its
+        # copy lands (in order, so every token sees the ones before it as context)
+        if advise_ng:
+            job0 = next(j for j in self.active_jobs if j.is_prefill_done())
+            self._ngram_advise_async(self._ngram_tail(job0), advise_ng)
 
         if conf_cols and len(conf_cols) == window:
             self._draft_conf_round = {
@@ -2117,6 +2174,8 @@ class Generator:
 
                 # The last sampled token leads the next forward
                 self.model.prefetch_tokens([sampled_token.item()])
+                if _NGRAM_ADVISE and not self.model.loaded_tp and self.model._get_prefetch_layers:
+                    self._ngram_advise_async(self._ngram_tail(job))
 
                 accepted_lengths.append(accepted_length)
                 j += 1

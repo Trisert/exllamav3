@@ -139,6 +139,10 @@ class MoeCpuTuning:
         self.stream_t = int(os.environ.get("EXL3_MOE_STREAM_T", 8))
         self.stream_fused_t = int(os.environ.get("EXL3_MOE_STREAM_FUSED_T", 256))
         self.stream_min_rows = int(os.environ.get("EXL3_MOE_STREAM_MIN_ROWS", 32))
+        # EXL3_MOE_DEFER_TAIL=1: streamed prefill leaves the CPU tail's flag wait / readback / merge to
+        # cpu_split_combine, after the layer's resident-expert GPU work is queued (runtime-toggleable)
+        self.defer_tail = os.environ.get("EXL3_MOE_DEFER_TAIL", "0") != "0"
+        self._deferred_open = None   # the one deferred tail not yet collected (see _drain_abandoned_tail)
         self.batch_experts = max(1, min(
             int(os.environ.get("EXL3_MOE_STREAM_BATCH_EXPERTS", 24)), MOE_JOB_MAX_EXPERTS))
 
@@ -167,6 +171,13 @@ class MoeCpuTuning:
         # Fused-tier row tiles (32 / 64-row kernel instances per expert range), as EXL3_MOE_MTILE
         # on the GPU side
         self.mtile = os.environ.get("EXL3_MOE_MTILE", "1") != "0"
+        # Issue the streamed-expert DMA and the CPU-tail slot copies as raw cudaMemcpyAsync on
+        # the current stream instead of torch's copy_. The handoff segment and the pinned arena
+        # are cudaHostRegister'ed shared memory, which torch's copy_ does not reliably recognize
+        # as pinned: it then stages the transfer through a pageable buffer and blocks the host
+        # until the DMA finishes (1-8 ms per streamed batch here, and the prefill's main thread
+        # spends most of its time in those calls). EXL3_MOE_ASYNC_DMA=0 restores copy_ for A/B
+        self.async_dma = os.environ.get("EXL3_MOE_ASYNC_DMA", "1") != "0"
 
         # --- debug / kill switches ---
         self.stream_debug = bool(os.environ.get("EXL3_MOE_STREAM_DEBUG"))
@@ -1417,6 +1428,7 @@ class MoeCpuHost:
         stream; returns the (asynchronously filled) float output tensor. Never synchronizes the
         host with the stream.
         """
+        self._drain_abandoned_tail()
         # Device guard: the flag kernels launch on the *current* device's current stream, which
         # need not match the layer's device (e.g. a model loaded entirely on cuda:1)
         with torch.cuda.device(y.device):
@@ -1454,6 +1466,7 @@ class MoeCpuHost:
         the caller can enqueue its own GPU expert work in between. That work then executes
         concurrently with the worker instead of behind the flag wait.
         """
+        self._drain_abandoned_tail()
         with torch.cuda.device(y.device):
             spec = self.specs[layer_idx]
             h = y.shape[1]
@@ -1484,6 +1497,7 @@ class MoeCpuHost:
         back to the copy path). selected_experts must hold RAW router ids here; translation
         (dynamic map or static tail offset) happens inside the kernel.
         """
+        self._drain_abandoned_tail()
         rows = y.shape[0]
         spec = self.specs[layer_idx]
         if rows > self.cap_rows or not (y.is_contiguous() and routing_weights.is_contiguous()):
@@ -1526,6 +1540,21 @@ class MoeCpuHost:
         ext.exl3_moe_split_collect_fused(
             final_2d, slot["out_dev"], counts, slot_idx, ho,
             slot["done"], seq, slot["consumed"], self.gpu_base_ptr + 128)
+
+    def _copy(self, dst: torch.Tensor, src: torch.Tensor, kind: int):
+        """DMA between the handoff segment (or the pinned arena) and device memory. kind 1 is
+        host->device, 2 device->host; both directions here run on the current stream, so the
+        flag writes that follow stay ordered behind the transfer. With TUNING.async_dma the
+        transfer is a raw cudaMemcpyAsync (see cuda_host.h: torch's copy_ does not recognize
+        cudaHostRegister'ed memory as pinned and copies it synchronously through a staging
+        buffer). Contiguous views only; anything else keeps the torch path"""
+        if TUNING.async_dma and dst.is_contiguous() and src.is_contiguous():
+            nbytes = dst.numel() * dst.element_size()
+            if src.numel() * src.element_size() == nbytes:
+                if nbytes:
+                    ext.cuda_memcpy_async(dst.data_ptr(), src.data_ptr(), nbytes, kind)
+                return
+        dst.copy_(src, non_blocking = True)
 
     def _issue_compute(self, layer_idx, y, selected_experts, routing_weights, spec, out, h):
         """
@@ -1586,9 +1615,9 @@ class MoeCpuHost:
             # may sit queued on a different stream than this issue
             if self.slot_last_seq[slot_idx]:
                 ext.exl3_moe_flag_wait(slot["consumed"], self.slot_last_seq[slot_idx], self.gpu_base_ptr + 128)
-            slot["x"][:n].copy_(y_pad[a:b], non_blocking = True)
-            slot["sel"][:n].copy_(sel32[a:b], non_blocking = True)
-            slot["w"][:n].copy_(routing_weights[a:b], non_blocking = True)
+            self._copy(slot["x"][:n], y_pad[a:b], 1)
+            self._copy(slot["sel"][:n], sel32[a:b], 1)
+            self._copy(slot["w"][:n], routing_weights[a:b], 1)
             ext.exl3_moe_flag_write(slot["data_ready"], seq)
             self.slot_last_seq[slot_idx] = seq
             jobs.append((seq, slot_idx, a, b, n))
@@ -1599,9 +1628,9 @@ class MoeCpuHost:
         slot = self.slots[slot_idx]
         ext.exl3_moe_flag_wait(slot["done"], seq, self.gpu_base_ptr + 128)
         if rtmp is None:
-            out[a:b].copy_(slot["out"][:n], non_blocking = True)
+            self._copy(out[a:b], slot["out"][:n], 1)
         else:
-            rtmp[:n].copy_(slot["out"][:n], non_blocking = True)
+            self._copy(rtmp[:n], slot["out"][:n], 1)
             out[a:b] = rtmp[:n, :h]
         # Publish consumption AFTER the readback on this same stream: the slot's next tenant
         # (possibly issuing from another device) gates on this
@@ -1707,7 +1736,7 @@ class MoeCpuHost:
         ev0, ev1 = torch.cuda.Event(enable_timing = True), torch.cuda.Event(enable_timing = True)
         def timed_copy():
             ev0.record(st["copy_stream"])
-            st["vram_slots"][0][:probe // 2].copy_(self.wviews[0][:probe // 2], non_blocking = True)
+            self._copy(st["vram_slots"][0][:probe // 2], self.wviews[0][:probe // 2], 1)
             ev1.record(st["copy_stream"])
             ev1.synchronize()
             return probe / (ev0.elapsed_time(ev1) * 1e-3) / 1e9   # GB/s
@@ -1923,7 +1952,11 @@ class MoeCpuHost:
         if msg[0] != "ok":
             raise RuntimeError(f"CPU MoE worker expert install failed: {msg[1] if len(msg) > 1 else msg}")
 
-    def submit_prefill(self, layer_idx, y, selected_experts, routing_weights):
+    @property
+    def defer_tail(self):
+        return TUNING.defer_tail
+
+    def submit_prefill(self, layer_idx, y, selected_experts, routing_weights, defer_tail = False):
         """
         Split the routed-expert workload by per-expert token count: hot experts (count >=
         stream_t) have their weights staged by the worker, DMA'd through the pinned ring to a
@@ -1932,12 +1965,19 @@ class MoeCpuHost:
         unmasked assignment. Tail jobs are issued before the streamed batches and collected
         after them, so the CPU works the tail while the GPU streams. Falls back to the plain CPU
         path when nothing qualifies.
+
+        defer_tail: return (out, pending) instead of out, leaving the tail's flag wait, readback and
+        merge to collect_deferred_tail (pending is None when there is no tail to collect). The caller
+        enqueues its other GPU work first, so the stream is not parked on the worker's done flag while
+        work that does not depend on the tail is still unqueued.
         """
+        self._drain_abandoned_tail()
         spec = self.specs[layer_idx]
         rows = y.shape[0]
         if (rows < self.stream_min_rows or spec.get("expert_bytes") is None
                 or spec["expert_bytes"] > self.wslot_size or layer_idx not in self.aux):
-            return self.submit(layer_idx, y, selected_experts, routing_weights)
+            out = self.submit(layer_idx, y, selected_experts, routing_weights)
+            return (out, None) if defer_tail else out
 
         with torch.cuda.device(y.device):
             st = self._ensure_stream_state(y.device)
@@ -1958,10 +1998,35 @@ class MoeCpuHost:
                 print(f" -- stream L{layer_idx}: rows {rows}, streamed experts "
                       f"{len(streamed)}/{E}, assignments {n_str}/{sum(counts_h)}")
             if not streamed:
-                return self.submit(layer_idx, y, selected_experts, routing_weights)
+                out = self.submit(layer_idx, y, selected_experts, routing_weights)
+                return (out, None) if defer_tail else out
             return self._submit_prefill_streamed(
                 layer_idx, y, selected_experts, routing_weights, spec, streamed, st,
-                counts_h, flat, shifted, neg)
+                counts_h, flat, shifted, neg, defer_tail)
+
+    def collect_deferred_tail(self, pending):
+        """Second half of submit_prefill(defer_tail = True): enqueue the flag wait and readback of the
+        CPU tail jobs and merge them into the output (same ops, same order as the inline collect)"""
+        tail_jobs, out_t, rtmp, tidx, h, out, dev = pending
+        if getattr(self, "_deferred_open", None) is pending:
+            self._deferred_open = None
+        with torch.cuda.device(dev):
+            self._collect_compute(tail_jobs, out_t, rtmp, h)
+            out.index_add_(0, tidx, out_t)
+
+    def _drain_abandoned_tail(self):
+        """A deferred tail whose caller never reached collect_deferred_tail (an exception between issue and combine:
+        OOM, Ctrl-C, a failed layer) leaves its slots' consumed flags unpublished, and the next job on those slots
+        waits on them forever (the memops wait has no abort). At most one tail is ever open (layers run in sequence
+        and each combines before returning), so any open one at the next submit is abandoned: read it back to
+        release the flags and drop the result"""
+        pending = getattr(self, "_deferred_open", None)
+        if pending is None:
+            return
+        self._deferred_open = None
+        tail_jobs, out_t, rtmp, tidx, h, out, dev = pending
+        with torch.cuda.device(dev):
+            self._collect_compute(tail_jobs, out_t, rtmp, h)
 
     def _stream_fused_t(self, spec, aux, h):
         """Fused-kernel row capacity for a streamed layer, 0 when the layer isn't eligible
@@ -2036,7 +2101,7 @@ class MoeCpuHost:
         return fixed, max(per_expert, batched)
 
     def _submit_prefill_streamed(self, layer_idx, y, selected_experts, routing_weights, spec,
-                                 streamed, st, counts_h, flat, shifted, neg):
+                                 streamed, st, counts_h, flat, shifted, neg, defer_tail = False):
         from ..modules.moe_batch_recon import plan_groups
         rows = y.shape[0]
         h = y.shape[1]
@@ -2123,9 +2188,8 @@ class MoeCpuHost:
                     raw = st["vram_slots"][ws]
                     for bi, e in enumerate(batch):
                         ci, off = blocks[e]
-                        raw[bi * exp_b // 2 : (bi + 1) * exp_b // 2].copy_(
-                            self.arena_views[ci][off // 2 : (off + exp_b) // 2],
-                            non_blocking = True)
+                        self._copy(raw[bi * exp_b // 2 : (bi + 1) * exp_b // 2],
+                                   self.arena_views[ci][off // 2 : (off + exp_b) // 2], 1)
             else:
                 # Stage job: its own ring, consumed by the worker's dedicated stager thread, so
                 # the weight memcpys overlap the compute pool's work on the tail
@@ -2153,7 +2217,7 @@ class MoeCpuHost:
                     if st["wslot_used"][ws]:
                         copy_stream.wait_event(st["wconsumed_ev"][ws])
                     ext.exl3_moe_flag_wait(self.stage_done_addr[ws], seq, abort)
-                    st["vram_slots"][ws][:used].copy_(self.wviews[ws][:used], non_blocking = True)
+                    self._copy(st["vram_slots"][ws][:used], self.wviews[ws][:used], 1)
                     ext.exl3_moe_flag_write(self.pinned_free_addr[ws], seq)
 
             if restore and st["native_slots"] is None:
@@ -2314,11 +2378,16 @@ class MoeCpuHost:
                 out.index_add_(0, idx, dy[:, :h] * we)
             st["wconsumed_ev"][ws].record(torch.cuda.current_stream())
 
-        # Collect the CPU tail (by now usually complete) and merge
+        # Collect the CPU tail (by now usually complete) and merge; deferred, the caller does it after
+        # its own GPU work is queued (collect_deferred_tail)
         if tail_jobs:
+            if defer_tail:
+                pending = (tail_jobs, out_t, rtmp, tidx, h, out, y.device)
+                self._deferred_open = pending
+                return out, pending
             self._collect_compute(tail_jobs, out_t, rtmp, h)
             out.index_add_(0, tidx, out_t)
-        return out
+        return (out, None) if defer_tail else out
 
     def unregister(self):
         # Called per offloaded layer on unload; shut down when the model releases the last
@@ -2365,6 +2434,7 @@ class MoeCpuHost:
         self.next_slot = self.next_wslot = 0
         self.slot_last_seq = [0] * MOE_MAX_SLOTS
         self.wslot_prev_seq = [0] * MOE_MAX_WSLOTS
+        self._deferred_open = None
         cleanupper.unregister_atexit(self.shutdown)
         if self.conn is not None:
             try:

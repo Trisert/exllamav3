@@ -5,6 +5,10 @@
 
 int exl3_moe_max_concurrency(int device);
 
+// Phase profile counters of a build with EXL3_MOE_PROF (all zero otherwise): int64 [72] = 3 x 16 phase counters (16 / 32 /
+// 64-row tile instances) then 3 x 8 GEMM main-loop counters (16 / 32 / 64-row GEMM tiles), see exl3_moe_kernel.cuh. reset zeroes them after the read
+at::Tensor exl3_moe_prof_read(int device, bool reset);
+
 void exl3_moe
 (
     const at::Tensor& hidden_state,

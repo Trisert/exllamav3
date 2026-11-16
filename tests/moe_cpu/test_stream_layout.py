@@ -79,7 +79,7 @@ def harness(monkeypatch):
         dst.copy_(src)
 
     tuning = SimpleNamespace(swizzle = True, stream_fused_t = 0, stream_t_explicit = True,
-                             stream_debug = False)
+                             stream_debug = False, async_dma = False)
     monkeypatch.setattr(mch, "torch", proxy)
     monkeypatch.setattr(mch, "TUNING", tuning)
     monkeypatch.setattr(mch, "ext", SimpleNamespace(

@@ -328,6 +328,16 @@ Pascal (sm_60), m = 3..4 rows (MTP verify at `-ndt 2/3`): the GEMV takes MMODE 4
 with one output per lane, bit-identical to the MMA path and 10-40% faster. `0` restores the MMA path (MMODE 1).
 Read per call.
 
+### `EXL3_GEMV_M16` (default: `1`)
+
+Pascal/Turing, m = 9..16 rows: the GEMV takes MMODE 5, the MMA path with both row groups of the m16n8k16
+fragments live (the second group costs one more A load per k-slice, one more fold accumulator and 16 instead
+of 8 shared-memory rows; bit-identical by construction to splitting the call into two m <= 8 GEMVs). Without
+it, `m > 8` leaves the GEMV entirely and the dense projections run the tile GEMM, which on sm_60 is several
+times off the roofline at those batches — the difference between -hdt 7 and -hdt 12 paying or not on copy-heavy
+agentic turns. Instances exist for 4/5/6 bpw mul1 only (the dense-projection classes of Qwen3.8-Flash-Next);
+every other width, codebook, half-integer rate and `m > 16` keeps the old fallback. `0` disables. Read per call.
+
 ### `EXL3_GEMV_SMEM` (default: `-1`)
 
 Weight-extraction strategy inside the fp16 GEMV kernel: `-1` picks per bitrate (default), `0`
@@ -486,6 +496,20 @@ Memcpy threads used by the worker's dedicated stager (which packs streamed exper
 into the pinned staging ring, concurrently with the compute pool working the CPU tail). A few
 threads saturate host memcpy bandwidth; raising this mainly helps wide streamed batches on
 models with many small experts (see issue trace on Qwen3.6-35B-A3B).
+
+### `EXL3_MOE_STREAM_T` (default: per-device, bandwidth-scaled from `16`)
+
+### `EXL3_MOE_ASYNC_DMA` (default: `1`)
+
+Issue the streamed-expert weight DMAs and the CPU-tail slot transfers as raw `cudaMemcpyAsync` on the
+current stream instead of torch `Tensor.copy_`. The handoff segment and the pinned arena are
+`cudaHostRegister`'ed shared memory, which torch's `copy_` does not reliably classify as pinned: it
+stages the transfer through a pageable buffer and blocks the host until the DMA completes. On the
+Qwen3.8-Flash-Next prefill that was 13 s of the 21 s main-thread time per 4096-token chunk (2.1 s of
+actual HtoD transfer over a Gen3 x4 link); replacing it raised cold prefill from 188-200 t/s to
+245-262 t/s at 4096 tokens and 240-249 to 274-275 t/s at 8192 tokens. See the progress log for the
+output-identity check on this model.
+`0` restores `copy_` for A/B.
 
 ### `EXL3_MOE_STREAM_T` (default: per-device, bandwidth-scaled from `16`)
 
@@ -876,6 +900,17 @@ pages (`MFD_HUGETLB`) of that size instead of shmem. Requires reserved huge page
 (`vm.nr_hugepages`, or `hugepages-1048576kB` for `1g`) covering the whole arena; allocation
 fails with a clear error otherwise. Rejected on Windows.
 
+### `EXL3_HC_NT` (default: `1`)
+
+Pascal (SM 6.0) only: runs the hyper-connection mix GEMMs of the prefill path (`proj_h` and `up_h`, the cuBLAS
+branch of `HyperConnection._mix`) through `ext.hgemm_hfma2_nt`, the HFMA2 GEMM with the weight in its natural
+`[N][K]` layout. The weights are stored that way and reach the old kernel as transposed views, which it refuses
+(`b.stride(-1) != 1`), so cuBLAS ran them at ~5 TFLOPs. The `proj` weight has 324 rows; the output is computed into
+a 384-column buffer and the extra columns are ignored. Minimum rows below which cuBLAS stays (P100 microbench,
+`[M, 10240] x [324, 10240]^T` and `[M, 320] x [10240, 320]^T`): `up` 192 (1.8-2.0x faster from M = 256), `proj`
+1536 (0.96x at M = 1024, 2.1-2.2x at M = 2048-4096). Relative RMS against fp32 8.7e-4 (fp16 partial sums over 32 k terms, flushed to fp32); no end-to-end logit comparison with the switch on and off has been done yet. `0` keeps cuBLAS; an
+extension built without the kernel falls back automatically.
+
 ### `EXL3_MOE_MTILE` (default: `1`)
 
 Row tiles for the fused MoE prefill kernel. The kernel dequantizes each expert's weights once
@@ -894,6 +929,32 @@ on a 4090 + 3090 split; gemma4-26B +1-4%; Qwen3-30B neutral. Other codebooks and
 all-fused fast path (no host-side counts) keep the single launch. Outputs are bit-identical to
 the 16-row tiling at equal group geometry (per-launch active counts widen the groups, which
 reorders the fp32 k-slice reduction to rounding level). Set to `0` for the single launch.
+
+### `EXL3_MOE_DEFER_TAIL` (default: `0`)
+
+CPU-split MoE prefill (streamed path). By default the CPU-expert tail of a layer is collected inline: the stream
+waits on the worker's done flag, reads the tail back and merges it before the layer's resident-expert GPU work is
+queued. With this on, `submit_prefill` returns the tail as a pending and `cpu_split_combine` collects it after the
+resident work is queued, so the flag wait no longer sits in front of that work. The merge is the same ops in the same
+order as the inline collect (`out.index_add_(0, tidx, out_t)`). Measured prefill gain at 2304 tokens: +4% to +13% over
+two A/Bs; the logits stay within the engine's run-to-run noise. Safety: at most one tail is open at a time (layers run
+in sequence and each combines before returning). If a caller never collects it (an exception between issue and
+combine), the host reads it back and drops the result before the next submit, so the slots' consumed flags are
+released instead of hanging the next prefill (`tests/moe_cpu/test_defer_tail_abandon.py`).
+
+### `EXL3_MOE_MTILE_SM60` (default: `1`)
+
+Lets Pascal (SM 6.0, P100) use the row tiles of `EXL3_MOE_MTILE` in the **resident** fused tier. The launcher
+clamps the 64-row request to the 32-row instance there (48 KB shared memory), so experts above 16 rows run through
+the 32-row tile; the tier keeps the 16-row capacity (`EXL3_MOE_FUSED_ROWS`, which must be >= 32 for this path).
+The streamed tier of the CPU split reads `EXL3_MOE_MTILE` directly and is not affected by this switch. Measured on
+the P100 (Qwen3.8-Flash-Next, cold 4096-token prefill), from two profiler runs per arm: the MoE kernels' summed GPU
+time dropped from 4.40 / 4.49 s to 3.67 / 3.59 s; that is the same order as the run-to-run thermal spread, so
+treat it as an estimate until a clock-cycle comparison replicates it. Numerics: with identical group geometry the
+32-row tile is bit-identical to the single 16-row launch for N = 128 shapes, and agrees within 2e-3 of the maximum
+for N = 256 and for the production per-tier geometry (`tests/kernels/moe/test_moe_fused_det.py`); the end-to-end
+logit comparison could not separate the arms from the engine's own run-to-run variation. `0` restores the
+16-row-only resident tier. No effect off Pascal or with `EXL3_MOE_MTILE=0`.
 
 ### `EXL3_MOE_TILE_N` (default: `0` = automatic)
 
@@ -1047,6 +1108,24 @@ Linux only. The process's `RLIMIT_MEMLOCK` must cover the table (the soft limit 
 hard limit when that suffices; `ulimit -l unlimited`, `LimitMEMLOCK=infinity` for systemd
 services) or the interpreter needs `CAP_IPC_LOCK`; this is checked before the table loads. Also
 `--ngram_lock` / `-ngl` in `model_init`-based scripts.
+
+### `EXL3_NGRAM_RAMP` (default: `1`), `EXL3_NGRAM_RAMP_FIRST` (default: one page), `EXL3_NGRAM_RAMP_GROW` (default: `2.0`)
+
+Progressive first prefill chunks for models that stream a row table from disk (PLE n-gram tables): a cold
+prompt's first chunk is the one row gather with nothing to overlap, and its cost is linear in the rows it
+touches (~300 us per cold random row on this machine's USB SSD, queue depth 1). On a dedicated prefill the
+first chunks ramp up from `EXL3_NGRAM_RAMP_FIRST` tokens, multiplied by `EXL3_NGRAM_RAMP_GROW` each chunk
+until the normal `--chunk_size`; the later chunks' gathers then run on the row-table worker behind the GPU
+work of the earlier ones. Only chunk boundaries change (page aligned, same token order and forward
+semantics). Gated off for multimodal inputs, tensor parallel, and shared/cooldown chunking (when another job
+is generating). `EXL3_NGRAM_RAMP=0` restores the fixed chunking. See also the exact next-chunk lookahead
+(`ple_prefetch_next`), which now mirrors the prefill loop's bounds including the recurrent last-page split.
+
+### `EXL3_NGRAM_PREFETCH_MIN` (default: `64`)
+
+Position count below which a row-table prefetch declines to stage on the worker thread (decode-sized
+inputs gather inline, faster than the thread hop). The old default of 256 left the last chunk of a
+4096/8192-token prompt (255 positions) gathering inline at the PLE layer, exposed in the prefill.
 
 ### `EXL3_EMBED_STREAM` (default: `0`)
 

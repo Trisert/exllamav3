@@ -237,6 +237,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("hgemm_f16acc", &hgemm_f16acc, "hgemm_f16acc");
     m.def("hgemm_f16acc_status", &hgemm_f16acc_status, "hgemm_f16acc_status");
     m.def("hgemm_hfma2", &hgemm_hfma2, "hgemm_hfma2", py::arg("a"), py::arg("b"), py::arg("c"), py::arg("bm") = 128);
+    m.def("hgemm_hfma2_nt", &hgemm_hfma2_nt, "hgemm_hfma2_nt", py::arg("a"), py::arg("bt"), py::arg("c"), py::arg("bm") = 64);
+    m.def("hgemm_hfma2_nt_try", &hgemm_hfma2_nt_try, "hgemm_hfma2_nt_try", py::arg("a"), py::arg("bt"), py::arg("c"), py::arg("min_rows") = 1024);
     m.def("hgemv_f16", &hgemv_f16, "hgemv_f16", py::arg("a"), py::arg("b"), py::arg("c"), py::arg("ksplit") = 0);
     m.def("fa75_fwd", &fa75_fwd, "fa75_fwd");
     m.def("fa75_fwd_slice", &fa75_fwd_slice, "fa75_fwd_slice");
@@ -326,6 +328,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
     m.def("blocksparse_mlp_routing", &blocksparse_mlp_routing, "blocksparse_mlp_routing");
     m.def("exl3_moe_max_concurrency", &exl3_moe_max_concurrency, "exl3_moe_max_concurrency");
+    m.def("exl3_moe_prof_read", &exl3_moe_prof_read, "exl3_moe_prof_read", py::arg("device"), py::arg("reset") = true);
     m.def("exl3_moe", &exl3_moe, "exl3_moe");
     m.def("exl3_moe_gather", &exl3_moe_gather, "exl3_moe_gather");
     m.def("exl3_moe_coop", &exl3_moe_coop, "exl3_moe_coop");

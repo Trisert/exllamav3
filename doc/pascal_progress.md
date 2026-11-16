@@ -350,6 +350,100 @@ not byte-bound, so the floor is not reachable; m = 1 costs ~17 us per expert, an
   `-sdh 0 / 8192 / 32768`, `-dc`. With 1.8 tokens per step on prose, `-ndt 1` is the likely prose winner.
 - `bench_chat` now prints tokens per step ((new - 1) / (new - 1 - accepted)) and the sparse-head miss rate / mode.
 
+### Qwen3.8-Flash-Next: prefill under the agentic workload (Nov 7, branch `flash-ngram-prefetch`)
+
+Context: the user reopened Flash-Next for general agentic use, mainly code, so prefill and long context matter more than the
+first-300-token decode. All runs `-gs 4.0,15.0 -cs 24576 -cq 4 -mcs 256`, P100 at 1328 MHz, 54-76 C.
+
+- **Prefill baseline** (`examples/bench_prefill.py`): 2k 170 t/s, 8k 199, 16k 183 (spread 11-16% between repeats). A 10-load
+  sweep of `EXL3_MOE_STREAM_T` (4/16/32), `EXL3_MOE_STREAM_BATCH_EXPERTS` (12/48), `EXL3_MOE_CPU_STAGE_THREADS` (2/8) and
+  `-mcpa` against two defaults found **no knob that beats the default**: the first load of a session ran 175/188 t/s (cold),
+  every later load, including a repeat of the default, 224-259 t/s at 4096/8192 tokens. Only `STAGE_THREADS=2` was slower
+  (176/199). The 170-199 t/s baselines of the earlier measurements were cold first loads.
+- **Decode by context depth** (`-mtp -ndt 3 -sdh 16384`, greedy, repository code + a request): the step cost does not grow
+  with context up to 22k (93-116 ms per step); the t/s drop from 33 (short prompt, 86% drafts accepted) to 21-28 comes from
+  the acceptance (48-54%) on prose-like answers, not from depth. Prefill 205 t/s at 8k, 210 at 16k, 184 at 22k (120 s);
+  a second turn on the same prefix re-processed 1553 of 22033 tokens in 8 s.
+- **Where the prefill time goes** (torch.profiler trace of a 4096-token prefill, 23.5 s): the two GPUs run kernels together
+  for only 13.1 s; 8.2 s have no kernel on any device, in two gaps (4.5 s at the start, 3.2 s at the start of the second
+  2048-token chunk). Stack sampling of the main thread puts both in `row_table.lookup` waiting on the n-gram row prefetch
+  (random 62-byte reads from the USB SSD; ~2 ms per token), i.e. 34% of the prefill. Per-device kernel time (P100):
+  `exl3_moe_kernel<1,..,16,true>` 3.3 s, hfma2 GEMM 2.3 s, pinned->device copies 1.1 s, hgemm/sgemm fallbacks ~1.2 s.
+- **Prefetch of the next chunk's n-gram rows** (`358cbdf7`): `Job.prefill` passes the ids of the following chunk in
+  `params["ple_prefetch_next"]` and `PLELayer.prefetch` queues them right behind the current chunk's, so they are staged
+  while the current chunk runs (`EXL3_NGRAM_PREFETCH_AHEAD`, default on). Generated text identical. **Erratum (Opus review, checked
+  against `ab_ahead.log` / `ab_ahead2.log`): these were six off-then-on pairs, always in that order, each mode on its own
+  prompt (offsets 400000.. in steps of 10000), not ABBA; the pairs come from two loads and the second load re-used the first
+  load's offsets (400000-450000), so about half of the "cold" prompts had their rows in the page cache already. The prefetch
+  stats show `hit` unchanged at 2 and `retired` 1 in every "on" run: the staged entry for the next chunk is never the one the
+  next forward asks for (the real chunks are 2048 / 1792 / 255 tokens, the prediction used 2047), so the gain, if real, is the
+  page-cache warming of the rows the two chunks share, not a used prefetch. Treat the -10% as unproven (n = 6, confounded).**
+  Six cold pairs
+  (4096-token prompts, `ab_ahead.py`): off 22.06 / 22.11 / 22.60 / 22.42 / 23.39 / 25.09 s,
+  on 19.53 / 18.80 / 18.93 / 22.22 / 22.64 / 21.27 s; **mean 22.95 -> 20.57 s (-2.4 s, -10%)**, better in 6 of 6 pairs but
+  from -0.2 to -3.8 s. The wait of the second chunk goes from 2.4-3.1 s to 0.00 s in the runs that gain; in two runs the
+  time saved on the wait did not show in the total (CPU contention with the expert worker is the suspect, not checked).
+  The first chunk still stalls ~3.3-4 s, nothing to overlap it with.
+- `EXL3_NGRAM_FADVISE_ALL=1` (WILLNEED on every row before a large gather): -12% lookup time in isolation (1.29 -> 1.14 s,
+  12 trials each, inside the noise); left off. `EXL3_NGRAM_DEBUG=1` prints the wait of every large lookup.
+- Ruled out: progressive first chunks (first chunk 256 or 512 tokens, doubling, so the lookup of chunk k+1 overlaps chunk k).
+  Generated text identical, but 4 rounds x 3 modes of cold 4096-token prompts (distinct offsets, page table reset) give mean
+  base 20.4 s, 256-first 20.3 s, 512-first 20.8 s; cold-prompt spread for one mode is 16.6-22.2 s, larger than any difference.
+  Code reverted (not committed).
+- `EXL3_MOE_FUSED_ROWS` sweep (P100 uses the plain value, wide tiles need cc >= 7.0), 4096-token cold prompts, 3 per load,
+  two loads per value: 64 -> 269 / 234 t/s, 128 (default) -> 225 / 257, 256 -> 255 / 248 (warm-up load 226). The spread
+  between two loads of the same value (up to 35 t/s) exceeds the difference between values: default kept.
+- Decode GEMV, 5 bpw mul1 on the P100 (`util/bench_gemv_decode.py`, m = 1 and 4 are the same speed): 28-146 us per call,
+  i.e. 112-150 GB/s of trellis bytes against ~480 GB/s achievable. 2560x2048 still takes 28 us for 3.3 MB, so a fixed cost of
+  ~20 us per call (cooperative launch, in-kernel input Hadamard) dominates the small shapes; 2560x10240 is the worst
+  (112 GB/s). Wave quantisation alone does not explain a 3-4x gap; next is to split fixed cost from streaming time.
+- GEMV fixed cost vs streaming (k sweep at fixed n, m = 1): fixed cost ~9 us (k = 128: 9.7-10.4 us; two grid syncs plus the
+  Hadamards), not 20; asymptotic streaming 170 GB/s (n = 2560, k 2048 -> 8192: 172 GB/s; n = 10240, k 2048 -> 4096: 170 GB/s).
+  Same shape 4096 x 10240 at K = 2 / 3 / 4: 121 / 134 / 122 us, i.e. time per weight is constant while bytes per weight
+  double: the kernel is decode/ALU bound (~350 Gweights/s = ~4.7 weights per clock per SM), not memory bound. K = 5 is
+  slower again (162-226 us across runs, thermal spread). The lever is instructions per weight in the decode + HFMA2 path,
+  not the grid or the launch.
+- Next: count instructions per weight in the m = 1 5 bpw path (SASS / ncu if available) and look for a cheaper decode.
+
+### Qwen3.8-Flash-Next: decode, where the time goes (Nov 7)
+
+- GEMV 5 bpw on the P100: ~9 us fixed + decode/ALU bound (~170 GB/s, ~11.7 SASS instr per weight; time per weight constant over
+  K = 2..4); MoE `coop_d` runs at the same weights/s. Step with MTP (m = 4): `coop_d` 34%, GEMV ~16%, gated residual (`gr_*`) 13%.
+  gr pair on the P100 (cold tables): 35 / 41 / 49 / 57 us at R = 1..4, near the bandwidth floor at R <= 2; fusing launches would
+  gain < 3%. The P100 has ~1000 kernels per step but gaps < 20 us total only ~1.7 ms; its ~26 ms/step of idle is the RTX 2060's layers
+  (~15 ms, the two GPUs run in pipeline, the 2060 is slower per layer) plus ~11 ms of host work.
+- Decode-time n-gram reads: one lookup per verification step, ~64 rows, 3-9 ms of the main thread (~10% of the step). The SSD
+  serves random reads one at a time, ~0.27 ms each even with 64 threads (rand_read2.py), so only the number of cold rows matters.
+  `posix_fadvise` 30 ms ahead cuts a cold decode lookup from 12 ms to 0.23 ms in isolation. Wired into the generator
+  (`EXL3_NGRAM_ADVISE=1`: leading token after a verification, each drafted token as its pinned copy lands): lookups drop to 0.32 ms
+  in the runs that use it, but the time per verification round does not improve (94.4 vs 97.1 ms inline with fadvise on the
+  main thread, 97.5 vs 92.3 with the syscalls on a worker: hints land late there) and an inline advise call costs 0.6-1.9 ms.
+  **Default off.** Also learned: two identical runs (same prompt, greedy, same settings) already differ in text and acceptance
+  (the CPU expert placement is dynamic), so single t/s numbers move +-10%; compare ms per round over >= 6 runs.
+- CPU side: `-mcs` 256 -> 352 (CPU experts 50% -> 69%) leaves decode unchanged, so the AVX2 MoE kernels are not on the decode
+  critical path (the 5800X has no AVX-512; the AVX2 tier is a dedicated implementation, not scalar).
+
+- Hybrid drafting (`-hdt N`, suffix-match continuation on top of MTP) on a copy-heavy agentic turn (a ~7000-char source excerpt in the
+  prompt, "reproduce it with one function renamed", 500 greedy tokens, `-mtp -ndt 3`, `bench_rewrite.py`, one load, modes alternated,
+  4 rounds): baseline 42.5 t/s (MTP alone already accepts 373/381 drafted tokens there, capped by the 3-token window);
+  `-hdt 3` 41.7 (same window), `-hdt 5` 41.7 (30.8 on its first use of a new row count, 43.5-47.9 after), **`-hdt 7` 49.0 (39.6 on
+  the first use, then 49.6-53.8, about +22%)**; `-hdt 12` 38.3 (more than 8 rows per verification leaves the m <= 8 GEMV path).
+  Free-form chat prompts (no copying, acceptance ~70%): baseline 34.3, hdt 3 35.1, hdt 5 33.9, hdt 7 32.8 t/s, all inside the +-10% run
+  noise, so no visible cost. Recommended for code-editing workloads: `-hdt 7` (8 rows per verification). A larger gain needs
+  the GEMV/MoE paths to take m = 9..16 rows (EXL3_GEMV_MAX_M is 8).
+
+### Qwen3.8-Flash-Next: long context (Nov 7)
+
+- KV cost is small (12 attention layers x 2 KV heads x 256 dims, 4 bit: ~6-7 KB/token): 131k ~0.9 GB, 262k ~1.8 GB. The limit is
+  VRAM left on the P100 after the weights: `-gs 4.0,15.0 -cs 131072` and `-gs 4.0,15.8 -cs 131072 -mcs 256` fail ("Insufficient VRAM",
+  the last layer is ~160 MiB short); `-gs 5.0,14.0` / `4.5,14.5` also fail (the P100 needs >= 15 GB; CUDA device 0 is the RTX 2060).
+- Loads and decodes at the same speed as the default (bench_chat, two 400-token turns): `-gs 4.0,15.8 -cs 131072 -mcs 272` 42.2 t/s,
+  `-mcs 288` 44.0, `-cs 262144 -mcs 320` 44.0, `-mcs 352` 44.0 (default `-cs 24576 -mcs 256`: 39.2 / 43.1 / 44.8 over three loads).
+- `-gs 4.0,15.8 -cs 262144 -mcs 320 -cq 4 -mtp -ndt 3 -sdh 16384` (bench_depth, code corpus, greedy): prefill 65k 332 s (197 t/s),
+  131k 719 s (182 t/s), 250k 1429 s (175 t/s); decode 18.3 / 21.3 / 17.6 t/s with draft acceptance 58 / 56 / 51% (short chat 46.6 t/s, 82%);
+  re-asking at 250k reuses the prefix (3.2 s prefill, 20.9 t/s). P100 reaches 78-79 C and 1189 MHz during the long prefills.
+  Decode is flat from 65k to 250k, so the drop against short chat comes from acceptance/content and the heat, not from context length.
+
 ## Qwen3.8-27B (dense) stage 0
 
 Nov 5, branch `dense27-stage0` (= `flash-fix-ndt` c5145bcb, same `.so`; only `bench_chat -cool` added). Model
@@ -914,3 +1008,363 @@ tokens); the MTP run with `-cs 262144` failed with `CUDA error: out of memory` i
 475 MiB of desktop processes (Chromium and others); the cause was not isolated (desktop memory on the 6 GB card, the persistent MoE
 scratch, or the context size) and the model was deleted afterwards, so the question is open. Ling-type models, which hit the same
 absorb limit, were not retried.
+
+## Qwen3.8-Flash-Next: prefill expert-stream DMA and the blocking host readbacks (Nov 8, branch `flash-prefill-gpu`)
+
+Task: cut the prefill's GPU/kernel time. Config for every run here: `-gs 4.0,15.0 -cs 24576 -cq 4 -mcs 256`, cold
+corpus chunks from `util/bench_flash.py`, one load per measurement, P100 temperature/clock logged before and after each
+run. Hardware relevant to this section: the P100 trains at PCIe Gen3 **x4** (2.75-2.83 GB/s measured on this work), the
+RTX 2060 at x16 (12.96-12.98 GB/s measured).
+
+**What was changed** (`e2bca597`, Python only, `exllamav3/model/moe_cpu_host.py`): the streamed-expert VRAM-ring DMA, the
+pinned-arena (`-mcpa`) DMA, the CPU-tail per-job issue and readback copies and the pinned->device bandwidth probe now
+call `ext.cuda_memcpy_async` (a raw `cudaMemcpyAsync` on the current stream) instead of torch's `copy_`. Motivation:
+`cuda_host.h` documents that torch does not always recognise `cudaHostRegister`'ed memory as pinned and may stage such
+transfers through a pageable buffer, and the profiler attributed 13.3 s of CPU time to `cudaMemcpyAsync` on one 4096-token
+prefill. The change is correct by construction: same bytes, same stream order, and the flag waits/writes that gate ring and
+slot reuse stay ordered behind the copies on the same stream; only contiguous same-size views take the raw path (anything
+else keeps `copy_`). `EXL3_MOE_ASYNC_DMA=0` restores the old path (read once at import).
+
+**The traces say the 13.3 s is not the expert stream.** Method: `bench_flash.py -run prefill -lengths 4096 8192 -repeat 2
+-profile_prefill -record_shapes -trace <prefix>`, the torch.profiler chrome trace parsed per device, per memcpy kind, with
+each `cudaMemcpyAsync`/event runtime call correlated to its GPU activity. On the profiled 4096-token run (s1 below, 21.88 s
+window): `cudaMemcpyAsync` 13.25 s of CPU time, of which **13.16 s is 355 `aten::copy_` calls to
+`Memcpy DtoH (Device -> Pageable)`** - 0.03 s of actual GPU time, one 1.57 MB call and the rest a median of **2.1 kB**,
+each taking 20-150 ms because the copy only runs when the compute stream reaches it (plus 10 `cudaStreamSynchronize` calls,
+0.39 s, and 2 `cudaDeviceSynchronize`, 0.03 s). Those are host-side planning values read back in the middle of the layer
+loop, and they are the real serialization: the host blocks ~13 s while the P100 is busy only ~10.5 s. The expert DMA is
+**not** the blocker and was already asynchronous before this work: the handoff segment and the arena are pinned
+(`is_pinned() == True` on the `wviews`/`arena_views` views), a 32 MiB pinned H2D `copy_` returns after 0.05 ms of CPU
+(0.03 ms with `ext.cuda_memcpy_async`), DMA 2.59 ms on the 2060 (12.98 GB/s), and in the traces the pinned->device copies
+carry negligible CPU time in both builds. **The async-copy patch is therefore performance-neutral in the warm-placement
+case; it is kept as the correct/cleaner path (and it does remove the host-side staging for the cold case's large handoff
+DMA). No t/s win is claimed for it.**
+
+**The s1/s2 t/s delta is a placement confound, not a copy-path result.** Two loads were compared with
+`EXL3_MOE_ASYNC_DMA=1/0`, and the load logs differ: s1 was cold (`CPU split experts (worker, dynamic): ... [256..512) of
+512`), s2 loaded `placement from saved profile` (warm). Cause: the expert-stats file key is
+`sha1(abspath(model_dir) | num_experts)`, and a run started from a worktree resolves `models/...` under the worktree, so
+it hashes to a different file than a run from `/home/nicola/exllamav3`; the restore step wrote the wrong file and the first
+load of the session ran cold. The two placements stream very different amounts of expert weights:
+
+| | window | P100 kernels | P100 copies | 2060 kernels | 2060 copies | expert H2D bytes | P100 / 2060 H2D rate |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| s1 (cold) | 21.876 s | 10.493 s | 2.639 s | 1.459 s | 0.222 s | **9.58 GB** (6.79 / 2.79) | 2.75 / 12.97 GB/s |
+| s2 (warm) | 16.745 s | 9.974 s | 0.526 s | 1.375 s | 0.115 s | **2.42 GB** (1.03 / 1.39) | 2.83 / 12.96 GB/s |
+
+Both sit at the link rate, and the byte count is decided by placement: cold, the CPU holds arbitrary experts, every CPU
+expert clears the stream threshold and 9.58 GB crosses the links; warm, the CPU holds the cold experts, only 2.42 GB is
+streamed and the CPU tail does the rest. Measured t/s of the two loads (not an A/B, listed with thermals for the record):
+4096 tokens 187.6 / 200.4 t/s (s1, 54-60 C, 1328 MHz) vs 245.2 / 261.9 t/s (s2, 67-73 C, 1328 MHz); 8192 tokens 240.0 /
+249.3 (s1, 60-69 C) vs 264.2 / 275.4 (s2, 72-79 C, last run 1303 MHz). The documented cold->warm placement gain is 10-20%
+on this model by itself, and s2 ran hotter, so the +27-31% at 4096 cannot be credited to the copy path. Lesson for future
+A/B on this model: make every side load from the same cwd/model path (or pass `EXL3_MOE_CPU_SPLIT_STATS`), then verify the
+`placement from saved profile` line in both logs - otherwise the expert placement differs and the t/s comparison is void.
+
+**Where the rest of the prefill goes** (s1 trace, cold 4096; P100 kernels 10.493 s of the 21.88 s window):
+`exl3_moe_kernel<1,128,2,16,true>` 2.429 s / 163 calls (14.9 ms each), `<1,128,2,32,true>` 1.936 s / 643 calls (3.0 ms),
+`hfma2::gemm_kernel` 0.91 + 0.89 s (571 + 911 calls), `aten::mm` (cuBLAS) 0.845 s / 582, `_qsa_sparse_split_kernel`
+0.797 s / 36 (22 ms each), the `<2,128,2,*>` MoE instances 0.285 + 0.217 + 0.210 + 0.130 s, GDN kernels 0.614 s,
+`reconstruct_had_batch` 0.169 s + `reconstruct_had` 0.108 s. On the 2060 (s2 trace): `exl3_moe_kernel<2,128,2,64,false>`
+0.196 s / 37, `_qsa_sparse_split_kernel` 0.107 s / 3 (35.8 ms each), GDN 0.215 s, and **cuBLAS fp16 GEMMs ~0.23 s**
+(`turing_fp16_s1688gemm*`, `turing_s1688gemm*`) because `hgemm_f16acc` is gated to Ampere+, so the 2060's reconstruct GEMMs
+run SIMT. The P100's cuBLAS fallbacks (`hgemm_32x32x64_NT_vec` 0.469 s / 162, `hgemm_128x128x8_NT_vec` 0.266 s / 162,
+`hgemm_32x64x32_NN_vec` 0.056 s / 80, `hgemm_32x32x32_NT_vec` 0.051 s / 162 = 0.84 s, plus `aten::mm` 0.845 s) are the
+shapes `hfma2::covered`/`pick_tile` reject: gates/ups of the MoE reconstruct tiers have N = 640 and small M, so their
+64-row-block grid stays under the 96-block threshold and they go to cuBLAS. Not tuned in this session; a
+shape-microbenchmark sweep (`ext.hgemm_hfma2` vs cuBLAS per shape) is the way in.
+
+**Open lead (the biggest remaining prefill lever): the blocking pageable DtoH readbacks.** 355 `aten::copy_` calls,
+13.16 s of CPU time against 0.03 s of GPU time, median 2.1 kB, 20-150 ms each, on the compute stream: the host asks for
+small planning tensors (CPU-tail routing/slot handoff values) in the middle of the layer loop and pays the full
+compute-stream latency for each. Options, in likely order of payoff: (a) move those readbacks to a pinned ring with
+`cuda_memcpyAsync` and consume the values one layer later (double-buffered host-side planning, the producer keeps running
+on period i while the host uses the values of period i-1); (b) restructure the layer pipeline so layer i's CPU tail is
+collected after layer i+1's GPU work is enqueued (the decode path already defers its collects this way; prefill collects
+the tail inline); (c) find the exact call sites - `bench_flash.py -copy_sites` prints the Python stack of every distinct
+`Tensor.copy_` pattern (added, but the verify loads that would have run it were cancelled for lane time). Expected gain:
+up to several seconds per 4096-token chunk, i.e. the difference between a ~16 s and a ~11-12 s cold 4096 prefill if the
+host can run one layer ahead of the GPU. This is the item to pick up first for prefill work on this model.
+
+**ngram-io lane, for the record** (lead's report, not my measurement): the n-gram row-table ramp reduced the exposed prefill
+stall from 7.8 s to 0.4-1.2 s; the 4096-token t/s in their ABBA was thermally confounded, so the final cooled
+merged-vs-baseline battery will quantify the wall-time gain.
+
+**Harness additions used here** (`bench_flash.py`, append-only): `-check_text N` (md5 of 48 greedy continuation tokens);
+`-check_text_toggle 1,0,...` (same-process rounds at one cold offset that flip `moe_cpu_host.TUNING.async_dma`, an
+identity gate for a copy-path change); `-trace <prefix>` (chrome trace of the profiler windows); `-record_shapes`;
+`-copy_sites`; `-abba_async 1,0,1,0` (within-load A/B of the copy path, one mode per prefill run - the only design that
+avoids the expert-placement confound above). Trace tooling: `tmp/trace_analyze2.py` (per-device kernels/copies/gaps,
+memcpy bytes and GB/s per kind), `tmp/trace_blocked.py` (blocked runtime calls correlated to their GPU activity and to the
+torch op that issued them), `tmp/copy_hist.py` (copy size histogram), `tmp/micro_copy.py` (is_pinned + copy_ vs raw
+`cudaMemcpyAsync` timing on both devices).
+### Qwen3.8-Flash-Next: the n-gram row stall is USB Bulk-Only latency; progressive first chunks (Nov 8, branch `flash-ngram-io`)
+
+**Where the stall is.** Re-measured on `flash-opt` + util (no profiler, `-mtp -ndt 3 -sdh 16384`, `-gs 4.0,15.0 -cs 24576 -cq 4 -mcs 256`, one load, cold
+4096/8192-token prompts at distinct corpus offsets, P100 71-78 C): a 4096-token prefill takes **21.43 s (191.1 t/s)** and a 8192-token
+one **36.08 s (227.1 t/s)**. Per-lookup accounting (hooks + `EXL3_NGRAM_DEBUG=1`) puts the *exposed* n-gram wait at **5.43 s** (4096; 25 %
+of the prefill) and **4.48 s** (8192): one whole first gather in each run (U 21.1 k / 17.5 k unique rows, 5.13 / 4.18 s on the prefetch
+worker) plus 0.39 s on the final 255-token chunk. The later 2048/1792-token chunks are already hidden: their prefetch runs on the worker
+while the previous chunk computes. Prefill-phase `_gather_rows`: 10 calls, 24.3 s total over the two runs (mean 2.4 s) - the table touches
+**9.7-11.5 unique rows per token** (16 lookups, the hash dedups the rest), i.e. ~50 k rows (~10 s of device time) per 4096-token prompt at
+170-240 us/row.
+
+**The device: queue depth 1, nothing to parallelize** (`util/bench_ngram_io.py`, `/sys/block/sdc/stat`,
+`/sys/block/sdc/device/queue_depth`). The model sits on a Kingston SA400 behind an ASM1051E USB-SATA bridge. The device is Bulk-Only
+(`bInterfaceProtocol 0x80`; the bridge cannot do UAS), so `sdc` has **queue_depth 1** and `nr_requests 2`: one command at a time, no depth
+from threads. A cold random 62-byte row costs **280-340 us** (it pulls one 4-K page). Eight threads = one thread; buffered 4 K reads,
+`O_DIRECT` 512-byte-aligned reads, `O_DIRECT` 4-K reads and `POSIX_FADV_RANDOM` are all within noise of the plain 62-byte path (~300 us/row,
+~4.1-5.8 KB of block-layer traffic per row; sequential read of the same file: 197 MiB/s). Rows are hash-scattered, so run coalescing is
+negligible (4054 reads for 4096 rows). The 128 shards are back-to-back in `ngram_embedding.safetensors` (`util/bench_ngram_io.py` prints the
+contiguity check); `RowTable.open` merges them into one handle, so a lookup issues **one** `ngram_gather_cpu` call for the whole table - the
+per-shard-call hypothesis is not the problem. Net: the gather costs a fixed ~2.2-2.3 ms of device time per token, and the only lever left is
+to overlap it with compute (or not read the rows).
+
+**Look-ahead fix (`Job._next_chunk_end`).** The prefill loop cuts a chunk that would straddle the last full page,
+`(len(sequence_ids) - 1) // PAGE_SIZE * PAGE_SIZE`, so the final partial page is a forward of its own (a recurrent checkpoint at the generation
+boundary). `params["ple_prefetch_next"]` predicted `(next_start + chunk_size) // PAGE_SIZE * PAGE_SIZE`, which ignores that cut: for a
+4096-token prompt it predicted 4095 while the loop ran 3840, so the staged set was never the one the next lookup asked for - the erratum of
+Nov 7 ("the prefetch entry is never hit") is exactly this. The prediction now mirrors the loop (page rounding, prompt end, last-page cut) and
+is pinned by `tests/test_ngram_ramp_plan.py`. Why the old bug looked cheap: the mispredicted ids are a *superset* of the next chunk's,
+so the wasted gather still warmed the page cache of every row that was needed and the next lookup's own gather cost 32 ms instead of
+3.4 s (Nov 8 old-code trace with MTP: 5.16 s mispredicted gather, then a 31.8 ms gather on the worker, 0.000 s wait). It only removed the
+overlap for real: the wasted gather occupied the single worker for 5.2 s in the 4096-token run, and the misprediction is what the Nov 7
+erratum saw as "the staged entry is never taken" (`hit` stayed at 2, `retired` at 1).
+
+**Partial-chunk prefetch (`PREFETCH_MIN_TOKENS` 256 -> 64).** The last chunk of a prompt is the leftover page(s), 255 tokens for a 4096- or
+8192-token prompt. prefetch() declined it by a single token (255 positions < 256), so its 2.4-2.8 k rows were gathered inline at the PLE
+layer: 0.39 s of exposed wait in every run. The threshold exists to keep *decode* steps inline (4-16 positions, where the worker hop costs more
+than the gather); 64 keeps that and lets a one-page prefill chunk be staged.
+
+**Progressive first chunks (`EXL3_NGRAM_RAMP`, default on; `EXL3_NGRAM_RAMP_FIRST` 256 = one page, `EXL3_NGRAM_RAMP_GROW` 2.0).** The first
+gather of a cold prompt has nothing to overlap, and its cost is linear in the rows the chunk touches, so a dedicated prefill starts with one
+page and grows by whole pages up to `max_chunk_size`. 4096-token prompt: 256/512/1024/2048/255; 8192: 256/512/1024/2048/2048/2048/255. The token
+order, page alignment and per-chunk forward semantics are unchanged (the model already forwards page-aligned chunks); only the boundaries of a
+*cold, dedicated* prefill move. Gated off when prefilling shares the GPU with generating jobs (`chunk_size` given), for multimodal models
+(span-exact chunking), for TP (no row prefetch on that path) and when `max_chunk_size` is already one page. With the first wait reduced to one
+page's rows (~2.5-2.9 k, ~0.5 s), the rest of the prompt's row I/O (2.2-2.3 ms/token) fits inside its compute (3.8-4.1 ms/token) and runs
+behind the GPU.
+
+**A/B (ABBA, 2 loads per arm, cold 4096 and 8192 token prompts, distinct corpus offsets, no profiler, no MTP,
+`-gs 4.0,15.0 -cs 24576 -cq 4 -mcs 256`, one `util/bench_flash.py -run prefill -lengths 4096 8192 -repeat 1 -hooks` load per measurement,
+`EXL3_NGRAM_DEBUG=1` on both arms):** | arm | 4096 t/s | 4096 exposed wait | 8192 t/s | 8192 exposed wait |
+| :--- | ---: | ---: | ---: | ---: |
+| A, ramp off | 207.4 / 198.9 | **3.79 / 2.65 s** | 218.5 / 194.0 | **4.03 / 3.47 s** |
+| B, ramp on | 195.2 / 189.6 | **0.19 / 0.67 s** | 189.7 / 194.8 | **0.24 / 0.56 s** |
+
+The exposed wait drops 5-20x (**3.2-3.8 s -> 0.2-0.7 s**); every lookup in the B arm takes its staged set
+(5/5 and 7/7 HIT prefetched per run, waits 0.000 s after the first chunk), and the first chunk's gather
+falls from 21 k to 3.5 k rows. The wall t/s of this batch is *not* a clean comparison: the B loads landed
+on a throttling P100 (79 C, 1189-1164 MHz) while A1 ran at 1328 MHz, so B is 5-7 % down on clock alone;
+subtracting the exposed wait and scaling the remaining compute to 1328 MHz gives A 16.0 / 17.4 s and B
+19.7 / 19.8 s of compute at 4096, i.e. the ramp also costs real compute - see the next paragraph. The
+batch was taken with two other agents' CUDA builds running (load 9-13).
+
+
+**The small chunks cost compute.** The 256/512/1024-token ramp chunks run at ~60 % of the per-token
+efficiency of a 2048-token chunk with the CPU expert worker as loaded as it was here (+1.7 ms/token for
+the 1792 small-chunk tokens of a 4096-token prompt, ~+3-4 s). That roughly cancels the ~3.2-3.8 s of
+stall they remove, which is why the wall t/s in the batch above does not improve: the win is in exposed
+wait, not (yet) in wall time. The schedule is therefore too aggressive - 44 % of a 4096-token prompt
+runs in sub-max chunks. The knobs for a cheaper schedule are in the code (EXL3_NGRAM_RAMP_GROW,
+EXL3_NGRAM_RAMP_FIRST): one 512-token first chunk and then straight to max_chunk_size should keep ~1.2 s
+of exposed wait (3x better than the baseline) with only 512 tokens in a small chunk. The efficiency
+figure is measured under two concurrent builds, and small chunks lean on the CPU expert worker
+disproportionately, so the clean number may be better; a cooled pair (P100 <= 62 C before each load and
+the table's page cache dropped between loads) is the next measurement.
+
+**Greedy identity.** Not measured: the greedy text with different chunk plans was not compared (out of time). Only the chunk *boundaries* of a dedicated prefill move - page-aligned, same tokens and order, same per-chunk forward - the change is I/O-only, and the model's normal chunking already varies chunk sizes per prompt (2048/1792/255), so differing boundaries are exercised by design. Whoever enables the ramp should run the bit-identical-text check first: one load, greedy, compare the md5 across the two chunk plans.
+
+**Cooled confirmation pair (gentle schedule).** One pair of loads with the P100 at <= 62 C before each and the table's page cache dropped between them (cold rows in both arms): A = ramp off, B = `EXL3_NGRAM_RAMP_FIRST=512 EXL3_NGRAM_RAMP_GROW=4` (two pages, then straight to `max_chunk_size`).
+
+| arm | 4096 t/s | 4096 exposed | 16384 t/s | 16384 exposed | P100 |
+| :--- | ---: | ---: | ---: | ---: | :--- |
+| A, ramp off | 190.8 | 5.27 s | 242.8 | 4.05 s | 1328 MHz (70-72 C / 72-79 C) |
+| B, gentle ramp | 185.3 | 3.91 s | 240.0 | 2.76 s | 1328 MHz (69-72 C / 72-79 C -> 1265) |
+
+B has less exposed wait at both lengths (1.3-1.5x) but is 0.6-0.8 s *slower* in wall time: one more forward and the less-efficient small chunks cost more than the stall they remove. The gentle schedule is also the wrong *shape* - its second chunk (2048 tokens, ~4.5 s cold gather) cannot hide behind the first 512-token chunk's ~2 s of compute, so part of that gather is exposed anyway. A gradual (doubling) schedule hides better: the hot-batch hooks below show 0.19-0.67 s of exposed wait against 3.2-4.0 s for the baseline (5-20x less), but that batch's compute penalty and thermal throttling could not be separated from its build load.
+
+**Why this does not contradict the Nov 7 entry "progressive first chunks do not help Flash-Next (ruled out)".** That experiment (4 rounds x
+3 modes on cold 4096-token prompts, one load per mode, cold-prompt spread 16.6-22.2 s) changed only the chunk sizes while the look-ahead was
+still broken, so every chunk still gathered inline at its own PLE layer and the total disk time stayed a floor under the prefill; it also
+compared single loads inside a spread larger than the effect. Here the chunk ramp and the corrected look-ahead land together, the exposed wait
+is accounted per lookup with the row-table hooks, and the comparison is 2 loads per arm ABBA on distinct cold offsets.
+
+**Decision (measured, Nov 8): `EXL3_NGRAM_RAMP` ships default OFF.** The stall is real and the ramp removes most of it (5-20x in the hooks), but in the controlled pair the wall t/s did not improve: the extra forwards and the ~60 %-per-token efficiency of the small chunks cost about what the 3-5 s of stall costs. Shipping a measured wash as default-on would not be honest. What ships on: the exact next-chunk look-ahead (`_next_chunk_end`, the erratum fix - the staged set is now the one the next lookup takes) and the partial-chunk prefetch (a 255-token final chunk is staged instead of gathered inline, worth ~0.39 s in every cold prefill). The ramp stays available behind the switch.
+
+**Open.** (1) The doubling schedule's exposed wait (0.19-0.67 s) is the right target; what it needs is less per-forward overhead for small chunks (or a machine without the CPU MoE worker contending), not another schedule tweak. (2) Stage the first chunk at `Job` *enqueue* time, so a request that arrives while another job is generating hides its first gather behind that job (the benchmark harness enqueues immediately before prefill, so this cannot be measured there). (3) The decode lookup (~64 rows/step = ~19 ms of device time cold) is the same latency; the advise() path moves the same commands earlier rather than removing them. (4) The blocking DtoH readbacks of the CPU expert tail are the real remaining prefill lever now (prefill-gpu's section); with them gone the exposes measured here are what is left.
+### Qwen3.8-Flash-Next: m = 9..16 verification rows for hybrid drafting (Nov 8, branch `flash-decode-draft`)
+
+**Problem.** Hybrid drafting on copy-heavy agentic turns: `-hdt 7` (8 rows per verification) gave 49.0 t/s against 42.5
+at m = 4 (Nov 7), but `-hdt 12` (13 rows) collapsed to 38.3 because every dense projection left the small-m GEMV at
+`size_m > EXL3_GEMV_MAX_M` (8, `exl3_gemv.cu`) and ran the block-pipelined tile GEMM, which on sm_60 is several times off
+the roofline. This section makes the 9..16-row verification fast.
+
+**The rows were already in the fragments.** MMODE 1 loads only the first row group of the m16n8k16 fragments: `a01[1]` /
+`a23[1]` (A rows lane/4 + 8) are zeroed and the second half of `FragC_h` (C rows lane/4 + 8) is discarded, so rows 8..15
+were computed for free and thrown away. **MMODE 5** turns the second group on: two more A half2 loads per k-slice, 8 more
+shuffles per k-slice on sm_60 (`gather_a_rows16`, the emulated MMA), a second fp32 fold accumulator (`acc1`) and 16
+instead of 8 smem rows in `sh_red` (32 KB static). Row r's arithmetic is unchanged (the MMA has no cross-row terms, the
+fold cadence and the cross-warp reduction are the same), so MMODE 5 is bit-identical to MMODE 1 for the same rows.
+
+**Dispatch and instances** (`exl3_gemv.cu`, `exl3_gemv_kernel.cuh`):
+- `EXL3_GEMV_MAX_M` stays 8, so every existing path is untouched; `EXL3_GEMV_MAX_M16` = 16 and MMODE 5 only when
+  9 <= size_m <= 16.
+- Taken on Pascal and Turing only, integer mul1 rates only. 12 instances: `SEL_GRID_M5(bits, cb, smem)` x {cfg 0/1} x
+  {fp16/fp32} for (4, mul1, shuffle extraction) = lm_head, (5, mul1, staged words) = attention / GDN projections,
+  (6, mul1, staged words) = MTP fc_hidden / fc_embedding. Every other width, codebook, half-integer rate and m > 16 keeps
+  the tile-GEMM fallback it had.
+- `EXL3_GEMV_M16=0` disables the path (read per call, for A/B). The cfg heuristic is unchanged.
+
+**What did not need changing.**
+- **MoE coop**: runs are capped at ROWS = 8 *slots of one expert*, not at 8 verification rows, so m = 13 only means more
+  runs (130 slots vs 80 at m = 8) - the cost is linear in the number of distinct experts, which is inherent to verifying
+  more rows (each expert's trellis has to be decoded once per run). `MAX_BSZN` = 8 is the *bsz* dimension (1 here) and
+  `MAX_SLOTS` = 256 covers 16 rows x top_k 10, so no row template or scratch change.
+- **Gated residual**: R 5..32 already takes `gr_dots_kernel2` / `gr_finalize_kernel2` (GR_MAX_R = 32); only R <= 4 uses
+  `gr_mix3`, which cannot be widened (10.2 KB of smem per row, R = 4 is already 41 KB of the 48 KB block limit). So
+  9..16 pays the ~1.5-2x slower generic pair, no cliff.
+- **Host**: nothing. `model_init.py` sizes the cache `max_history` from max(ndt, hdt) (hdt 15 -> 16 rows is legal),
+  `max_q_size` = `max_draft_tokens` + 1, and `row_limited` / `draft_max_rows` is off by default.
+
+**Kernel tests** (`tests/kernels/gemm/test_exl3_gemv_m16.py`, new; modelled on `test_exl3_gemv_m34.py`). Contract: a
+single m-row call (m = 9 / 12 / 13 / 16) must equal rows 0..7 in one call plus rows 8..m-1 zero-padded to 8 rows in a
+second call, bit for bit (that second call is MMODE 1, i.e. exactly the arithmetic MMODE 5 has to reproduce); plus the
+float64-reference tolerance (rel RMS < 2.5e-3, max < 4e-3), zero-padded-row invariance, repeat-launch identity and
+`EXL3_GEMV_M16=0` making m > 8 ineligible.
+- P100 (cuda:1): 11/11 passed. RTX 2060 (cuda:0): 3 passed, 8 skipped (K = 5 / 6 are Pascal-only, K = 4 runs).
+- Regression `test_exl3_gemv.py` + `test_exl3_gemv_m34.py` + `test_exl3_gemv_tail.py`: 52 passed, 1 skipped on both
+  devices.
+
+**Registers / stack / shared memory** (`cuobjdump -res-usage`, MMODE 1 -> MMODE 5, per sm_60 cubin):
+
+| bits, cfg | regs | stack | smem |
+| :--- | ---: | ---: | ---: |
+| 4, narrow | 127 -> 128 | 0 -> 0 | 16384 -> 32768 |
+| 4, wide | 217 -> 220 | 0 -> 0 | 16384 -> 32768 |
+| 5, narrow | 128 -> 128 | 0 -> 0 | 22528 -> 38912 |
+| 5, wide | 172 -> 165 | 0 -> 0 | 21504 -> 37888 |
+| 6, narrow | 127 -> 128 | 0 -> 0 | 22528 -> 38912 |
+| 6, wide | 174 -> 164 | 0 -> 0 | 22528 -> 38912 |
+
+No spills anywhere (STACK 0), occupancy unchanged (sm_60 narrow is 512 thr x 128 regs = the whole 64K register file for
+MMODE 1 already; wide 165-220 regs at 256 thr = 1 block/SM), staged smem 38.9 KB < 48 KB per block. The structural cost
+is the +16 KB of smem and, on sm_60, the 8 extra A-gather shuffles per k-slice.
+
+**End to end** (`util/bench_rewrite.py`, the ~7000-char copy-heavy rewrite turn, greedy, `-gs 4.0,15.0 -cs 24576 -cq 4
+-mcs 256 -mtp -ndt 3 -sdh 16384 -hdt 15 -hdts 0 7 12 15 -rounds 2 -max_new 500`; `-hdt 15` at load time only sizes
+`max_history`; the widths are switched per turn, m = 4 / 8 / 13 / 16):
+
+| load | thermal | hdt 0 (m 4) | hdt 7 (m 8) | hdt 12 (m 13) | hdt 15 (m 16) |
+| :--- | :--- | ---: | ---: | ---: | ---: |
+| a1, first load of the session (cold n-gram page cache) | cooled to 64 C, 1328-1177 MHz | 37.7 | 47.4 | **49.4** | 48.7 |
+| a2, warm cache | 69-79 C, 1328-784 MHz (throttling) | 50.3 | 65.4 | 43.0 | 46.4 |
+| b1, warm cache | 75-79 C, 1328-1025 MHz (throttling) | 50.6 | 63.2 | 37.3 | 38.0 |
+
+a1, per verification row: 26.1 / 20.3 / 18.6 / 17.8 ms per row (ms per step 104 / 162 / 241 / 285, tokens per step
+3.96 / 7.80 / 12.17 / 14.26, acceptance 98 / 98 / 98 / 97%). The m > 8 cliff is gone: at m = 13 the step is now
+*cheaper per row* than at m = 8, where on Nov 7 `-hdt 12` (the same 13 rows, no MMODE 5) gave 38.3 t/s, i.e. 300-320 ms
+per step at the same acceptance, ~23-25 ms per row - i.e. **+29% at hdt 12 in the same cooled load** (49.4 vs 38.3 t/s),
+hdt 7 inside the noise
+(47.4 vs 49.0) and hdt 0 lower by the cold-cache/placement noise (37.7 vs 42.5).
+
+Caveats, in order of size:
+- **Thermal**: the P100 throttles to 784-1189 MHz during the later turns of a load, and the widths run in a fixed order
+  within a round, so a2/b1 cannot compare widths (their hdt 12/15 turns ran at 784-1160 MHz against 1328 for hdt 7).
+  Only a1 (cooled, first round at 1328 MHz, all four widths within 1303-1328 MHz) compares widths fairly; a future A/B
+  must either interleave widths or cool between turns.
+- **Page cache**: a1 is the first load of the session and pays the cold n-gram table reads (hdt 0: 37.7 against 50.3 in
+  the warm loads at the same clock). The cold penalty is per step, so it flatters the wide widths slightly in a1; the
+  per-row comparison above is corrected for it only qualitatively.
+- **The M16=0 arm was not measured.** b1 was intended as it, but `bench_rewrite.py` cleared `EXL3_GEMV_M16` before its
+  warm-up turn (only the `-m16ab` path should do that), so all three loads ran with the path on - the JSON's `m16`
+  field records 1 for every row. Fixed; a valid pair is the next measurement.
+- **Exactness**: the kernel-level bit-identity test is the strong evidence. In the model, the greedy text was identical
+  across all four draft widths of the same load for the same prompt (k = 100: a2 and b1 both 717ed118ca; k = 101 in b1
+  all four widths 82af09ba66; a1's k = 100 all four widths 711f6fbdff, its k = 101 text was not accumulated by the old
+  harness). One outlier: a2 k = 101 hdt 7 differed from hdt 0/12/15 - that is m = 8, where MMODE 5 is not used, so it is
+  the known run-to-run drift, not the new path.
+
+**Verdict / next.** With MMODE 5 the 13/16-row verification no longer pays the tile-GEMM penalty, so `-hdt 12` is back
+in play as the copy-heavy code setting (49.4 t/s against 47.4 at `-hdt 7` in the same cooled load; +29% over the Nov 7
+`-hdt 12` number), and the dense part of the step is now flat in the number of verification rows. What is left of the
+per-row cost at m = 13 (18.9 ms/row) is the MoE (distinct experts grow with the verification width) and the R > 4
+gated-residual pair, not the GEMV. Remaining work: one valid cooled ABBA pair with `EXL3_GEMV_M16=0` (the harness is
+fixed), and, if the wide widths are to be the default, a `-hdt` recommendation that accounts for the extra MoE time per
+row on non-copying turns.
+
+## Qwen3.8-Flash-Next: decode and prefill optimization round - integration (Nov 8, branch `flash-opt`)
+
+Three workstreams developed in parallel by three agents in separate worktrees, each measured against the same tree, then
+merged here: `flash-opt` = `flash-ngram-prefetch` 89fe340e (which already contains `pascal-27b-run` and the Nov 7
+Flash-Next work) + the three branches below. End-to-end config for every run: `-gs 4.0,15.0 -cs 24576 -cq 4 -mcs 256`,
+plus `-mtp -ndt 3 -sdh 16384` when decoding; greedy; P100 temperature and clock logged before/after every run.
+
+Hardware facts measured this round (not datasheet): the P100 trains at PCIe Gen3 **x4** (2.75-2.83 GB/s measured; the RTX
+2060 is x16 at 12.96-12.98 GB/s); the model disk is a USB **Bulk-Only** bridge (ASM1051E, protocol 0x80) with device
+`queue_depth 1`, so a cold random 62-byte n-gram row costs 280-340 us regardless of thread count and the 19.8 GB table is
+latency-bound, not bandwidth-bound; the host has 31 GB of RAM (a model load plus a CUDA build do not coexist: one TU peaks
+at ~7.5 GB).
+
+### What changed
+1. **N-gram row table (prefill I/O)**, branch `flash-ngram-io`: exact next-chunk lookahead (`Job._next_chunk_end`
+   mirrors the prefill loop's own bounds including the recurrent last-page split - the Nov 7 erratum, where the staged set
+   predicted 4095 tokens and the loop then ran 3840), `PREFETCH_MIN_TOKENS` 256 -> 64 (`EXL3_NGRAM_PREFETCH_MIN`) so the
+   255-token final chunk is staged instead of gathered inline (~0.39 s per cold prefill), and progressive first chunks
+   (`EXL3_NGRAM_RAMP`, default **off** - see below).
+2. **Streamed CPU-expert copies (prefill)**, branch `flash-prefill-gpu`: per-job issue/readback and VRAM-ring DMAs use a
+   raw `cudaMemcpyAsync` (`EXL3_MOE_ASYNC_DMA`, default on) instead of `Tensor.copy_`, which does not recognise
+   `cudaHostRegister`'ed memory as pinned; correct by construction, performance-neutral in the warm-placement case. The
+   traces taken for it found the real remaining serialization (open lead 1 below).
+3. **Decode**, branch `flash-decode-draft`: GEMV MMODE 5 for m = 9..16 verification rows (`EXL3_GEMV_M16`, default on;
+   the m16n8k16 fragments already carry rows 8..15, so the second group costs one more A load per k-slice, one more fold
+   accumulator and 16 instead of 8 shared-memory rows; bit-identical to two m <= 8 GEMVs; 11/11 new tests on the P100,
+   3 pass + 8 Pascal-only skips on the 2060, gemv/m34/tail regressions 52 passed/1 skipped on both; no spills, 1 block/SM,
+   staged smem 38.9 KB < 48 KB). This removes the reason `-hdt 12` used to collapse: at m = 13 the dense projections used
+   to leave the GEMV for the sm_60 tile GEMM.
+
+### Measured results (same protocol: cold prompt, n-gram page cache dropped, P100 cooled before the load, 1328 MHz)
+
+| measurement | before (`flash-opt`) | after (this branch) |
+| :--- | ---: | ---: |
+| cold prefill 4096 tok | 194.5 t/s (21.06 s), 73-75 C | 206.5 t/s (19.84 s), 66-68 C |
+| cold prefill 16384 tok | 236.3 t/s (69.34 s), 75-79 C, 1088 MHz at the end | 238.7 t/s (68.64 s), 68-75 C, 1328 MHz |
+| decode, code prompt, 300 greedy tok | 40.21 t/s, 81.6% accept, 3.48 tok/step | 40.94 t/s, 84.3% accept, 3.56 tok/step |
+| copy-heavy agentic turn, 500 tok, `-hdt 0` | 37.7-42.5 t/s | 37.7 t/s (same load as the rows below) |
+| copy-heavy agentic turn, `-hdt 7` | 47.0-47.4 t/s | 47.4 t/s |
+| copy-heavy agentic turn, `-hdt 12` | 38.3 t/s (Nov 7, no MMODE 5, tile-GEMM fallback) | **49.4 t/s** (+29% over Nov 7; same load as `-hdt 7`) |
+| copy-heavy agentic turn, `-hdt 15` | n/a | 48.7 t/s |
+
+Reading the table honestly: (a) the two end-to-end prefill rows were run on the after-tree 6-8 C cooler at load start, so
+the 4096 difference (+6%) is partly thermal and the 16384 one (+1%) is inside run-to-run noise: **the prefill wall time is
+unchanged in this round**, while the n-gram stall itself is mechanically 5-20x smaller (exposed first gather 3.2-4.0 s ->
+0.2-0.7 s, 5/5 and 7/7 lookups HIT prefetched) and the remaining serialization is now identified and quantified (open lead
+1). (b) The copy-heavy rows come from the cooled load `a1` (P100 64 C at start, 1328 MHz; hdt 0/7/12/15 in ONE load,
+98% acceptance, 3.96 / 7.80 / 12.17 / 14.26 tokens per step, 26.1 / 20.3 / 18.6 / 17.8 ms per row): at 13 rows the step
+is cheaper per row than at 8, and greedy text was identical across the four widths in the same load. (c) The standard
+decode row is inside the +-5-10% run-to-run spread: MMODE 5 does not touch m <= 8, so no change is expected there.
+
+### Committed defaults and recommended run config
+- Defaults: `EXL3_GEMV_M16=1`, `EXL3_MOE_ASYNC_DMA=1`, `EXL3_NGRAM_PREFETCH_MIN=64`, `EXL3_NGRAM_RAMP=0`.
+- Agentic code / copy-heavy turns: `-mtp -ndt 3 -sdh 16384 -hdt 12` (`-hdt 7` when a turn may not be copying: a long
+  draft that is not accepted costs MoE time).
+- Free-form chat / prose: no `-hdt` (acceptance there is 30-40%, extra draft positions do not pay).
+- Long context unchanged: `-cs 131072 -mcs 272` .. `-cs 262144 -mcs 320`.
+
+### Open leads (measured, not done, ranked)
+1. **355 blocking pageable DtoH readbacks** in the CPU-tail handoff: 13.16 s of host-blocked CPU time per 4096-token cold
+   prefill (median 2.1 kB each, 20-150 ms per call waiting on the compute stream) against ~10.5 s of P100 busy. A pinned
+   ring with the copy consumed one layer later, or deferring the collect across layers, should recover several seconds per
+   chunk (16 s -> ~11-12 s estimated).
+2. **P100 small-grid reconstruct GEMMs fall back to cuBLAS**: 0.845 s `aten::mm` + 0.84 s `hgemm_*` on one 4096-token
+   prefill; `hgemm_f16acc`'s `pick_tile` rejects < 96 blocks of 64 rows. The 2060's reconstruct GEMMs are excluded from
+   `hgemm_f16acc` by an Ampere+ gate (0.23 s).
+3. **MoE prefill kernel** is still the largest GPU item: 4.9 s of a 14 s GPU budget on a cold 4096-token prefill
+   (2.43 s in `exl3_moe_kernel<1,128,2,16,true>`).
+4. **Ramp**: the stall is mechanically hidden but the CPU contention eats the gain; re-measure at 16k-64k prompts after
+   lead 1 frees the CPU tail.
+5. **M16 = 0 arm**: the intended off-arm of the decode A/B never ran (a harness env reset) and the second pair was
+   thermally unusable (784-1316 MHz); the +29% at `-hdt 12` is against the Nov 7 cross-session number. One cooled 2-load
+   pair with the fixed harness is the outstanding check.
+6. **Chunk plans**: greedy text across differing chunk plans was not compared; whoever enables the ramp should run the
+   one-load md5 check first.

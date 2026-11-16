@@ -19,7 +19,10 @@
 //
 // CFG 0 ("narrow", 512 threads, 2 n-tiles/warp, 16 k-splits) wins at attention-projection sizes;
 // CFG 1 ("wide", 256 threads, 4 n-tiles/warp, 8 k-splits) wins at large-n FFN sizes. MMODE 0 is
-// the m == 1 fast path, MMODE 1 covers 2 <= m <= 8 with row-guarded fragment loads.
+// the m == 1 fast path, MMODE 1 covers 2 <= m <= 8 with row-guarded fragment loads, MMODE 5 covers
+// 9 <= m <= 16: the m16n8k16 A/C fragments already span 16 rows (A rows lane/4 and lane/4 + 8 are
+// a01[1] / a23[1], C rows lane/4 + 8 is the second half of FragC_h), so the second row group only
+// needs its A loads, one more fold accumulator and one more smem row per store.
 
 #include <cooperative_groups.h>
 #include "../ptx.cuh"
@@ -27,7 +30,8 @@
 #include "exl3_kernel_map.cuh"
 #include "hadamard_inner.cuh"
 
-#define EXL3_GEMV_MAX_M 8
+#define EXL3_GEMV_MAX_M 8        // MMODE 1 (m = 2..8)
+#define EXL3_GEMV_MAX_M16 16     // MMODE 5 (m = 9..16)
 
 namespace exl3_gemv_ns {
 
@@ -203,6 +207,24 @@ __device__ __forceinline__ void dq8_regs_half(uint32_t a7, uint32_t b7, int s7, 
                 w4 & 0xffff, w5 & 0xffff, w6 & 0xffff, w7 & 0xffff, f0, f1);
 }
 
+#if EXL3_SM60
+// MMODE 5: the emulated MMA's two row groups. a01[1] / a23[1] are A row g + 8 (lane 4g + i holds k = 2i, 2i + 1
+// in a01[0] for row g and in a01[1] for row g + 8), so filling a_rows[1] costs the same 8 shuffles
+// exl3_gather_a_row0 spends on a_rows[0]. Bit-identical to the MMODE 1 result for the same row.
+__device__ __forceinline__ void gather_a_rows16(const FragB& a01, const FragB& a23, half2 (&a_rows)[2][8])
+{
+    const int g = (threadIdx.x & 31) >> 2;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i)
+    {
+        a_rows[0][i]     = exl3_shfl_h2(a01.elems[0], 4 * g + i);
+        a_rows[0][4 + i] = exl3_shfl_h2(a23.elems[0], 4 * g + i);
+        a_rows[1][i]     = exl3_shfl_h2(a01.elems[1], 4 * g + i);
+        a_rows[1][4 + i] = exl3_shfl_h2(a23.elems[1], 4 * g + i);
+    }
+}
+#endif
+
 }  // namespace exl3_gemv_ns
 
 // HALF: bitrate is bits + 0.5 (bits = 1, 2, 3; mul1 codebook): 12 / 20 / 28 uint32 per tile. 1.5 bpw packs two tiles
@@ -228,7 +250,9 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
     // products, 2 / 4 rows)
     // MMODE 4: m = 3..4 on sm_60, the same arithmetic as the emulated MMA of MMODE 1 (bit-identical) with one output
     // (column lane / 4, row lane % 4) per lane and fragment: 8 shuffles + 8 HFMA2 per fragment instead of 16 + 32
-    constexpr int ROWS = MMODE == 0 ? 1 : (MMODE == 2 ? 2 : (MMODE == 3 || MMODE == 4 ? 4 : EXL3_GEMV_MAX_M));
+    // MMODE 5: m = 9..16, MMODE 1's MMA path with both row groups of the fragment live (16 smem rows)
+    constexpr int ROWS = MMODE == 0 ? 1 : (MMODE == 2 ? 2 : (MMODE == 3 || MMODE == 4 ? 4 :
+                         (MMODE == 5 ? EXL3_GEMV_MAX_M16 : EXL3_GEMV_MAX_M)));
     constexpr int COLS = WNT * 16;
     constexpr bool TRANS = MMODE == 4;
     // sm_60 has no tensor cores and the shuffle-emulated MMA wastes 15 of 16 A rows at m = 1: take the dot product
@@ -355,6 +379,8 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
         FragC_h ch[WNT][2] = {};
         float2 acc0[WNT][2] = {};
+        // MMODE 5: fp32 fold of the second row group (C rows lane/4 + 8, FragC_h's high half)
+        [[maybe_unused]] float2 acc1[WNT][2] = {};
         // MMODE 4: fp16 run sum and fp32 accumulator of this lane's single output per tile and fragment
         [[maybe_unused]] half th[WNT][2];
         [[maybe_unused]] float ta[WNT][2];
@@ -458,10 +484,24 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             {
                 a01[0] = r0_ok ? A2[a_row0 + a_col] : hzero;
                 a23[0] = r0_ok ? A2[a_row0 + a_col + 4] : hzero;
-                a01[1] = hzero;
-                a23[1] = hzero;
+                if constexpr (MMODE == 5)
+                {
+                    // Second row group (rows 8..15): same fragment slots, A row r0 + 8
+                    const bool r8_ok = (r0 + 8) < size_m;
+                    const size_t a_row8 = (size_t) (r0 + 8) * (size_k / 2);
+                    a01[1] = r8_ok ? A2[a_row8 + a_col] : hzero;
+                    a23[1] = r8_ok ? A2[a_row8 + a_col + 4] : hzero;
+                }
+                else
+                {
+                    a01[1] = hzero;
+                    a23[1] = hzero;
+                }
 #if EXL3_SM60
-                exl3_gather_a_row0(a01, a23, a_rows);
+                if constexpr (MMODE == 5)
+                    exl3_gemv_ns::gather_a_rows16(a01, a23, a_rows);
+                else
+                    exl3_gather_a_row0(a01, a23, a_rows);
 #endif
             }
 
@@ -601,6 +641,12 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                         {
                             acc0[t][f].x += __low2float(ch[t][f][0]);
                             acc0[t][f].y += __high2float(ch[t][f][0]);
+                            if constexpr (MMODE == 5)
+                            {
+                                acc1[t][f].x += __low2float(ch[t][f][1]);
+                                acc1[t][f].y += __high2float(ch[t][f][1]);
+                                ch[t][f][1] = hzero;
+                            }
                             ch[t][f][0] = hzero;
                         }
                 }
@@ -654,6 +700,13 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                         const int col = t * 16 + f * 8 + c0;
                         sh_red[warp][sr0][col + 0] = acc0[t][f].x;
                         sh_red[warp][sr0][col + 1] = acc0[t][f].y;
+                        if constexpr (MMODE == 5)
+                        {
+                            // C rows lane/4 + 8 live in the same fragment; the rows past size_m are dropped by
+                            // rows_out (their smem slots are written with the zero A row's result)
+                            sh_red[warp][sr0 + 8][col + 0] = acc1[t][f].x;
+                            sh_red[warp][sr0 + 8][col + 1] = acc1[t][f].y;
+                        }
                     }
             }
         }

@@ -38,3 +38,5 @@ void hgemm_recon(at::Tensor a, at::Tensor b, at::Tensor c);
 // hgemm_f16acc_try on sm_60 (EXL3_HGEMM_HFMA2=0 keeps cuBLAS). K % 32, N % 128, packed aligned rows
 bool hgemm_hfma2_try(const at::Tensor& a, const at::Tensor& b, at::Tensor& c);
 void hgemm_hfma2(at::Tensor a, at::Tensor b, at::Tensor c, int64_t bm);
+bool hgemm_hfma2_nt_try(const at::Tensor& a, const at::Tensor& bt, at::Tensor& c, int64_t min_rows);
+void hgemm_hfma2_nt(at::Tensor a, at::Tensor bt, at::Tensor c, int64_t bm);

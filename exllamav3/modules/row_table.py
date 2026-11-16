@@ -1,5 +1,7 @@
 from __future__ import annotations
 import os
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 import torch
 from ..loader.safetensors import DiskTensorHandle
@@ -24,9 +26,28 @@ writer waits on it before reusing the buffers.
 """
 
 PREFETCH_ENABLED = os.environ.get("EXL3_NGRAM_PREFETCH", "1") != "0"   # debug/A-B switch
-PREFETCH_MIN_TOKENS = 256   # positions (bsz * seq) below which prefetch() declines (decode-sized)
-MAX_PIN_SETS = 2            # staging sets: one with the last forward's uploads in flight, one being staged
+# Positions (bsz * seq) below which prefetch() declines: the generator stages a decode step inline
+# (a handful of positions; a thread hop there costs more than the gather), while a prefill chunk -
+# including the final partial page, which can be as short as one token - is worth staging on the
+# worker: a 255-token chunk still touches ~2.4 k rows, 0.4 s of cold reads that would otherwise
+# stall the forward at the PLE layer
+PREFETCH_MIN_TOKENS = int(os.environ.get("EXL3_NGRAM_PREFETCH_MIN", "64"))
+DEBUG = os.environ.get("EXL3_NGRAM_DEBUG", "0") != "0"   # print the wait of every large lookup
+PREFETCH_AHEAD = os.environ.get("EXL3_NGRAM_PREFETCH_AHEAD", "1") != "0"   # stage the next prefill chunk's rows too
+MAX_PIN_SETS = 2           # staging sets: one with the last forward's uploads in flight, one being staged
 INLINE_MAX_ROWS = 16        # rows of a table that gets read-ahead hints, below which a gather reads in line
+# Before a large gather from disk, ask the kernel for every row at once (posix_fadvise WILLNEED) so the device
+# sees a deep queue of random reads instead of the gather threads' few outstanding ones (slow SATA/USB SSDs)
+FADVISE_ALL = os.environ.get("EXL3_NGRAM_FADVISE_ALL", "0") != "0"
+ADVISE_THREAD = os.environ.get("EXL3_ROW_ADVISE_THREAD", "1") != "0"   # issue advise() read-ahead hints on a worker
+
+
+def _advise_rows(work: list):
+    for fd, off, nbytes in work:
+        try:
+            os.posix_fadvise(fd, off, nbytes, os.POSIX_FADV_WILLNEED)
+        except OSError:
+            pass            # a hint; a closed handle (table unloaded meanwhile) or odd filesystem is not an error
 
 
 class _PinSet:
@@ -70,7 +91,9 @@ class RowTable:
         self._pins = []             # pinned staging sets (see _PinSet)
         self._pending = []          # queued prefetches, oldest first: {"ids", "pin", "future"}
         self._executor = None
+        self._advise_exec = None    # worker for advise()'s fadvise syscalls
         self.prefetch_stats = {"hit": 0, "miss": 0, "retired": 0}
+        self.stage_stats = {"gathers": 0, "rows": 0, "t": 0.0, "resolve_t": 0.0}
         self.hinted = False         # the owner announces rows ahead of their lookup (advise())
 
     @staticmethod
@@ -213,13 +236,24 @@ class RowTable:
         if not self.on_disk or not hasattr(os, "posix_fadvise"):
             return
         self.hinted = True
+        # Each WILLNEED submits a read and blocks while the device queue is full (~0.1 ms a row on a disk that serves
+        # random reads one at a time): 16 rows cost 1+ ms on the caller. The syscalls release the GIL, so a worker
+        # thread issues them and the decode thread goes on. (Opening the shard handles stays here: not thread-safe.)
+        work = []
         for uid in uids:
             if not 0 <= uid < self.num_rows:
                 continue            # (multimodal placeholder ids have no row)
             s, local = divmod(uid, self.rows_per_shard)
             h = self.stores[s]
-            os.posix_fadvise(h._ensure_open(), h.abs_offset + local * h.row_bytes, h.row_bytes,
-                             os.POSIX_FADV_WILLNEED)
+            work.append((h._ensure_open(), h.abs_offset + local * h.row_bytes, h.row_bytes))
+        if not work:
+            return
+        if ADVISE_THREAD:
+            if self._advise_exec is None:
+                self._advise_exec = ThreadPoolExecutor(max_workers = 1, thread_name_prefix = "row_advise")
+            self._advise_exec.submit(_advise_rows, work)
+        else:
+            _advise_rows(work)
 
     def drain_prefetch(self):
         for e in list(self._pending):
@@ -265,16 +299,29 @@ class RowTable:
         are in output order. Runs on the prefetch worker or inline (inference mode is
         thread-local, and the staging buffers are inference tensors). skip_read: stage zero rows
         instead of reading the table (model warmup, whose values are meaningless)."""
+        t0 = time.perf_counter() if DEBUG else 0.0
         if pin.event is not None:
             # the previous lookup's non_blocking uploads read this set; the generator issues
             # chunk forwards back to back with no host sync, so wait before rewriting it
             pin.event.synchronize()
         uids, in_order = resolve(ids, pin)
         U = uids.numel()
+        t1 = time.perf_counter() if DEBUG else 0.0
         if skip_read:
             pin.packed[:U].zero_()
+            t2 = t1
         else:
             self._gather_rows(uids, pin.packed[:U])
+            t2 = time.perf_counter() if DEBUG else 0.0
+            self.stage_stats["gathers"] += 1
+            self.stage_stats["rows"] += U
+            self.stage_stats["t"] += t2 - t1
+        if DEBUG:
+            self.stage_stats["resolve_t"] += t1 - t0
+            print(f" -- row_table {self.key[-24:]}: stage ids {tuple(ids.shape)} U {U} of {ids.shape[1]} pos, "
+                  f"resolve {1000 * (t1 - t0):.2f} ms, gather {1000 * (t2 - t1):.2f} ms "
+                  f"({U / max(t2 - t1, 1e-9) / 1000:.1f} krow/s) on {threading.current_thread().name}",
+                  flush = True)
         return U, in_order
 
     def _match(self, ids: torch.Tensor) -> dict | None:
@@ -311,6 +358,12 @@ class RowTable:
                             ext.ngram_gather_cpu(store._ensure_open(), store.abs_offset,
                                                  store.row_bytes, uids[i : i + 1], base, out[i : i + 1])
                     else:
+                        if FADVISE_ALL and hasattr(os, "posix_fadvise"):
+                            fd = store._ensure_open()
+                            off0 = store.abs_offset
+                            rb = store.row_bytes
+                            for u in (seg - base).tolist():
+                                os.posix_fadvise(fd, off0 + u * rb, rb, os.POSIX_FADV_WILLNEED)
                         ext.ngram_gather_cpu(store._ensure_open(), store.abs_offset,
                                              store.row_bytes, seg.contiguous(), base, out[i0 : i1])
                 else:
@@ -375,7 +428,15 @@ class RowTable:
             self.prefetch_stats["miss"] += 1
             pin = self._acquire_pin(n)
         try:
+            if DEBUG:
+                t_dbg = time.time()
+                done_dbg = entry["future"].done() if entry is not None else None
             U, in_order = entry["future"].result() if entry is not None else self._stage(ids, pin, resolve, skip_read)
+            if DEBUG:
+                print(f" -- row_table {self.key[-24:]}: lookup ids {tuple(ids.shape)} n {n} U {U} "
+                      f"{'HIT prefetched' if entry is not None else 'MISS inline'}"
+                      f"{' (already done)' if done_dbg else ''}, waited {time.time() - t_dbg:.3f} s "
+                      f"stage_stats {self.stage_stats}", flush = True)
             out = decode(pin.packed[:U].to(device, non_blocking = True), pin, U)
             if not in_order:
                 out = out.index_select(0, pin.inverse[:n].to(device, non_blocking = True))
