@@ -11,6 +11,7 @@ from ..util.tensor import g_tensor_cache
 from ..util.device_copy import to_device
 import os
 import math
+import functools
 
 # Prefill-sized GatedResidual mixes run the tiled deterministic kernel (rank-consistent under
 # TP, see hc_mix_tiled.cu); 0 falls back to the cuBLAS GEMM path
@@ -32,6 +33,12 @@ _HC_FOLD_MAX_R = 32
 _HFMA2_NT_ON = hasattr(ext, "hgemm_hfma2_nt_try") and os.environ.get("EXL3_HC_NT", "1") != "0"
 _HFMA2_NT_MIN_ROWS_PROJ = 1536 if _HFMA2_NT_ON else 1 << 60
 _HFMA2_NT_MIN_ROWS_UP = 192 if _HFMA2_NT_ON else 1 << 60
+
+
+@functools.lru_cache(maxsize = None)
+def _is_sm60(dev_index: int) -> bool:
+    # The NT kernel only exists for sm_60: elsewhere nothing may be allocated for it (the 2060, ROCm)
+    return bool(torch.version.cuda) and torch.cuda.get_device_capability(dev_index) == (6, 0)
 
 
 def hc_flush(params: dict):
@@ -638,7 +645,7 @@ class GatedResidual(Module):
             # (cuBLAS then runs them at ~5 TFLOPs); the NT variant reads them in place. Row thresholds: below them the
             # grid is too small to beat cuBLAS (proj has only ceil(324 / 128) = 3 column tiles)
             dm = None
-            if R >= _HFMA2_NT_MIN_ROWS_PROJ and normed.is_cuda:
+            if R >= _HFMA2_NT_MIN_ROWS_PROJ and normed.is_cuda and _is_sm60(normed.device.index):
                 npad = -(-self.proj_m // 128) * 128
                 buf = torch.empty((R, npad), dtype = torch.half, device = dev)
                 if ext.hgemm_hfma2_nt_try(normed.view(R, H * Dh), self.proj_h[: self.proj_m], buf, _HFMA2_NT_MIN_ROWS_PROJ):
@@ -649,7 +656,7 @@ class GatedResidual(Module):
             if self.use_combine:
                 post.copy_(2.0 * torch.sigmoid(dm[:, self.rank :].float() / H))
             g = None
-            if R >= _HFMA2_NT_MIN_ROWS_UP and normed.is_cuda:
+            if R >= _HFMA2_NT_MIN_ROWS_UP and normed.is_cuda and _is_sm60(normed.device.index):
                 gbuf = torch.empty((R, H * Dh), dtype = torch.half, device = dev)
                 if ext.hgemm_hfma2_nt_try(t, self.up_h, gbuf, _HFMA2_NT_MIN_ROWS_UP):
                     g = gbuf

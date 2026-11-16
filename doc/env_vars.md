@@ -908,7 +908,7 @@ branch of `HyperConnection._mix`) through `ext.hgemm_hfma2_nt`, the HFMA2 GEMM w
 (`b.stride(-1) != 1`), so cuBLAS ran them at ~5 TFLOPs. The `proj` weight has 324 rows; the output is computed into
 a 384-column buffer and the extra columns are ignored. Minimum rows below which cuBLAS stays (P100 microbench,
 `[M, 10240] x [324, 10240]^T` and `[M, 320] x [10240, 320]^T`): `up` 192 (1.8-2.0x faster from M = 256), `proj`
-1536 (0.96x at M = 1024, 2.1-2.2x at M = 2048-4096). Relative RMS against fp32 8.7e-4. `0` keeps cuBLAS; an
+1536 (0.96x at M = 1024, 2.1-2.2x at M = 2048-4096). Relative RMS against fp32 8.7e-4 (fp16 partial sums over 32 k terms, flushed to fp32); no end-to-end logit comparison with the switch on and off has been done yet. `0` keeps cuBLAS; an
 extension built without the kernel falls back automatically.
 
 ### `EXL3_MOE_MTILE` (default: `1`)
@@ -933,13 +933,18 @@ reorders the fp32 k-slice reduction to rounding level). Set to `0` for the singl
 
 ### `EXL3_MOE_MTILE_SM60` (default: `1`)
 
-Lets Pascal (SM 6.0, P100) use the row tiles of `EXL3_MOE_MTILE`. The launcher clamps the 64-row
-request to the 32-row instance there (48 KB shared memory), so experts above 16 rows run through
-the 32-row tile; the fused tier keeps its 16-row-tier capacity (`EXL3_MOE_FUSED_ROWS`). Measured on
-the P100 (Qwen3.8-Flash-Next, cold 4096-token prefill): ~0.8 s less MoE kernel time (~20% of the
-fused kernels). Bit-identical to the single 16-row launch for N = 128 shapes, fp32 rounding for
-N = 256 (`tests/kernels/moe/test_moe_fused_det.py`). `0` restores the 16-row-only path. No effect
-off Pascal or with `EXL3_MOE_MTILE=0`.
+Lets Pascal (SM 6.0, P100) use the row tiles of `EXL3_MOE_MTILE` in the **resident** fused tier. The launcher
+clamps the 64-row request to the 32-row instance there (48 KB shared memory), so experts above 16 rows run through
+the 32-row tile; the tier keeps the 16-row capacity (`EXL3_MOE_FUSED_ROWS`, which must be >= 32 for this path).
+The streamed tier of the CPU split reads `EXL3_MOE_MTILE` directly and is not affected by this switch. Measured on
+the P100 (Qwen3.8-Flash-Next, cold 4096-token prefill), from two profiler runs per arm: the MoE kernels' summed GPU
+time dropped from 4.40 / 4.49 s to 3.67 / 3.59 s; that is the same order as the run-to-run thermal spread, so
+treat it as an estimate until a clock-cycle comparison replicates it. Numerics: with identical group geometry the
+32-row tile is bit-identical to the single 16-row launch for N = 128 shapes, and agrees within 2e-3 of the maximum
+for N = 256 and for the production per-tier geometry (`tests/kernels/moe/test_moe_fused_det.py`); the end-to-end
+logit comparison could not separate the arms from the engine's own run-to-run variation. `0` restores the
+16-row-only resident tier. No effect off Pascal or with `EXL3_MOE_MTILE=0`.
+
 ### `EXL3_MOE_TILE_N` (default: `0` = automatic)
 
 `128` keeps the N = 128 tile shape for the fused kernel's 16-row launches on dims that are

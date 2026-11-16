@@ -164,6 +164,22 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
     // Barriers for group sync
     int* barrier_counters_sense = locks + BARRIER_LOCKS_OFFSET;
 
+#if defined(EXL3_MOE_PROF) && !defined(USE_ROCM)
+    // Phase profile, CUDA only, off unless the extension is built with EXL3_MOE_PROF defined (add
+    // `#define EXL3_MOE_PROF 1` to exl3_moe_common.cuh); read the counters with ext.exl3_moe_prof_read(device, reset).
+    // Note the GEMM slots include the group barriers between row tiles. Thread 0 of every block: cycles since the previous mark, added to slot s of this tile size's
+    // counters. 0 gather, 1 gather barrier, 2 gemm g, 3 barrier, 4 gemm u, 5 barrier, 6 had g/u/d-in, 7 barrier,
+    // 8 gemm d, 9 barrier, 10 had d-out + scatter, 11 end-of-expert barrier, 12 block-experts, 13 block lifetime, 14 rows, 15 experts (per group)
+    unsigned long long* prof = reinterpret_cast<unsigned long long*>(locks + MOE_PROF_OFFSET) + 16 * (M_TILE >= 64 ? 2 : (M_TILE == 32 ? 1 : 0));
+    long long prof_last = clock64();
+    const long long prof_t0 = prof_last;
+    #define PMARK(s) do { if (threadIdx.x == 0) { long long n_ = clock64(); atomicAdd(prof + (s), (unsigned long long)(n_ - prof_last)); prof_last = n_; } } while (0)
+    #define PRESET() do { if (threadIdx.x == 0) prof_last = clock64(); } while (0)
+#else
+    #define PMARK(s) do {} while (0)
+    #define PRESET() do {} while (0)
+#endif
+
     // Expert scheduler state, self-resetting: [0] next ticket, [1] retired groups, [2 + g] ticket for group g
     volatile int* sched = reinterpret_cast<volatile int*>(locks + MOE_SCHED_OFFSET);
 
@@ -195,6 +211,7 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
 
         // Skip if expert is claimed by a different group
         if (expert_idx_assign++ != ticket) continue;
+        PRESET();
 
         // EXL3 weights for g, u, d
         const uint16_t* exp_gate_trellis = gate_trellis[expert_idx];
@@ -236,7 +253,9 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                     0.088388347648f
                 );
             }
+            PMARK(0);
             group_barrier(group_idx, group_size, barrier_counters_sense);
+            PMARK(1);
         };
 
         had_gather_gu_in();
@@ -295,7 +314,9 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                     act_function
                 );
             }
+            PMARK(6);
             group_barrier(group_idx, group_size, barrier_counters_sense);
+            PMARK(7);
         };
 
 #if defined(USE_ROCM)
@@ -335,14 +356,20 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
         if (gated)
         {
             gemm_up(temp_state_g, temp_intermediate_g, exp_gate_trellis, K_gate);
+            PMARK(2);
             group_barrier(group_idx, group_size, barrier_counters_sense);
+            PMARK(3);
         }
         gemm_up(temp_state_u, temp_intermediate_u, exp_up_trellis, K_up);
+        PMARK(4);
         group_barrier(group_idx, group_size, barrier_counters_sense);
+        PMARK(5);
         had_guad();
         gemm_down(temp_intermediate_g, temp_state_g, exp_down_trellis, K_down);
+        PMARK(8);
 #endif
         group_barrier(group_idx, group_size, barrier_counters_sense);
+        PMARK(9);
 
         // Output hadamard for d + scatter add
         auto had_d_out = [&]()
@@ -389,6 +416,7 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
         };
 
         had_d_out();
+        PMARK(10);
 
         // Draw the next ticket and publish it to the group through the end-of-expert barrier, which also protects
         // the temp buffers for reuse. Grabbed tickets continue from num_groups since 0..num_groups-1 are implicit
@@ -401,8 +429,16 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
         __threadfence();
 #endif
         group_barrier(group_idx, group_size, barrier_counters_sense);
+        PMARK(11);
+#if defined(EXL3_MOE_PROF) && !defined(USE_ROCM)
+        if (threadIdx.x == 0) atomicAdd(prof + 12, 1ull);
+        if (block_idx == 0 && threadIdx.x == 0) { atomicAdd(prof + 14, (unsigned long long) token_count); atomicAdd(prof + 15, 1ull); }
+#endif
         ticket = sched[2 + group_idx];
     }
+#if defined(EXL3_MOE_PROF) && !defined(USE_ROCM)
+    if (threadIdx.x == 0) atomicAdd(prof + 13, (unsigned long long)(clock64() - prof_t0));
+#endif
 
     // Retire group; last group out resets the scheduler for the next launch. The acq_rel increment orders each
     // group's earlier ticket grabs before the last group's reset (plain atomics are relaxed, so without this a

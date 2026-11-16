@@ -11,6 +11,7 @@ namespace cg = cooperative_groups;
 #include "bits_k.cuh"
 #include "exl3_devctx.cuh"
 #include <set>
+#include <ATen/ATen.h>
 #if defined(USE_ROCM)
     #include "../rocm/quant/exl3_moe_pipe_instances_rdna.cuh"
     #include "../rocm/quant/exl3_moe_inner_rdna.cuh"   // moe_pipe::smem_launch_bytes
@@ -18,6 +19,23 @@ namespace cg = cooperative_groups;
 #endif
 
 std::set<void*> moe_kernel_attr_set[MAX_DEVICES] = {};
+
+at::Tensor exl3_moe_prof_read(int device, bool reset)
+{
+    TORCH_CHECK(device >= 0 && device < MAX_DEVICES, "exl3_moe_prof_read: bad device");
+    const at::cuda::OptionalCUDAGuard guard(device);
+    cudaDeviceSynchronize();
+    int* locks = DevCtx::instance().get_locks(device);
+    at::Tensor out = at::zeros({3, 16}, at::TensorOptions().dtype(at::kLong));
+    cudaError_t e = cudaMemcpy(out.data_ptr(), locks + MOE_PROF_OFFSET, 3 * 16 * sizeof(long long), cudaMemcpyDeviceToHost);
+    TORCH_CHECK(e == cudaSuccess, "exl3_moe_prof_read: copy failed: ", cudaGetErrorString(e));
+    if (reset)
+    {
+        e = cudaMemset(locks + MOE_PROF_OFFSET, 0, MOE_PROF_INTS * sizeof(int));
+        TORCH_CHECK(e == cudaSuccess, "exl3_moe_prof_read: reset failed: ", cudaGetErrorString(e));
+    }
+    return out;
+}
 
 // EXL3_MOE_TILE_N=128 keeps the N = 128 tile shape for dims that are multiples of 256 (which
 // otherwise take the N = 256 instances); 0 / unset = automatic
@@ -447,9 +465,9 @@ void exl3_moe
         // 16-row tiling by ~20% at 24+ rows per expert (the N = 256 instance stays the faster
         // one for the <= 16-row launch, which the caller issues with m_tile 16)
         TORCH_CHECK(cb_idx == 1, "exl3_moe: row tiles above 16 are instantiated for the mul1 codebook only");
-        TORCH_CHECK(max_tokens_per_expert >= (size_t) m_tile, "exl3_moe: temp buffers hold fewer rows than the tile");
         int eff_m_tile = (int) m_tile;
         if (cc == CC_PASCAL && eff_m_tile > 32) eff_m_tile = 32;
+        TORCH_CHECK(max_tokens_per_expert >= (size_t) eff_m_tile, "exl3_moe: temp buffers hold fewer rows than the tile");
         if (half_k)
             kernel = eff_m_tile >= 64 ? exl3_moe_kernel_instances_h_m64[K - 1] : exl3_moe_kernel_instances_h_m32[K - 1];
         else

@@ -21,6 +21,16 @@
     #define EXL3_GRID_BARRIER_INTS 2
 #endif
 
+// Optional MoE kernel phase profile (EXL3_MOE_PROF): 3 tile sizes x 16 unsigned long long counters, after the scheduler
+// state (and the ROCm grid barrier). Always allocated, only written by builds that define EXL3_MOE_PROF
+#if defined(USE_ROCM)
+    #define MOE_PROF_OFFSET (MOE_SCHED_OFFSET + MOE_SCHED_INTS + EXL3_GRID_BARRIER_INTS)
+#else
+    #define MOE_PROF_OFFSET (MOE_SCHED_OFFSET + MOE_SCHED_INTS)
+#endif
+#define MOE_PROF_INTS 128
+static_assert(MOE_PROF_OFFSET % 2 == 0, "the 64-bit profile counters need 8-byte alignment");
+
 // Workspace size
 #define WORKSPACE_SIZE (16*1024*1024)
 

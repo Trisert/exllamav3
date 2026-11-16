@@ -5,6 +5,10 @@
 
 int exl3_moe_max_concurrency(int device);
 
+// Phase profile counters of a build with EXL3_MOE_PROF (all zero otherwise): int64 [3, 16], rows = 16 / 32 / 64-row tile
+// instances, see exl3_moe_kernel.cuh for the slots. reset zeroes them after the read
+at::Tensor exl3_moe_prof_read(int device, bool reset);
+
 void exl3_moe
 (
     const at::Tensor& hidden_state,

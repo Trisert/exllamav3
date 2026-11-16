@@ -328,6 +328,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
     m.def("blocksparse_mlp_routing", &blocksparse_mlp_routing, "blocksparse_mlp_routing");
     m.def("exl3_moe_max_concurrency", &exl3_moe_max_concurrency, "exl3_moe_max_concurrency");
+    m.def("exl3_moe_prof_read", &exl3_moe_prof_read, "exl3_moe_prof_read", py::arg("device"), py::arg("reset") = true);
     m.def("exl3_moe", &exl3_moe, "exl3_moe");
     m.def("exl3_moe_gather", &exl3_moe_gather, "exl3_moe_gather");
     m.def("exl3_moe_coop", &exl3_moe_coop, "exl3_moe_coop");
