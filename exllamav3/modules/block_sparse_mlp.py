@@ -745,8 +745,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             if self.support_fused:
                 dev_idx = torch.device(device).index or 0
                 cc = torch.cuda.get_device_capability(dev_idx) if not torch.version.hip else (0, 0)
-                self.mtile_ok = MTILE and bool(self.multi_up.mul1) and cc >= (7, 0)
-                self.fused_rows = FUSED_ROWS_WIDE if self.mtile_ok else TEMP_ROWS_FUSED
+                pascal_mtile = cc == (6, 0) and os.environ.get("EXL3_MOE_MTILE_SM60", "0") == "1"
+                self.mtile_ok = MTILE and bool(self.multi_up.mul1) and (cc >= (7, 0) or pascal_mtile)
+                # Pascal: the launcher clamps tiles to 32 rows, buffers stay at the 16-row tier's capacity
+                self.fused_rows = FUSED_ROWS_WIDE if (self.mtile_ok and not pascal_mtile) else TEMP_ROWS_FUSED
                 R = self.fused_rows
                 C = ext.exl3_moe_max_concurrency(torch.device(device).index)
                 self.fused_mode_buffers = FusedBuffers(
