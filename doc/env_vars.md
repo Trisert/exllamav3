@@ -930,6 +930,17 @@ all-fused fast path (no host-side counts) keep the single launch. Outputs are bi
 the 16-row tiling at equal group geometry (per-launch active counts widen the groups, which
 reorders the fp32 k-slice reduction to rounding level). Set to `0` for the single launch.
 
+### `EXL3_MOE_DEFER_TAIL` (default: `0`)
+
+CPU-split MoE prefill (streamed path). By default the CPU-expert tail of a layer is collected inline: the stream
+waits on the worker's done flag, reads the tail back and merges it before the layer's resident-expert GPU work is
+queued. With this on, `submit_prefill` returns the tail as a pending and `cpu_split_combine` collects it after the
+resident work is queued, so the flag wait no longer sits in front of that work. The merge is the same ops in the same
+order as the inline collect (`out.index_add_(0, tidx, out_t)`). Measured prefill gain at 2304 tokens: +4% to +13% over
+two A/Bs; the logits stay within the engine's run-to-run noise. Safety: at most one tail is open at a time (layers run
+in sequence and each combines before returning). If a caller never collects it (an exception between issue and
+combine), the host reads it back and drops the result before the next submit, so the slots' consumed flags are
+released instead of hanging the next prefill (`tests/moe_cpu/test_defer_tail_abandon.py`).
 
 ### `EXL3_MOE_MTILE_SM60` (default: `1`)
 

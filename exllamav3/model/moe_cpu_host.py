@@ -142,6 +142,7 @@ class MoeCpuTuning:
         # EXL3_MOE_DEFER_TAIL=1: streamed prefill leaves the CPU tail's flag wait / readback / merge to
         # cpu_split_combine, after the layer's resident-expert GPU work is queued (runtime-toggleable)
         self.defer_tail = os.environ.get("EXL3_MOE_DEFER_TAIL", "0") != "0"
+        self._deferred_open = None   # the one deferred tail not yet collected (see _drain_abandoned_tail)
         self.batch_experts = max(1, min(
             int(os.environ.get("EXL3_MOE_STREAM_BATCH_EXPERTS", 24)), MOE_JOB_MAX_EXPERTS))
 
@@ -1427,6 +1428,7 @@ class MoeCpuHost:
         stream; returns the (asynchronously filled) float output tensor. Never synchronizes the
         host with the stream.
         """
+        self._drain_abandoned_tail()
         # Device guard: the flag kernels launch on the *current* device's current stream, which
         # need not match the layer's device (e.g. a model loaded entirely on cuda:1)
         with torch.cuda.device(y.device):
@@ -1464,6 +1466,7 @@ class MoeCpuHost:
         the caller can enqueue its own GPU expert work in between. That work then executes
         concurrently with the worker instead of behind the flag wait.
         """
+        self._drain_abandoned_tail()
         with torch.cuda.device(y.device):
             spec = self.specs[layer_idx]
             h = y.shape[1]
@@ -1494,6 +1497,7 @@ class MoeCpuHost:
         back to the copy path). selected_experts must hold RAW router ids here; translation
         (dynamic map or static tail offset) happens inside the kernel.
         """
+        self._drain_abandoned_tail()
         rows = y.shape[0]
         spec = self.specs[layer_idx]
         if rows > self.cap_rows or not (y.is_contiguous() and routing_weights.is_contiguous()):
@@ -1967,6 +1971,7 @@ class MoeCpuHost:
         enqueues its other GPU work first, so the stream is not parked on the worker's done flag while
         work that does not depend on the tail is still unqueued.
         """
+        self._drain_abandoned_tail()
         spec = self.specs[layer_idx]
         rows = y.shape[0]
         if (rows < self.stream_min_rows or spec.get("expert_bytes") is None
@@ -2003,9 +2008,25 @@ class MoeCpuHost:
         """Second half of submit_prefill(defer_tail = True): enqueue the flag wait and readback of the
         CPU tail jobs and merge them into the output (same ops, same order as the inline collect)"""
         tail_jobs, out_t, rtmp, tidx, h, out, dev = pending
+        if getattr(self, "_deferred_open", None) is pending:
+            self._deferred_open = None
         with torch.cuda.device(dev):
             self._collect_compute(tail_jobs, out_t, rtmp, h)
             out.index_add_(0, tidx, out_t)
+
+    def _drain_abandoned_tail(self):
+        """A deferred tail whose caller never reached collect_deferred_tail (an exception between issue and combine:
+        OOM, Ctrl-C, a failed layer) leaves its slots' consumed flags unpublished, and the next job on those slots
+        waits on them forever (the memops wait has no abort). At most one tail is ever open (layers run in sequence
+        and each combines before returning), so any open one at the next submit is abandoned: read it back to
+        release the flags and drop the result"""
+        pending = getattr(self, "_deferred_open", None)
+        if pending is None:
+            return
+        self._deferred_open = None
+        tail_jobs, out_t, rtmp, tidx, h, out, dev = pending
+        with torch.cuda.device(dev):
+            self._collect_compute(tail_jobs, out_t, rtmp, h)
 
     def _stream_fused_t(self, spec, aux, h):
         """Fused-kernel row capacity for a streamed layer, 0 when the layer isn't eligible
@@ -2361,7 +2382,9 @@ class MoeCpuHost:
         # its own GPU work is queued (collect_deferred_tail)
         if tail_jobs:
             if defer_tail:
-                return out, (tail_jobs, out_t, rtmp, tidx, h, out, y.device)
+                pending = (tail_jobs, out_t, rtmp, tidx, h, out, y.device)
+                self._deferred_open = pending
+                return out, pending
             self._collect_compute(tail_jobs, out_t, rtmp, h)
             out.index_add_(0, tidx, out_t)
         return (out, None) if defer_tail else out
@@ -2411,6 +2434,7 @@ class MoeCpuHost:
         self.next_slot = self.next_wslot = 0
         self.slot_last_seq = [0] * MOE_MAX_SLOTS
         self.wslot_prev_seq = [0] * MOE_MAX_WSLOTS
+        self._deferred_open = None
         cleanupper.unregister_atexit(self.shutdown)
         if self.conn is not None:
             try:
