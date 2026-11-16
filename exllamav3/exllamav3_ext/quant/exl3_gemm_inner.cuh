@@ -57,9 +57,25 @@ void exl3_gemm_kernel_inner
     int* __restrict__ locks,
     const half* post_scale,
     int size_n_stride = 0     // full width of B and C when computing a column slice (0: = size_n)
+#if defined(EXL3_MOE_PROF) && !defined(USE_ROCM)
+    , unsigned long long* prof_in = nullptr   // MoE phase profile, see exl3_moe_kernel.cuh (null: off)
+#endif
 )
 {
     const int TILEBLOCKS_M = TILESIZE_M / 16;
+#if defined(EXL3_MOE_PROF) && !defined(USE_ROCM)
+    // Main-loop stage marks (thread 0): 0 issue cp.async, 1 wait + __syncthreads, 2 matmul issue, 3 reduce,
+    // 4 load_frags (dequant + __syncthreads), 5 stages. The stages overlap in flight: a mark measures what thread 0
+    // spent between two points, so asynchronous work shows up in the phase that waits for it
+    long long pm_last = clock64();
+    #define PM(s) do { if (prof_in && threadIdx.x == 0) { long long n_ = clock64(); atomicAdd(prof_in + (s), (unsigned long long)(n_ - pm_last)); pm_last = n_; } } while (0)
+    #define PM_RESET() do { pm_last = clock64(); } while (0)
+    #define PM_COUNT() do { if (prof_in && threadIdx.x == 0) atomicAdd(prof_in + 5, 1ull); } while (0)
+#else
+    #define PM(s) do {} while (0)
+    #define PM_RESET() do {} while (0)
+    #define PM_COUNT() do {} while (0)
+#endif
     if (size_n_stride == 0) size_n_stride = size_n;
     // Column blocks of the full-width B row: slices index B relative to their own column offset,
     // but a k-tile row still spans the whole matrix
@@ -993,27 +1009,31 @@ void exl3_gemm_kernel_inner
     if constexpr (FRAG_STAGES > 1)
         load_frags(0);
 
+    PM_RESET();
+
     // Main loop. Fragments are double buffered to allow more interleaving. This is especially important to hide the
     // dequantization overhead, but we need two different iterations of the main loop to avoid confusing the compiler
     // and making it (sometimes) place the fragment arrays in local memory
 
     #define FSTAGE_OLD(_load, _mul) \
-        async_load_gl(); \
-        wait_stage(); \
-        load_frags(_load); \
-        matmul(_mul); \
+        async_load_gl(); PM(0); \
+        wait_stage(); PM(1); \
+        load_frags(_load); PM(4); \
+        matmul(_mul); PM(2); \
         if (slice2_k == tiles_k - 1 || slice2_iters == 1) { reduce(); slice2_k0 = slice2_k + 1; } \
+        PM(3); PM_COUNT(); \
         advance2(); \
         if (!slice2_iters) break; \
 
     #define FSTAGE(_load, _mul) \
-        async_load_gl(); \
-        wait_stage(); \
-        matmul(_mul); \
+        async_load_gl(); PM(0); \
+        wait_stage(); PM(1); \
+        matmul(_mul); PM(2); \
         if (slice2_k == tiles_k - 1 || slice2_iters == 1) { reduce(); slice2_k0 = slice2_k + 1; } \
+        PM(3); PM_COUNT(); \
         advance2(); \
         if (!slice2_iters) break; \
-        load_frags(_load); \
+        load_frags(_load); PM(4); \
 
     if constexpr (FRAG_STAGES == 1)
     {

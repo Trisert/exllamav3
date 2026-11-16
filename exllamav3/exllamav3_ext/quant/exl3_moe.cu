@@ -26,8 +26,8 @@ at::Tensor exl3_moe_prof_read(int device, bool reset)
     const at::cuda::OptionalCUDAGuard guard(device);
     cudaDeviceSynchronize();
     int* locks = DevCtx::instance().get_locks(device);
-    at::Tensor out = at::zeros({3, 16}, at::TensorOptions().dtype(at::kLong));
-    cudaError_t e = cudaMemcpy(out.data_ptr(), locks + MOE_PROF_OFFSET, 3 * 16 * sizeof(long long), cudaMemcpyDeviceToHost);
+    at::Tensor out = at::zeros({72}, at::TensorOptions().dtype(at::kLong));
+    cudaError_t e = cudaMemcpy(out.data_ptr(), locks + MOE_PROF_OFFSET, 72 * sizeof(long long), cudaMemcpyDeviceToHost);
     TORCH_CHECK(e == cudaSuccess, "exl3_moe_prof_read: copy failed: ", cudaGetErrorString(e));
     if (reset)
     {

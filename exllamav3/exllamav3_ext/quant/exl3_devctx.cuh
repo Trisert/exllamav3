@@ -28,7 +28,7 @@
 #else
     #define MOE_PROF_OFFSET (MOE_SCHED_OFFSET + MOE_SCHED_INTS)
 #endif
-#define MOE_PROF_INTS 128
+#define MOE_PROF_INTS 256
 static_assert(MOE_PROF_OFFSET % 2 == 0, "the 64-bit profile counters need 8-byte alignment");
 
 // Workspace size

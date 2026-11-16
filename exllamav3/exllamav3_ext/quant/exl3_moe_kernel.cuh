@@ -40,11 +40,18 @@ void moe_gemm_tile
     const int size_n,
     int* __restrict__ locks,
     const int K
+#if defined(EXL3_MOE_PROF) && !defined(USE_ROCM)
+    , unsigned long long* prof_in = nullptr
+#endif
 )
 {
     // Fragment pipeline depth: the 64-row tile keeps two B stages so its A fragments fit
     constexpr int FS = (MT >= 64) ? 2 : MOE_FRAG_STAGES;
+#if defined(EXL3_MOE_PROF) && !defined(USE_ROCM)
+    #define ARGS in_addr, trellis, out_addr, MIN(size_m, MT), size_k, size_n, locks, nullptr, 0, prof_in
+#else
     #define ARGS in_addr, trellis, out_addr, MIN(size_m, MT), size_k, size_n, locks, nullptr
+#endif
     #define SHAPE_ARGS MT, MOE_TILESIZE_K, N_TILE, MOE_SH_STAGES, FS
     // Compile-time rate: t_bits, or t_bits + 0.5 with t_half (mul1 codebook only). Otherwise the runtime K
     // arrives in half-bit units (2 * bits + half, see bits_k.cuh): even = integer rates, odd = the
@@ -175,9 +182,13 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
     const long long prof_t0 = prof_last;
     #define PMARK(s) do { if (threadIdx.x == 0) { long long n_ = clock64(); atomicAdd(prof + (s), (unsigned long long)(n_ - prof_last)); prof_last = n_; } } while (0)
     #define PRESET() do { if (threadIdx.x == 0) prof_last = clock64(); } while (0)
+    // Main-loop sub-profile of the GEMM tile (exl3_gemm_inner.cuh PM marks), 8 counters per tile size after the phase counters
+    unsigned long long* const prof_sub = reinterpret_cast<unsigned long long*>(locks + MOE_PROF_OFFSET) + 48;
+    #define PSUB(mt) , prof_sub + 8 * ((mt) >= 64 ? 2 : ((mt) == 32 ? 1 : 0))
 #else
     #define PMARK(s) do {} while (0)
     #define PRESET() do {} while (0)
+    #define PSUB(mt)
 #endif
 
     // Expert scheduler state, self-resetting: [0] next ticket, [1] retired groups, [2 + g] ticket for group g
@@ -272,18 +283,18 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                 int tm;
                 if constexpr (M_TILE >= 64)
                 {
-                    if (size_m > 32)      { moe_gemm_tile<t_bits, cb, 64, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 64; }
-                    else if (size_m > 16) { moe_gemm_tile<t_bits, cb, 32, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 32; }
-                    else                  { moe_gemm_tile<t_bits, cb, 16, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16; }
+                    if (size_m > 32)      { moe_gemm_tile<t_bits, cb, 64, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K PSUB(64)); tm = 64; }
+                    else if (size_m > 16) { moe_gemm_tile<t_bits, cb, 32, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K PSUB(32)); tm = 32; }
+                    else                  { moe_gemm_tile<t_bits, cb, 16, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K PSUB(16)); tm = 16; }
                 }
                 else if constexpr (M_TILE == 32)
                 {
-                    if (size_m > 16)      { moe_gemm_tile<t_bits, cb, 32, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 32; }
-                    else                  { moe_gemm_tile<t_bits, cb, 16, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16; }
+                    if (size_m > 16)      { moe_gemm_tile<t_bits, cb, 32, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K PSUB(32)); tm = 32; }
+                    else                  { moe_gemm_tile<t_bits, cb, 16, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K PSUB(16)); tm = 16; }
                 }
                 else
                 {
-                    moe_gemm_tile<t_bits, cb, 16, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16;
+                    moe_gemm_tile<t_bits, cb, 16, MOE_TILESIZE_N, t_half>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K PSUB(16)); tm = 16;
                 }
                 in_addr += tm * size_k;
                 out_addr += tm * size_n;
