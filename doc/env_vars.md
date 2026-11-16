@@ -919,6 +919,16 @@ all-fused fast path (no host-side counts) keep the single launch. Outputs are bi
 the 16-row tiling at equal group geometry (per-launch active counts widen the groups, which
 reorders the fp32 k-slice reduction to rounding level). Set to `0` for the single launch.
 
+
+### `EXL3_MOE_MTILE_SM60` (default: `1`)
+
+Lets Pascal (SM 6.0, P100) use the row tiles of `EXL3_MOE_MTILE`. The launcher clamps the 64-row
+request to the 32-row instance there (48 KB shared memory), so experts above 16 rows run through
+the 32-row tile; the fused tier keeps its 16-row-tier capacity (`EXL3_MOE_FUSED_ROWS`). Measured on
+the P100 (Qwen3.8-Flash-Next, cold 4096-token prefill): ~0.8 s less MoE kernel time (~20% of the
+fused kernels). Bit-identical to the single 16-row launch for N = 128 shapes, fp32 rounding for
+N = 256 (`tests/kernels/moe/test_moe_fused_det.py`). `0` restores the 16-row-only path. No effect
+off Pascal or with `EXL3_MOE_MTILE=0`.
 ### `EXL3_MOE_TILE_N` (default: `0` = automatic)
 
 `128` keeps the N = 128 tile shape for the fused kernel's 16-row launches on dims that are
