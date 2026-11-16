@@ -900,6 +900,17 @@ pages (`MFD_HUGETLB`) of that size instead of shmem. Requires reserved huge page
 (`vm.nr_hugepages`, or `hugepages-1048576kB` for `1g`) covering the whole arena; allocation
 fails with a clear error otherwise. Rejected on Windows.
 
+### `EXL3_HC_NT` (default: `1`)
+
+Pascal (SM 6.0) only: runs the hyper-connection mix GEMMs of the prefill path (`proj_h` and `up_h`, the cuBLAS
+branch of `HyperConnection._mix`) through `ext.hgemm_hfma2_nt`, the HFMA2 GEMM with the weight in its natural
+`[N][K]` layout. The weights are stored that way and reach the old kernel as transposed views, which it refuses
+(`b.stride(-1) != 1`), so cuBLAS ran them at ~5 TFLOPs. The `proj` weight has 324 rows; the output is computed into
+a 384-column buffer and the extra columns are ignored. Minimum rows below which cuBLAS stays (P100 microbench,
+`[M, 10240] x [324, 10240]^T` and `[M, 320] x [10240, 320]^T`): `up` 192 (1.8-2.0x faster from M = 256), `proj`
+1536 (0.96x at M = 1024, 2.1-2.2x at M = 2048-4096). Relative RMS against fp32 8.7e-4. `0` keeps cuBLAS; an
+extension built without the kernel falls back automatically.
+
 ### `EXL3_MOE_MTILE` (default: `1`)
 
 Row tiles for the fused MoE prefill kernel. The kernel dequantizes each expert's weights once

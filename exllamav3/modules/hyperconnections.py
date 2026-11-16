@@ -26,6 +26,13 @@ _gr_mix3 = int(os.environ.get("EXL3_GR_MIX3", "-1"))
 _hc_fold = HC_FOLD
 _HC_FOLD_MAX_R = 32
 
+# Prefill mix GEMMs on sm_60 through the NT HFMA2 kernel (hgemm_f16acc.cu); minimum rows below which cuBLAS is faster
+# (measured on the P100: up wins from 256 rows, proj from ~1536). EXL3_HC_NT=0, or an extension without the kernel,
+# keeps cuBLAS everywhere
+_HFMA2_NT_ON = hasattr(ext, "hgemm_hfma2_nt_try") and os.environ.get("EXL3_HC_NT", "1") != "0"
+_HFMA2_NT_MIN_ROWS_PROJ = 1536 if _HFMA2_NT_ON else 1 << 60
+_HFMA2_NT_MIN_ROWS_UP = 192 if _HFMA2_NT_ON else 1 << 60
+
 
 def hc_flush(params: dict):
     """Run a deferred HyperConnection.apply_ (held in params["hc_pending"]) before anything other than the
@@ -627,11 +634,27 @@ class GatedResidual(Module):
             normed = torch.empty((R * H, Dh), dtype = torch.half, device = dev)
             ext.rms_norm(s3.view(R * H, Dh), self.w_h, normed,
                          self.rms_eps, 0.0, 1.0, False, False, H)
-            dm = torch.matmul(normed.view(R, H * Dh), self.proj_h[: self.proj_m].t())  # (R, rank [+ H])
+            # Pascal: the weights are stored [N][K], which the stride-1-B HFMA2 GEMM cannot take as a transposed view
+            # (cuBLAS then runs them at ~5 TFLOPs); the NT variant reads them in place. Row thresholds: below them the
+            # grid is too small to beat cuBLAS (proj has only ceil(324 / 128) = 3 column tiles)
+            dm = None
+            if R >= _HFMA2_NT_MIN_ROWS_PROJ and normed.is_cuda:
+                npad = -(-self.proj_m // 128) * 128
+                buf = torch.empty((R, npad), dtype = torch.half, device = dev)
+                if ext.hgemm_hfma2_nt_try(normed.view(R, H * Dh), self.proj_h[: self.proj_m], buf, _HFMA2_NT_MIN_ROWS_PROJ):
+                    dm = buf[:, : self.proj_m]
+            if dm is None:
+                dm = torch.matmul(normed.view(R, H * Dh), self.proj_h[: self.proj_m].t())  # (R, rank [+ H])
             t = F.silu(dm[:, : self.rank] / H)
             if self.use_combine:
                 post.copy_(2.0 * torch.sigmoid(dm[:, self.rank :].float() / H))
-            g = torch.matmul(t, self.up_h.t())                             # (R, H * Dh)
+            g = None
+            if R >= _HFMA2_NT_MIN_ROWS_UP and normed.is_cuda:
+                gbuf = torch.empty((R, H * Dh), dtype = torch.half, device = dev)
+                if ext.hgemm_hfma2_nt_try(t, self.up_h, gbuf, _HFMA2_NT_MIN_ROWS_UP):
+                    g = gbuf
+            if g is None:
+                g = torch.matmul(t, self.up_h.t())                         # (R, H * Dh)
             mixed = (torch.sigmoid(g.float()).view(R, H, Dh)
                      * normed.float().view(R, H, Dh)).mean(dim = -2).half()
         return post, mixed
