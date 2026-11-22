@@ -366,6 +366,16 @@ the GEMV reaches 440-490 GB/s on 2048 x 4096..8192 projections and 588 GB/s on t
 fp16 read runs at 593 GB/s on this card), and 280-300 GB/s of 317 on the RTX 2060.
 `0` keeps cuBLAS, `1` forces it on any CUDA device.
 
+### `EXL3_HGEMV_GRAPH` (default: `1`)
+
+Split-K scratch of the fp16 GEMV above inside CUDA graph captures. The scratch is kept per (device, stream) and a
+capture stream is new, so before this every split-K call inside a decode graph silently fell back to cuBLAS (the
+LFM3 headwise attention gate, 2048 -> 16: cuBLAS gemv2N ~18 us vs ~7 us on the P100). With `1` a per-device set is
+allocated beside the first eager one and captured launches use it. LFM3-1.7B 8.0bpw on the P100: 126.5-126.8 ->
+127.4-127.6 t/s at depth 512, greedy output unchanged; neutral on the RTX 2060. Also applies to the fused router
+top-k (`EXL3_ROUTER_FUSED`) and other fp16 linears at <= 4 rows inside graphs (not measured on other models). `0`
+restores the cuBLAS fallback inside captures.
+
 ### `EXL3_FP16_LINEAR_HFMA2` (default: `1`, sm_60 only)
 
 On sm_60, `LinearFP16` calls with more than 4 rows (prefill) go through `hgemm_recon`, the HFMA2 GEMM of

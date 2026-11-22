@@ -121,3 +121,27 @@ def test_hgemv_rejects_uncovered(device):
         ext.hgemv_f16(x, w, y, 0)
     ext.hgemm(x, w, y)   # falls back to cuBLAS
     assert (y.float() - x.float() @ w.float()).abs().max().item() < 0.05
+
+
+@pytest.mark.parametrize("K,N", [(2048, 16), (2048, 512), (7680, 64)])
+@torch.inference_mode()
+def test_hgemm_in_graph_takes_gemv(device, K, N):
+    """A split-K hgemm captured in a CUDA graph (fresh capture stream) uses the per-device graph scratch instead of
+    falling back to cuBLAS: every replay is bit-identical to the eager GEMV, and the counters stay clean across replays"""
+    if not _default_on(device):
+        pytest.skip("hgemv is off by default on this architecture")
+    torch.manual_seed(7)
+    x = torch.randn((1, K), device = device, dtype = torch.half)
+    w = torch.randn((K, N), device = device, dtype = torch.half) * 0.02
+    ref = torch.empty((1, N), device = device, dtype = torch.half)
+    ext.hgemv_f16(x, w, ref, 0)            # eager: allocates the per-device graph set as well
+    torch.cuda.synchronize(device)
+    y = torch.empty((1, N), device = device, dtype = torch.half)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ext.hgemm(x, w, y)
+    for i in range(3):
+        y.zero_()
+        graph.replay()
+        torch.cuda.synchronize(device)
+        assert torch.equal(y, ref), f"replay {i}: graph hgemm differs from the eager GEMV (cuBLAS fallback?)"

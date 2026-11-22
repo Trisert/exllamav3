@@ -79,6 +79,27 @@ glue ~1.7 ms: paged attention 0.58, norms 0.40, cuBLAS gemv2N 0.20, rope 0.12, c
   8.0k and 13.8k tokens, needle at 10 / 50 / 90 %.
 - Greedy oracle / decode ppl: see round 1.
 
+### Round 3 — E6 ACCEPTED (hgemv split-K scratch inside graph captures)
+The cuBLAS gemv2N (P100) / gemvx + splitKreduce (2060) at 11 calls per token was the headwise attention gate
+(`g_proj`, LinearFP16 2048 -> 16): eager it takes hgemv (~7 us), but hgemv keeps its split-K scratch per (device,
+stream) and refuses to allocate during a capture, so inside the decode graphs it fell back to cuBLAS (~18 us on the
+P100). Fix in hgemv_f16.cu: a per-device scratch set, allocated beside the first eager one, used by captured launches
+(`EXL3_HGEMV_GRAPH=0` = old behaviour). New test tests/kernels/gemm/test_hgemv_f16.py::test_hgemm_in_graph_takes_gemv
+(98 passed on both cards; with EXL3_HGEMV_GRAPH=0 the 2048 x 16 case fails).
+| arm | d512 greedy | d8192 greedy |
+|---|---:|---:|
+| P100 ctl a | 126.8 | 117.7 |
+| P100 E6 | **127.6** | **118.3** |
+| P100 ctl b | 126.5 | 117.4 |
+| P100 E6 repeat | **127.4** | 117.8 |
+| 2060 ctl a / E6 / ctl b / E6 | 130.9 / 130.7 / 130.6 / 130.5 | 118.5 / 117.9 / 117.9 / 117.9 |
+P100 +0.7 % (smaller than the 0.11 ms the kernel times suggested), 2060 neutral (its cuBLAS gemvx was already ~2.5 us).
+Greedy-128 oracles identical to round 1 on both cards (128/128). Side effect, not measured: the same capture fallback
+hit the fused router top-k and every other fp16 linear at <= 4 rows inside graphs (MoE routers of QNF / Qwen3.6).
+
+Lever 2 (one launch for k + v) cannot be done by concatenating the weights: each EXL3 tensor has its own input
+Hadamard signs (suh), so it needs a multi-matrix GEMV kernel.
+
 ## STATUS (2026-11-22)
 | metric | baseline | now | floor (copy BW) |
 |---|---:|---:|---:|
@@ -102,8 +123,7 @@ What limits further gains:
   ceiling (~137-149 t/s).
 
 Remaining levers, ranked (estimated gain / cost):
-1. P100: per-head attention gate `gate_proj` (2048 -> 16, fp16, cuBLAS gemv2N 11 x ~18 us = 0.20 ms) as a tiny custom
-   kernel or folded into the q GEMV: ~2 %, half a day.
+1. (done, round 3: +0.7 % on the P100) per-head attention gate on cuBLAS inside graphs.
 2. P100: multi-matrix GEMV for the q/k/v bundle (one launch for 2048 x (2048 + 512 + 512)) to cut the fixed latency of
    the small shapes (~0.3 ms): ~3-4 %, 1-2 days.
 3. P100: K=8 GEMV inner loop (instruction count per weight, HFMA2): the big one (up to ~1.5-2x on 6.5 ms), multi-day
