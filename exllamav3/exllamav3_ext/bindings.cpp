@@ -123,6 +123,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         py::arg("constant_bias"), py::arg("constant_scale"), py::arg("span_heads"),
         py::arg("add_residual"), py::arg("w_groups") = 1);
     m.def("rms_norm_res_in", &rms_norm_res_in, "rms_norm_res_in");
+    m.def("rms_norm_post_pre", &rms_norm_post_pre, "rms_norm_post_pre");
     m.def("gated_rms_norm", &gated_rms_norm, "gated_rms_norm");
     m.def("softcap", &softcap, "softcap");
     m.def("sparse_head_argmax", &sparse_head_argmax, "sparse_head_argmax");

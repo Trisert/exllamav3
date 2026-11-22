@@ -1,11 +1,15 @@
 from __future__ import annotations
 from typing_extensions import override
+import os
 import torch
 from torch import nn
 from ..model.config import Config
 from . import Module
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
+
+# Post-norm + next pre-norm in one launch (RMSNorm.forward_post_pre); 0 = two launches
+_POST_PRE = os.environ.get("EXL3_NORM_POST_PRE", "1") != "0"
 
 class RMSNorm(Module):
 
@@ -101,6 +105,32 @@ class RMSNorm(Module):
             x.is_contiguous() and y.is_contiguous() and
             x.shape[-1] % 4 == 0
         )
+
+    def can_fuse_post_pre(self, nxt, x: torch.Tensor, r: torch.Tensor, params: dict) -> bool:
+        """
+        True if this post-norm (r += norm(x) * w) and the pre-norm nxt that reads r next (fp16 out) can run as one
+        launch (forward_post_pre). EXL3_NORM_POST_PRE=0 keeps two launches
+        """
+        return (
+            _POST_PRE and isinstance(nxt, RMSNorm) and
+            not self.span_heads and not nxt.span_heads and self.groups == 1 and nxt.groups == 1 and
+            (self.weight is None or nxt.weight is None or self.weight.dtype == nxt.weight.dtype) and
+            x.dtype in (torch.half, torch.float) and r.dtype in (torch.half, torch.float) and
+            x.is_contiguous() and r.is_contiguous() and x.shape == r.shape and
+            x.shape[-1] % 4 == 0 and x.shape[-1] // 4 <= 1024 and
+            not params.get("export_state_norm_keys")
+        )
+
+    def forward_post_pre(self, x: torch.Tensor, residual: torch.Tensor, nxt, params) -> torch.Tensor:
+        """residual += self(x) in place, returns nxt(residual) in fp16; bit-identical to the two forwards"""
+        dim = x.shape[-1]
+        out = torch.empty(x.shape, dtype = torch.half, device = x.device)
+        ext.rms_norm_post_pre(
+            x.view(-1, dim), self.weight, residual.view(-1, dim), nxt.weight, out.view(-1, dim),
+            self.rms_norm_eps, self.constant_bias, self.constant_scale,
+            nxt.rms_norm_eps, nxt.constant_bias, nxt.constant_scale,
+        )
+        return out
 
     @override
     def forward(

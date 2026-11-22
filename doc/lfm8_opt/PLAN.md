@@ -260,6 +260,21 @@ conv in_proj ~42, q / o_proj / conv out_proj (2048x2048) ~38, k / v (2048x512) ~
   needle 3/3 at 49.0k tokens (doc/lfm8_opt/needle_p100.sh). At 32k the kernel is still ~3x off the HBM2 floor
   (~173 GB/s per call): instruction count (byte -> fp32 conversion + fp32 FMAs) and occupancy; an HFMA2 inner loop
   would be the next step there.
+- E16 HFMA2 inner loops for the native split kernel — REJECTED (code removed). PRMT byte pairs -> half2 (1024 + b),
+  HSUB2 to the exact b - 128, fp16 runs folded to fp32 per 32-dim score group and per 8 keys of P x V, the 0.5
+  centering from fp32 sums (doc/lfm8_opt/native_err.py: rel max error vs Triton 8e-4, fp32 variant 5e-4). P100,
+  HFMA2 / fp32 / HFMA2 (doc/lfm8_opt/ab_e16.sh): 512 140.2 / 140.4 / 140.0, 8k 134.2 / 135.7 / 134.1, 32k 117.6 /
+  123.2 / 117.1 (-4.7 %); oracle identical, needle 3/3. The per-key fp32 -> half2 conversions of p (4 heads), the
+  half-rate PRMTs and the folds cost more than the halved FMA count saves, and registers grew 94 -> 118.
+- **E17 ACCEPTED: post-norm + next pre-norm in one launch** (`rms_norm_post_pre`, norm.cu; `EXL3_NORM_POST_PRE`).
+  LFM3 has post-norms on both branches: r += norm(y) * w_post then the next sublayer's input = norm(r) * w_pre were
+  two row kernels; one block now does both with the same arithmetic (the second norm reads r as stored), bit-
+  identical: tests/kernels/norm/test_rms_norm_post_pre.py (144, torch.equal vs the two launches). In-block (attn
+  post-norm -> MLP norm) and across blocks (MLP post-norm deferred to the next block's input norm through
+  params["post_pending"], flushed by forward_ls at the end): 47 fused launches per token instead of 94. A/B
+  (doc/lfm8_opt/ab_e17.sh, cand / ctl / cand, depth 512 / 8192): P100 142.4 / 139.3 / 142.7, 137.7 / 135.0 / 137.8
+  (+2.3 / +2.0 %); RTX 2060 129.2 / 127.4 / 128.7, 120.9 / 119.6 / 120.7 (+1.2 / +1.0 %). Greedy oracle identical,
+  max |dlogit| 0.0000.
 
 ## STATUS after rounds 4-5 (final build 60280f40, re-measured)
 | metric | start | now |

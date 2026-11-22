@@ -510,5 +510,8 @@ class Model_LSMixin(ABC):
         pending = params.pop("resid_pending", None)
         if pending is not None:
             x += pending
+        post = params.pop("post_pending", None)
+        if post is not None:
+            post[1].forward(post[0], params, residual = x)
         return x
 

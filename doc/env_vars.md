@@ -309,6 +309,13 @@ identical, needle 3/3 at 49k. `tests/kernels/attention/test_decode_native.py`.
 Split target of the native decode kernel, in multiples of the SM count (the Triton kernel keeps 2). On the P100 4 gained
 1 % at 32k and lost 0.7 % at 512; 8 lost at every depth.
 
+### `EXL3_NORM_POST_PRE` (default: `1`)
+
+Post-norm models (LFM3): the post-norm residual (`r += norm(y) * w`) and the next sublayer's input norm run as one
+launch (`rms_norm_post_pre`), within a block and across blocks (the MLP post-norm is deferred to the next block).
+Bit-identical to the two launches. `0` keeps them separate. LFM3-1.7B 8.0bpw decode: P100 +2.3 % at depth 512, RTX
+2060 +1.2 %. `tests/kernels/norm/test_rms_norm_post_pre.py`.
+
 ### `EXL3_MGEMV` (default: `1`)
 
 Multi-matrix small-m GEMV (`exl3_mgemv_kernel`) for the exl3_mgemm bundles (gate + up, K + V, Q / K / V) at 7 / 8 bpw
