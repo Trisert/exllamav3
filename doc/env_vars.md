@@ -262,6 +262,13 @@ the model-level KL against SDPA is ~1e-3, below the 0.8e-3..5.4e-3 between the f
 cache. The switch is read per call. `1` forces it on any CUDA device (it is HFMA2 / fp32 SIMT code and
 runs from sm_60 up), `0` keeps SDPA.
 
+### `EXL3_FA60_HD128` (default: `1`)
+
+fa60 also takes head_dim 128 (where fa75 does not apply): the same kernel templated on the head dim, 4 rows x 8 columns
+per thread in the P V mapping, two blocks per SM. LFM3-1.7B 8.0bpw prefill on the P100 (6 full-attention layers):
+3184 -> 3504 t/s at 4096 tokens, 2807 -> 3346 at 8k, 2294 -> 3074 at 16k; prefill ppl 11.03238 -> 11.03115, needle
+6/6. `tests/kernels/attention/test_fa60.py` covers both head dims. Read per call; `0` keeps SDPA for head_dim 128.
+
 ### `EXL3_ATTN_LIVE_SPLIT` (default: `1`)
 
 Flash-decoding split of the paged decode attention (`_paged_attn_decode_split_kernel`, also inside the

@@ -1,3 +1,4 @@
+import os
 import torch
 from .common import AttnArgs, AttnFn, get_non_causal_span_arglist
 from ...util.backend import sdpa_prefill, fa75_prefill, fa60_prefill
@@ -160,8 +161,11 @@ def _attend_window(q_b, k_buf, v_buf, total_len, causal, softmax_scale, chunk_si
     or fa60 (sm_60) kernel where it applies (head_dim 256, fp16), else chunked SDPA"""
     seqlen_q, nheads, headdim = q_b.shape
     nheads_k = k_buf.shape[1]
+    # head_dim 128 runs fa60 only (fa75 is 256-only); EXL3_FA60_HD128=0 keeps SDPA for it (read per call)
+    hd128_fa60 = (headdim == 128 and fa60_prefill(q_b.device) and not fa75_prefill(q_b.device) and
+                  os.environ.get("EXL3_FA60_HD128", "1") != "0")
     if (
-        fa75 and headdim == 256 and q_b.dtype == torch.float16 and k_buf.dtype == torch.float16 and
+        fa75 and (headdim == 256 or hd128_fa60) and q_b.dtype == torch.float16 and k_buf.dtype == torch.float16 and
         total_len >= seqlen_q
     ):
         # One fa75 / fa60 call covers every q chunk and the whole GQA group

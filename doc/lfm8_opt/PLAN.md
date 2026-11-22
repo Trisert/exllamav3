@@ -134,6 +134,24 @@ SDPA (6 full-attention layers) 190 ms.
 | 8192 | 2211 / **2796** / 2184 | 3877 / **6156** / 3853 |
 | 16384 | 1885 / **2275** / 1861 | 3568 / **5399** / 3545 |
 
+- E11 ACCEPTED (`EXL3_FA60_HD128`, P100): fa60 templated on head_dim (256 unchanged: same HFMA2 sequence per
+  accumulator), head_dim 128 for the full-attention layers instead of SDPA's SIMT cutlass kernel. Test:
+  test_fa60.py with D = 256 / 128 and 16/4 heads (87 passed). Prefill ppl 11.03238 -> 11.03115 (top-1 4077/4096),
+  needle 6/6. The 2060 is unaffected (fa75 applies there, head_dim 128 keeps SDPA on HMMA).
+
+| P100 prefill t/s (ctl a / E11 / ctl b) | |
+|---|---|
+| 512 | 3050 / 3074 / 2999 |
+| 2048 | 3294 / **3449** / 3257 |
+| 4096 | 3184 / **3504** / 3137 |
+| 8192 | 2807 / **3346** / 2766 |
+| 16384 | 2294 / **3074** / 2262 |
+
+Prefill after E10 + E11 vs the start: P100 2407 -> 3504 t/s at 4096 (+46 %), 1873 -> 3074 at 16k (+64 %); RTX 2060
+4075 -> 6645 (+63 %), 3557 -> 5407 (+52 %). What is left: on the P100 the exl3 reconstruct + HFMA2 GEMMs (~71 % of a
+4k prefill at ~57 % of the fp16 peak); on the 2060 cuBLAS GEMMs on HMMA at ~22.6 TFLOPS average (70 %), close to
+the card.
+
 ## STATUS (2026-11-22)
 | metric | baseline | now | floor (copy BW) |
 |---|---:|---:|---:|

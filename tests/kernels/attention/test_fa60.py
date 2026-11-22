@@ -1,5 +1,5 @@
 """
-fa60 (exllamav3_ext/pascal/fa60.cu): HFMA2 flash-attention prefill kernel for head_dim 256 on Pascal (sm_60),
+fa60 (exllamav3_ext/pascal/fa60.cu): HFMA2 flash-attention prefill kernel for head_dim 256 / 128 on Pascal (sm_60),
 against an fp32 reference and against the SDPA window path it replaces, for prefill chunks appended to a cache
 (bottom-right causal), with and without GQA. The kernel uses only HFMA2 / fp32 SIMT instructions, so it runs on
 every CUDA device from sm_60 up.
@@ -33,14 +33,15 @@ def _rel_err(o, ref):
 
 
 @pytest.mark.parametrize("Tq, Tkv", [(256, 256), (300, 1000), (37, 37), (64, 5000), (1000, 1000), (1, 700), (65, 81)])
-@pytest.mark.parametrize("Hq, Hkv", [(24, 4), (8, 8)])
+@pytest.mark.parametrize("Hq, Hkv", [(24, 4), (8, 8), (16, 4)])
 @pytest.mark.parametrize("causal", [True, False])
-def test_fa60_matches_reference(Tq, Tkv, Hq, Hkv, causal, device):
+@pytest.mark.parametrize("D", [256, 128])
+def test_fa60_matches_reference(Tq, Tkv, Hq, Hkv, causal, D, device):
     gen = torch.Generator(device = device).manual_seed(Tq * 7 + Tkv)
-    q = torch.randn(Tq, Hq, 256, device = device, dtype = torch.half, generator = gen)
-    k = torch.randn(Tkv, Hkv, 256, device = device, dtype = torch.half, generator = gen)
-    v = torch.randn(Tkv, Hkv, 256, device = device, dtype = torch.half, generator = gen)
-    scale = 256 ** -0.5
+    q = torch.randn(Tq, Hq, D, device = device, dtype = torch.half, generator = gen)
+    k = torch.randn(Tkv, Hkv, D, device = device, dtype = torch.half, generator = gen)
+    v = torch.randn(Tkv, Hkv, D, device = device, dtype = torch.half, generator = gen)
+    scale = D ** -0.5
     o = torch.empty_like(q)
     ext.fa60_fwd(q, k, v, o, scale, causal)
     ref = _reference(q, k, v, scale, causal)
