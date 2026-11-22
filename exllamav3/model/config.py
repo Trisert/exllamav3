@@ -78,6 +78,18 @@ class InferParams:
         # loading the model
         self.embed_stream_from_disk = os.environ.get("EXL3_EMBED_STREAM", "0") != "0"
 
+    def qkv_headwise_bundle(self, device) -> bool:
+        # A headwise fp16 attention gate beside the sliced Q / K / V bundle: only where the bundle runs as the
+        # multi-matrix GEMV (Pascal). On the RTX 2060 the bundle takes the tile MGEMM and LFM3-1.7B 8.0bpw decode
+        # lost 4-7 % against the separate GEMVs (131.3 -> 122.6 t/s at depth 512). EXL3_QKV_HEADWISE=0 disables
+        if os.environ.get("EXL3_QKV_HEADWISE", "1") == "0" or os.environ.get("EXL3_MGEMV", "1") == "0":
+            return False
+        import torch
+        device = torch.device(device)
+        if device.type != "cuda" or device.index is None or torch.version.hip:
+            return False
+        return torch.cuda.get_device_capability(device.index)[0] == 6
+
     def use_mgemm(self, K: int, out_features: int, mul1: bool = False, device = None) -> bool:
         # Pre-Volta CUDA parts (Pascal) have a multi-matrix GEMV only for 7 / 8 bpw mul1 (below); elsewhere the fused
         # MGEMM runs the block-pipelined tile

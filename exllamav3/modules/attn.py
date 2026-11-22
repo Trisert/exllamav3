@@ -504,10 +504,10 @@ class Attention(Module):
             self.full_gate and not self.interleaved_gate and
             self.g_proj.quant_type == "exl3" and self.g_proj.inner.bias is None
         )
-        # A headwise gate (one fp16 value per head) stays out of the bundle and runs beside it
-        # (EXL3_QKV_HEADWISE=0 keeps such modules on the separate projections)
+        # A headwise gate (one fp16 value per head) stays out of the bundle and runs beside it, where the bundle
+        # takes the multi-matrix GEMV (see qkv_headwise_bundle)
         if self.g_proj is not None and getattr(self, "headwise_gate", False) and \
-                os.environ.get("EXL3_QKV_HEADWISE", "1") != "0":
+                self.config.infer_params.qkv_headwise_bundle(device):
             gate_ok = True
         self.qkv_gate_slice = self.g_proj is not None and not getattr(self, "headwise_gate", False)
         if self.interleaved_gate and not (self.head_dim % 8 == 0 and self.g_proj is None):

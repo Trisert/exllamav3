@@ -211,10 +211,23 @@ conv in_proj ~42, q / o_proj / conv out_proj (2048x2048) ~38, k / v (2048x512) ~
   Tests: tests/kernels/gemm/test_exl3_mgemv.py (uniform / sliced, m = 1..16, fp16 / fp32 out, in-graph replay, the
   kernel taken on Pascal; K / V pairs bit-identical to the single GEMV at m = 1): 144 passed on the P100; with the
   existing GEMV / sliced-mgemm / m16 / m34 suites 161 passed on the P100, 276 on the RTX 2060.
-  A/B stopped by the user after the first arms (doc/lfm8_opt/ab_e13.sh, ab_e13_2060.sh, t/s at 512 / 8192 / 32768):
-  P100 ctl a (EXL3_MGEMV=0) 133.1 / 123.2 / 99.2, candidate not run. RTX 2060 (only the headwise Q / K / V bundle
-  changes there, tile MGEMM): ctl a 131.0 / 122.7 / 102.3, candidate 130.6 / 122.4 / 101.5 (-0.2..-0.8 %, no ctl b).
-  Open: P100 candidate + ctl b, oracle, decode ppl; if the 2060 loss repeats, gate the headwise bundle to Pascal.
+  (A first parallel run on both cards was stopped: the UPS alarmed under the combined load. Every run below is one
+  card at a time.)
+  **E13 ACCEPTED on the P100** (doc/lfm8_opt/ab_e13.sh, ctl = EXL3_MGEMV=0, t/s at depth 512 / 8192 / 32768):
+
+  | P100 | 512 | 8192 | 32768 |
+  |---|---:|---:|---:|
+  | ctl a | 132.5 | 122.7 | 99.0 |
+  | E13 | **141.3** | **130.1** | **103.7** |
+  | ctl b | 132.5 | 122.6 | 99.1 |
+
+  +6.6 / +6.1 / +4.7 % (about half the isolated-kernel estimate). Greedy oracle 128/128 identical to the E8 build
+  (max |dlogit| 0.039), decode ppl 9.94133 -> 9.93979, top-1 1533/1536.
+  RTX 2060 (doc/lfm8_opt/ab_e13_2060.sh): only the headwise Q / K / V bundle changes there and it runs on the tile
+  MGEMM: ctl a 131.3 / 123.2 / 102.5, candidate 122.6 / 117.9 / 97.9, ctl b 130.9 / 122.6 / 95.4 (32k noisy) ->
+  REJECTED for sm_75: the headwise bundle is now limited to where the multi-matrix GEMV runs
+  (InferParams.qkv_headwise_bundle: Pascal, EXL3_MGEMV and EXL3_QKV_HEADWISE on). After the gate: RTX 2060
+  131.2 / 122.9 (unchanged), P100 141.8 / 130.4.
 
 ## STATUS after rounds 4-5 (final build 60280f40, re-measured)
 | metric | start | now |
