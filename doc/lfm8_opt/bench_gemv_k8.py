@@ -2,7 +2,7 @@
 over the trellis bytes, under the GEMV mode given in EXL3_GEMV (1 heuristic, 3 force narrow, 4 force wide; read per
 call) and EXL3_GEMV_BALANCE (read once: run one process per value). usage: bench_gemv_k8.py [kxn ...]"""
 import sys, os
-src = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+src = os.environ.get("EXL_SRC") or os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, src)
 sys.path.insert(0, src + "/tests")
 import torch

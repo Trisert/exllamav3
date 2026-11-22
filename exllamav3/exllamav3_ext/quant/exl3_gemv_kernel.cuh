@@ -164,6 +164,27 @@ __device__ __forceinline__ void dq8_regs_4bits(uint32_t a, uint32_t b, FragB& f0
     decode8<cb>(w0, w1, w2, w3, w4, w5, w6, w7, f0, f1);
 }
 
+// sm_60, 8 bpw mul1, staged tile (64 words): dq_dispatch<8> (two dq4) for lane l reads words 2l + 63, 2l + 64 and
+// 2l + 64, 2l + 65 (mod 64), and its shift s2 works out to 0 for every lane, so the 16-bit windows sit at the fixed
+// offsets 24, 16, 8, 0 of each word pair. Three LDS instead of four, one immediate funnel shift per four weights
+// instead of three variable 64-bit ones, the offset-16 window is the high half the HI product reads directly.
+// Bit-identical to dq_dispatch<8, 2>. -DEXL3_GEMV_K8_STAGED_SM60=0 restores dq_dispatch (A/B builds)
+#ifndef EXL3_GEMV_K8_STAGED_SM60
+#define EXL3_GEMV_K8_STAGED_SM60 1
+#endif
+__device__ __forceinline__ void dq8_staged_8bits_mul1_sm60(const uint32_t* tp, int lane, FragB& f0, FragB& f1)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610 && !defined(USE_ROCM)
+    const uint32_t wm = tp[(2 * lane + 63) & 63];
+    const uint32_t wc = tp[(2 * lane + 64) & 63];
+    const uint32_t wn = tp[(2 * lane + 65) & 63];
+    f0[0] = decode_mul1_product_2(mul1_product_h16<false>(__funnelshift_r(wc, wm, 24)), mul1_product_h16<true>(wc));
+    f0[1] = decode_mul1_product_2(mul1_product_h16<false>(wc >> 8), mul1_product_h16<false>(wc));
+    f1[0] = decode_mul1_product_2(mul1_product_h16<false>(__funnelshift_r(wn, wc, 24)), mul1_product_h16<true>(wn));
+    f1[1] = decode_mul1_product_2(mul1_product_h16<false>(wn >> 8), mul1_product_h16<false>(wn));
+#endif
+}
+
 // Register form of dq8_aligned_2bits: the two words and the funnel shift are lane-dependent
 template <int cb>
 __device__ __forceinline__ void dq8_regs_2bits(uint32_t a, uint32_t b, int t_offset, FragB& f0, FragB& f1)
@@ -686,6 +707,8 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                     const uint32_t* tp = &sh_stage[warp][t * TWORDS];
                     if constexpr (HALF)
                         exl3_gemv_ns::dq8_regs_half<bits, cb>(tp[XP(0)], tp[XP(1)], XP(2), tp[XP(3)], tp[XP(4)], XP(5), f0, f1);
+                    else if constexpr (bits == 8 && cb == 2 && EXL3_SM60 && EXL3_GEMV_K8_STAGED_SM60)
+                        exl3_gemv_ns::dq8_staged_8bits_mul1_sm60(tp, lane, f0, f1);
                     else if constexpr (bits >= 5)
                         dq_dispatch<bits, cb>(tp, lane << 3, f0, f1);
                     else if constexpr (bits == 4)
