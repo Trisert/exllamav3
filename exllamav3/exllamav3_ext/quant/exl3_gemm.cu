@@ -745,6 +745,24 @@ int exl3_mgemm_gr
         }
     };
 
+#if !defined(USE_ROCM)
+    // Small-m multi-matrix GEMV (exl3_gemv_kernel.cuh, exl3_mgemv_kernel): one launch over the matrices as a single
+    // virtual matrix, for the uniform and the sliced forms with one input and no index / weight tables (m <= 16 and
+    // the device gates are checked by the launcher). Same kernel arguments, so the graph sites are the tile kernel's
+    if (bszm_in == 1 && !indices && !weights && num_tokens == 1 && min_index < 0
+        && force_shape_idx <= 0 && force_num_sms <= 0 && (!size_n_list || had_src_list))
+    {
+        void* mgemv_kernel = nullptr;
+        if (exl3_mgemv_try_launch(kernelArgs, size_m, size_k, size_n, bszm_out, K, half_k, cb, c_fp32,
+                                  device, stream, &mgemv_kernel))
+        {
+            add_graph_args(mgemv_kernel);
+            cuda_check(cudaPeekAtLastError());
+            return 0;
+        }
+    }
+#endif
+
     bool autotune = force_shape_idx <= 0 && force_num_sms <= 0;
     if (autotune)
     {

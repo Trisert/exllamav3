@@ -79,7 +79,8 @@ class InferParams:
         self.embed_stream_from_disk = os.environ.get("EXL3_EMBED_STREAM", "0") != "0"
 
     def use_mgemm(self, K: int, out_features: int, mul1: bool = False, device = None) -> bool:
-        # Pre-Volta CUDA parts (Pascal) have no multi-matrix GEMV: the fused MGEMM runs the block-pipelined tile
+        # Pre-Volta CUDA parts (Pascal) have a multi-matrix GEMV only for 7 / 8 bpw mul1 (below); elsewhere the fused
+        # MGEMM runs the block-pipelined tile
         # kernel, which is far below the memory roofline there, while separate calls take the GEMV path
         # (the GEMV covers K <= 5; wider tensors keep the fused kernel). Same on Turing sm_75 for mul1, where every
         # K <= 4 shape takes the GEMV (measured on the RTX 2060; EXL3_GEMV_SM75=0 keeps the tile kernel and the MGEMM)
@@ -94,7 +95,9 @@ class InferParams:
             if device.type == "cuda" and device.index is not None and not torch.version.hip:
                 cap = torch.cuda.get_device_capability(device.index)
                 if cap[0] == 6 and os.environ.get("EXL3_GEMV_PASCAL_K8", "1") != "0":
-                    return False
+                    # The bundle stays fused where the multi-matrix GEMV takes it (exl3_mgemv_kernel, m <= 16:
+                    # one launch for gate + up, K + V or Q / K / V); EXL3_MGEMV=0 restores the separate GEMVs
+                    return os.environ.get("EXL3_MGEMV", "1") != "0"
                 if cap == (7, 5) and out_features >= 4096 and os.environ.get("EXL3_GEMV_SM75", "1") != "0":
                     return False
         if device is not None and K <= 5 and os.environ.get("EXL3_GEMV", "1") != "0":

@@ -343,6 +343,106 @@ bool exl3_gemv_try_launch
     return true;
 }
 
+// Multi-matrix small-m GEMV (exl3_mgemv_kernel): EXL3_MGEMV = 0 disables, 1 / unset = Pascal, 2 = every CUDA device
+// (testing)
+static int exl3_mgemv_env_mode()
+{
+    static const int mode = [] { const char* env = std::getenv("EXL3_MGEMV"); return env ? atoi(env) : 1; }();
+    return mode;
+}
+
+bool exl3_mgemv_try_launch
+(
+    void** mgemm_args,
+    int size_m,
+    int size_k,
+    int size_n,
+    int num_slices,
+    int K,
+    bool half_k,
+    int cb,
+    bool c_fp32,
+    int device,
+    cudaStream_t stream,
+    void** launched_kernel
+)
+{
+    const int mmode_env = exl3_mgemv_env_mode();
+    if (!mmode_env || exl3_gemv_env_mode() == 0) return false;
+    if (size_m < 1 || size_m > EXL3_GEMV_MAX_M16 || half_k || cb != 2 || num_slices < 1) return false;
+    if (size_k % 128 || size_n % 128) return false;
+    const int cc = DevCtx::instance().get_cc(device);
+    if (mmode_env != 2 && !(cc == CC_PASCAL && exl3_gemv_env_pascal_k8())) return false;
+    const bool sm75 = cc == CC_OLD && exl3_gemv_sm75(device);
+    // Row modes as the single-matrix GEMV picks them on Pascal (m = 9..16 only with EXL3_GEMV_M16)
+    const bool m16 = size_m > EXL3_GEMV_MAX_M;
+    if (m16 && !exl3_gemv_env_m16()) return false;
+    int mmode = size_m == 1 ? 0 : (m16 ? 5 : (size_m == 2 ? 2 : 1));
+    if (mmode == 1 && size_m <= 4)
+    {
+        const char* env = std::getenv("EXL3_GEMV_M34");
+        if (!env || atoi(env) != 0) mmode = 4;
+    }
+    if (!exl3_mgemv_select_kernel(K, c_fp32, mmode, 0, false)) return false;
+    const int num_sms = DevCtx::instance().get_num_sms(device);
+
+    static std::map<void*, int> occ_cache[MAX_DEVICES];
+    auto& cache = occ_cache[device];
+    auto occupancy = [&] (void* kernel, int block_dim) -> int
+    {
+        auto it = cache.find(kernel);
+        if (it != cache.end()) return it->second;
+        int blocks_per_sm;
+        cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, block_dim, 0));
+        cache[kernel] = blocks_per_sm;
+        return blocks_per_sm;
+    };
+
+    // The slices run as one matrix of num_slices * size_n columns: the single-matrix shape heuristic and balanced-split
+    // test apply to that virtual width
+    const int size_nv = num_slices * size_n;
+    void* narrow_kernel = exl3_mgemv_select_kernel(K, c_fp32, mmode, 0, false);
+    const int narrow_coresident = occupancy(narrow_kernel, 512) * num_sms;
+    const int cfg = exl3_gemv_cfg(cc, sm75, size_m, size_k, size_nv, K, cb, 1, narrow_coresident);
+    if (cfg < 0) return false;
+    void* kernel = exl3_mgemv_select_kernel(K, c_fp32, mmode, cfg, false);
+    if (!kernel) return false;
+    int block_dim = cfg == 0 ? 512 : 256;
+    const int cols = cfg == 0 ? 32 : 64;
+    if (size_n % cols) return false;
+    const int max_blocks = occupancy(kernel, block_dim) * num_sms;
+    int grid = MIN(size_nv / cols, max_blocks);
+    if (grid < 1) return false;
+
+    const int bal_mode = exl3_gemv_env_balance();
+    void* bal_kernel = bal_mode && mmode == 0 ? exl3_mgemv_select_kernel(K, c_fp32, 0, 1, true) : nullptr;
+    if (bal_kernel && size_n % 64 == 0)
+    {
+        const int bal_blocks = occupancy(bal_kernel, 256) * num_sms;
+        const int G = size_nv / 64, ks = size_k / 16;
+        const long long cells = (long long) G * ks;
+        const int tw = bal_blocks * 8;
+        if (bal_blocks > 0 && cells < EXL3_GEMV_BAL_MAX_CELLS && (bal_mode == 2 || cells / tw >= EXL3_GEMV_BAL_MIN_CELLS_PER_WARP))
+        {
+            const int groups_old = size_nv / cols;
+            const int rounds_old = (groups_old + max_blocks - 1) / max_blocks;
+            const bool underfilled = groups_old * 10 < rounds_old * max_blocks * EXL3_GEMV_BAL_UTIL_TENTHS;
+            const exl3_gemv_ns::BalPlan plan = exl3_gemv_ns::bal_plan(G, ks, tw);
+            const bool fits = (size_t) exl3_gemv_ns::bal_max_slots(plan) * size_nv <= (size_t) EXL3_GEMV_WS_FLOATS;
+            if ((underfilled || bal_mode == 2) && fits)
+            {
+                kernel = bal_kernel;
+                block_dim = 256;
+                grid = bal_blocks;
+            }
+        }
+    }
+
+    cuda_check(cudaLaunchCooperativeKernel(kernel, dim3(grid), dim3(block_dim), mgemm_args, 0, stream));
+    if (launched_kernel) *launched_kernel = kernel;
+    return true;
+}
+
 void exl3_gemv
 (
     const at::Tensor& A,

@@ -182,6 +182,40 @@ Depth 32768: P100 99.2 t/s (10.08 ms; decode attention 3.09 ms = 28 % of the tok
   takes 40 us at 512 and 267 us at 32k with 16-key tiles, 71 / 207 us with 64 — the remaining long-context gap is in
   the Triton kernel itself (scalar-FMA tl.dot on sm_60), not in its launch configuration.
 
+### Round 7 — P100 GEMV launch structure (multi-matrix GEMV)
+Profile (P100, depth 512, build 7615dfe3, profiler-inflated): 8.35 ms/token, of which the exl3 GEMVs 6.76 ms (81 %),
+decode attention 0.59, norms 0.40, the rest ~0.6. Per call in the graph: gate 2048x7680 ~60 us, up ~47, down ~61,
+conv in_proj ~42, q / o_proj / conv out_proj (2048x2048) ~38, k / v (2048x512) ~16 (grid 16: 16 of 56 SMs).
+- mul1 product in 2 XMADs instead of 3 (doc/lfm8_opt/xmad_probe.cu): REJECTED without a run. Every PTX form (16-bit
+  high product, shl + add, 32-bit multiply by 0x83DC0000) compiles to 3 XMADs or to the full 32-bit multiply;
+  `XMAD.PSL x, imm, c` exists in SASS but ptxas does not select it. Backs the round 4 "inherent" note.
+- Microbench was L2-warm below 4 MB (one tensor reused): bench_gemv_k8.py now cycles over copies totalling >= 48 MB
+  (BG_COLD_MB). Cold P100: 2048x2048 28-30 us (heuristic narrow) / 24-26 (wide), 2048x512 15.8-17.3, 2048x1024 17.8,
+  2048x3072 27.1 (wide).
+- Forcing the balanced split on the small shapes (EXL3_GEMV_BALANCE=2): no gain (2048x2048 29.9 vs 30.1 us),
+  2048x512 worse (19.6 vs 17.3; its output stage sums ~128 slots per group serially). REJECTED.
+- Phase probe (doc/lfm8_opt/gemv_probe.cu: the kernel header built standalone with EXL3_GEMV_BAL_DBG=128, 200
+  launches in one CUDA graph, cold copies; us): input Hadamard + grid.sync ~2.3 per call on every shape; 2048x2048
+  narrow: main avg 12.2 / max 20.7 (64 column groups on 56 blocks: two rounds), 9.7 waiting at the second grid.sync;
+  2048x7680 balanced: main 30.8 avg, 8.0 avg waiting for the slowest warp, ~6 of launch / tail outside the probes;
+  128x128: 7.4 in graph (fixed floor). One launch over a wider matrix amortizes it: 2048x15360 balanced 82.7 vs
+  2 x 49.6 (gate + up), 2048x3072 wide 24.9 vs 30 + 17.2 + 17.2 (q + k + v), 2048x1024 narrow 16.1 vs 2 x 17.2 (k + v).
+  Estimate: ~0.4 ms (gate + up, 24 layers) + ~0.43 ms (q / k / v, 11 layers) of 7.5 ms per token.
+- E13 (in progress): multi-matrix GEMV `exl3_mgemv_kernel` (exl3_gemv_kernel.cuh; the kernel body is now a device
+  function shared by the single and multi wrappers, single-path SASS opcode histogram unchanged): the bundle's
+  matrices as one virtual matrix of num_slices x width columns, per-source input transform, exl3_mgemm's uniform and
+  sliced tables and launch signature (same graph sites), m = 1..16 with the single GEMV's row modes, balanced split
+  at m = 1. Dispatched from exl3_mgemm on Pascal at 7 / 8 bpw mul1 (`EXL3_MGEMV`, 0 = off); use_mgemm keeps those
+  bundles fused instead of unfusing them. LFM3's headwise fp16 attention gate no longer excludes the sliced Q / K / V
+  bundle (it runs beside it as before; `EXL3_QKV_HEADWISE=0` restores the separate projections).
+  Tests: tests/kernels/gemm/test_exl3_mgemv.py (uniform / sliced, m = 1..16, fp16 / fp32 out, in-graph replay, the
+  kernel taken on Pascal; K / V pairs bit-identical to the single GEMV at m = 1): 144 passed on the P100; with the
+  existing GEMV / sliced-mgemm / m16 / m34 suites 161 passed on the P100, 276 on the RTX 2060.
+  A/B stopped by the user after the first arms (doc/lfm8_opt/ab_e13.sh, ab_e13_2060.sh, t/s at 512 / 8192 / 32768):
+  P100 ctl a (EXL3_MGEMV=0) 133.1 / 123.2 / 99.2, candidate not run. RTX 2060 (only the headwise Q / K / V bundle
+  changes there, tile MGEMM): ctl a 131.0 / 122.7 / 102.3, candidate 130.6 / 122.4 / 101.5 (-0.2..-0.8 %, no ctl b).
+  Open: P100 candidate + ctl b, oracle, decode ppl; if the 2060 loss repeats, gate the headwise bundle to Pascal.
+
 ## STATUS after rounds 4-5 (final build 60280f40, re-measured)
 | metric | start | now |
 |---|---:|---:|

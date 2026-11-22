@@ -504,6 +504,12 @@ class Attention(Module):
             self.full_gate and not self.interleaved_gate and
             self.g_proj.quant_type == "exl3" and self.g_proj.inner.bias is None
         )
+        # A headwise gate (one fp16 value per head) stays out of the bundle and runs beside it
+        # (EXL3_QKV_HEADWISE=0 keeps such modules on the separate projections)
+        if self.g_proj is not None and getattr(self, "headwise_gate", False) and \
+                os.environ.get("EXL3_QKV_HEADWISE", "1") != "0":
+            gate_ok = True
+        self.qkv_gate_slice = self.g_proj is not None and not getattr(self, "headwise_gate", False)
         if self.interleaved_gate and not (self.head_dim % 8 == 0 and self.g_proj is None):
             gate_ok = False
         if (
@@ -516,7 +522,7 @@ class Attention(Module):
             all(p.inner.K == self.q_proj.inner.K for p in (self.k_proj, self.v_proj)) and
             all(p.in_features == self.q_proj.in_features for p in (self.k_proj, self.v_proj))
         ):
-            linears = [self.q_proj, self.k_proj, self.v_proj] + ([self.g_proj] if self.g_proj is not None else [])
+            linears = [self.q_proj, self.k_proj, self.v_proj] + ([self.g_proj] if self.qkv_gate_slice else [])
             try:
                 self.multi_qkv = SlicedMultiLinear(self.device, linears)
             except (ValueError, AssertionError):
@@ -542,7 +548,7 @@ class Attention(Module):
                 qg_1 = g_tensor_cache.get(device, (2, 1, n_q), torch.half, "qg_1")
                 q_out = qg_1[0]
             kv_1 = g_tensor_cache.get(device, (2, 1, n_kv), torch.half, "kv_1")
-            outs = [q_out, kv_1[0], kv_1[1]] + ([qg_1[1]] if self.g_proj is not None else [])
+            outs = [q_out, kv_1[0], kv_1[1]] + ([qg_1[1]] if self.qkv_gate_slice else [])
             self.prealloc_qkv_out_1 = (qg_1, kv_1)
             self.prealloc_qkv_cptrs_1 = mq.c_ptrs(outs)
             # The mgemm C argument only carries the dtype and slice width in sliced mode: one row,
@@ -642,6 +648,8 @@ class Attention(Module):
 
         if self.multi_qkv is not None and bsz * q_len <= 32:
             q, k, v, g = self.project_qkv_sliced(x, bsz, q_len)
+            if g is None and self.g_proj is not None:
+                g = self.g_proj.forward(x, params)
             return self.finish_qkv(q, k, v, g, bsz, q_len, params)
 
         if self.multi_qg is None or bsz * q_len > 32:
@@ -760,7 +768,7 @@ class Attention(Module):
             else:
                 qg = torch.empty((2, m, n_q), dtype = torch.half, device = x.device)
             kv = torch.empty((2, m, n_kv), dtype = torch.half, device = x.device)
-            c_ptrs = mq.c_ptrs([qg[0], kv[0], kv[1]] + ([qg[1]] if self.g_proj is not None else []))
+            c_ptrs = mq.c_ptrs([qg[0], kv[0], kv[1]] + ([qg[1]] if self.qkv_gate_slice else []))
         ext.exl3_mgemm(
             x,
             mq.ptrs_trellis,
@@ -790,7 +798,7 @@ class Attention(Module):
             ext.deinterleave_qg(qg[0].view(bsz, q_len, 2 * n_q), q, g, self.head_dim)
         else:
             q = qg[0].view(bsz, q_len, n_q)
-            g = qg[1].view(bsz, q_len, n_q) if self.g_proj is not None else None
+            g = qg[1].view(bsz, q_len, n_q) if self.qkv_gate_slice else None
         k = kv[0].view(bsz, q_len, n_kv)
         v = kv[1].view(bsz, q_len, n_kv)
         return q, k, v, g
