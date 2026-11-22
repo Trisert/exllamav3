@@ -161,6 +161,20 @@ the card.
     113.7 / 99.3 / 96.7 / 98.0. No regression at m = 2..4 from the unfused gate/up (+3-5 %).
   - P100: ctl 67.5 / 62.7 / 60.1 / 60.0, default 122.6 / 97.8 / 87.6 / 87.4.
 
+### Round 6 — long context (decode at 32k, 64k 8-bit cache)
+Depth 32768: P100 99.2 t/s (10.08 ms; decode attention 3.09 ms = 28 % of the token: ~201 MB of 8-bit KV per token in
+2.94 ms, ~68 GB/s), RTX 2060 90.5 t/s (11.05 ms).
+- Split target 2 -> 8 / 32 x SMs (bc_attn.py splits_cap; the eager path's knob alone had no effect, the decode graph
+  runs the BC attention): neutral on both cards (P100 99.5 / 100.9 / 102.3, 2060 90.6 / 91.3 / 89.6).
+- Key tile 16 -> 64 (32 in between): P100 99.4 -> 103.2 at 32k but 132.8 -> 122.9 at 512 and 122.6 -> 117.7 at 8k
+  (REJECTED for sm_60: one tile per graph slot, it cannot follow the context length); RTX 2060 90.4 -> 101.2 at 32k.
+- E12 ACCEPTED (sm_75, head_dim <= 128: 64-key tiles, `EXL3_ATTN_DECODE_BN` pins): RTX 2060 ctl a / E12 / ctl b
+  512: 130.6 / **129.4** / 130.5 (-0.9 %), 8192: 118.4 / **121.5** / 118.0 (+2.8 %), 32768: 90.6 / **101.4** / 90.5
+  (+12 %). Greedy oracle 128/128 identical, decode ppl 9.94076, top-1 1531/1536 vs the E1 build;
+  test_decode_live_split.py 56 passed. head_dim 256 models (QNF, Qwen3.6) keep 16.
+- Long-context gate (doc/lfm8_opt/longctx_gate.sh, 64k 8-bit cache): needle 3/3 at 49.0k tokens (10 / 50 / 90 %) on
+  both cards; prefill to 64k (t/s) P100 16k 3046, 32k 2617, 64k 2024; RTX 2060 16k 5287, 32k 4295, 64k 3110.
+
 ## STATUS after rounds 4-5 (final build 60280f40, re-measured)
 | metric | start | now |
 |---|---:|---:|

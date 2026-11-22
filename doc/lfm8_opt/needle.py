@@ -10,10 +10,15 @@ from exllamav3.cache import CacheLayer_quant
 from exllamav3.generator.sampler import ArgmaxSampler
 
 root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import glob
 filler = ""
-for f in ("README.md", "doc/env_vars.md", "doc/pascal_progress.md", "doc/pascal_p100.md"):
+for f in ["README.md", "doc/env_vars.md", "doc/pascal_progress.md", "doc/pascal_p100.md"] + \
+        sorted(set(glob.glob(os.path.join(root, "doc", "*.md"))) - {os.path.join(root, "doc", x) for x in
+               ("env_vars.md", "pascal_progress.md", "pascal_p100.md")}):
     filler += open(os.path.join(root, f), errors = "ignore").read() + "\n"
-CACHE = 16384
+# NEEDLE_CACHE (tokens) and NEEDLE_FRACS (comma-separated shares of the cache) widen the test, e.g. 65536 / 0.75
+CACHE = int(os.environ.get("NEEDLE_CACHE", "16384"))
+FRACS = [float(x) for x in os.environ.get("NEEDLE_FRACS", "0.5,0.85").split(",")]
 NEEDLE = "The secret passphrase for the vault is HARBOR-7421-VIOLET."
 
 with torch.inference_mode():
@@ -25,8 +30,9 @@ with torch.inference_mode():
     gen = Generator(model = model, cache = cache, tokenizer = tok)
     fids = tok.encode(filler)[0]
     ok = 0; total = 0
-    for frac_ctx in (0.5, 0.85):
+    for frac_ctx in FRACS:
         n = int(CACHE * frac_ctx) - 200
+        assert fids.shape[-1] >= n, f"filler too short: {fids.shape[-1]} < {n} tokens"
         hay_ids = fids[:n]
         for depth in (0.1, 0.5, 0.9):
             cut = int(n * depth)

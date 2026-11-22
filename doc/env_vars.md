@@ -281,6 +281,14 @@ boundaries move; the result equals the bound split up to the reduction order
 q_len 2, 4-bit cache): P100 63 -> 30 us at 500 keys, 98 -> 62 us at 3500; RTX 2060 90 -> 29 us and
 127 -> 83 us.
 
+### `EXL3_ATTN_DECODE_BN` (default: unset)
+
+Key tile of the paged decode attention split kernel (eager and graphed BC paths). Unset: 64 on sm_75 for head_dim <= 128
+(LFM3-1.7B 8.0bpw on the RTX 2060: 130.6 -> 129.4 t/s at depth 512, 118.2 -> 121.5 at 8k, 90.5 -> 101.4 at 32k),
+16 on sm_60 / sm_75 otherwise (on the P100 64 cost 7.5 % at depth 512 for +3.8 % at 32k; head_dim 256 was measured at
+16), the generic size elsewhere. A value pins it for A/B testing. Raising the split target instead (2 -> 8 / 32 x SMs)
+measured neutral on both cards at 32k.
+
 ### `EXL3_QC_PREFILL_NS` (default: `0` = measure)
 
 Pipeline stage count for the direct quantized-cache prefill kernel. Unset/`0`, the best of

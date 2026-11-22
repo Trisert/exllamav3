@@ -79,6 +79,15 @@ def attn_decode_config(device, hd_pad: int) -> tuple[int, int, int]:
     kv tile, the top of the shared-memory ladder on devices that cannot hold it"""
     if hd_pad <= 128 and gfx_arch(device) == "gfx1100":
         return 32, 2, 2
+    env = os.environ.get("EXL3_ATTN_DECODE_BN")
+    if env:
+        return int(env), *ATTN_SPLIT_WARPS_STAGES
+    if (attn_live_split(device) and not ROCM and hd_pad <= 128 and
+            torch.cuda.get_device_capability(device) == (7, 5)):
+        # sm_75, head_dim <= 128: 64-key tiles (LFM3-1.7B 8.0bpw, 4 kv heads, 8-bit cache, RTX 2060 decode:
+        # 131.8 -> 130.8 t/s at depth 512, 118.5 -> 122.5 at 8k, 90.4 -> 101.2 at 32k). On sm_60 the same change cost
+        # 7.5 % at depth 512 (gaining 3.8 % at 32k), and head_dim 256 was measured at 16 below, so both keep 16
+        return 64, *ATTN_SPLIT_WARPS_STAGES
     if attn_live_split(device) and not ROCM and torch.cuda.get_device_capability(device) in ((6, 0), (7, 5)):
         # With the live split, 16-key tiles: sm_60 / sm_75 run tl.dot on scalar FMAs, and the smaller tile halves
         # the per-program latency at short contexts (microbenchmark, head_dim 256, q_len 2, 16 q / 2 kv heads,
