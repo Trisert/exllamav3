@@ -152,7 +152,15 @@ Prefill after E10 + E11 vs the start: P100 2407 -> 3504 t/s at 4096 (+46 %), 187
 4k prefill at ~57 % of the fp16 peak); on the 2060 cuBLAS GEMMs on HMMA at ~22.6 TFLOPS average (70 %), close to
 the card.
 
-## STATUS (2026-11-22)
+## STATUS after rounds 4-5 (final build 60280f40, re-measured)
+| metric | start | now |
+|---|---:|---:|
+| P100 decode d512 / d8192 | 51.7 / 50.1 t/s | **132.6 / 122.8** (x2.56) |
+| RTX 2060 decode d512 / d8192 | 117.8 / 107.2 | **130.7 / 118.3** (+11 %) |
+| P100 prefill 4096 / 16384 | 2407 / 1873 t/s | **3504 / 3074** (+46 % / +64 %) |
+| RTX 2060 prefill 4096 / 16384 | 4075 / 3557 | **6645 / 5407** (+63 % / +52 %) |
+
+## STATUS (2026-11-22, after round 3)
 | metric | baseline | now | floor (copy BW) |
 |---|---:|---:|---:|
 | P100 d512 greedy | 51.7 t/s | 126.5-126.8 t/s (x2.45) | ~323 t/s |
