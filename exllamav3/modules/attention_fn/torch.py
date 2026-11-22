@@ -180,6 +180,17 @@ def _attend_window(q_b, k_buf, v_buf, total_len, causal, softmax_scale, chunk_si
                         chunk_size, group_gqa)
 
 
+def _fa60_window_ok(q_b, k_buf, total_len) -> bool:
+    """The sliding-window fa60 form applies: sm_60, fp16, head_dim 256 or 128 (128 under EXL3_FA60_HD128),
+    EXL3_FA60_SWA on"""
+    headdim = q_b.shape[-1]
+    return (
+        os.environ.get("EXL3_FA60_SWA", "1") != "0" and fa60_prefill(q_b.device) and not fa75_prefill(q_b.device) and
+        q_b.dtype == torch.float16 and k_buf.dtype == torch.float16 and total_len >= q_b.shape[0] and
+        (headdim == 256 or (headdim == 128 and os.environ.get("EXL3_FA60_HD128", "1") != "0"))
+    )
+
+
 def sdpa_prefill_paged(q, k_cache, v_cache, block_table, cache_seqlens, kv_append_len, causal, softmax_scale, out,
                        chunk_size = 512, window_left = -1):
     """Prefill attention over a dense fp16 paged cache whose new rows are already written (the sm_75 path
@@ -194,7 +205,13 @@ def sdpa_prefill_paged(q, k_cache, v_cache, block_table, cache_seqlens, kv_appen
         total_len = seqlens[b] + kv_append_len
         num_blocks = (total_len + page_size - 1) // page_size
         k_buf, v_buf = _window_buffers(k_cache, v_cache, block_table[b, :num_blocks], nheads_k, headdim)
-        if window_left >= 0:
+        if window_left >= 0 and causal and _fa60_window_ok(q[b], k_buf, total_len):
+            # sm_60: one fa60 call over the whole sequence, key tiles outside each query block's band skipped
+            # (EXL3_FA60_SWA=0 keeps the banded chunked SDPA; read per call)
+            from ...ext import exllamav3_ext as ext
+            scale = softmax_scale if softmax_scale is not None else headdim ** -0.5
+            ext.fa60_fwd_window(q[b], k_buf[:total_len], v_buf[:total_len], out[b], scale, window_left)
+        elif window_left >= 0:
             out[b] = _sdpa_chunks(q[b], k_buf, v_buf, total_len, seqlen_q, nheads, nheads_k, causal, softmax_scale,
                                   chunk_size, True, window_left = window_left)
         else:

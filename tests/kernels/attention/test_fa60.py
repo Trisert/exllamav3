@@ -95,3 +95,49 @@ def test_fa60_long(Tq, Tkv, D, Hq, device):
     ref = _sdpa_chunks(q, k, v, Tkv, Tq, Hq, 4, True, D ** -0.5, 512, True)
     assert torch.isfinite(o).all()
     assert _rel_err(o, ref.float()) < 4e-3
+
+
+def _reference_window(q, k, v, scale, window):
+    Tq, Hq, D = q.shape
+    Tkv, Hkv, _ = k.shape
+    grp = Hq // Hkv
+    qf = q.float().transpose(0, 1)
+    kf = k.float().repeat_interleave(grp, dim = 1).transpose(0, 1)
+    vf = v.float().repeat_interleave(grp, dim = 1).transpose(0, 1)
+    s = (qf @ kf.transpose(1, 2)) * scale
+    rows = torch.arange(Tq, device = q.device)[:, None] + (Tkv - Tq)
+    cols = torch.arange(Tkv, device = q.device)[None, :]
+    s = s.masked_fill((cols > rows) | (cols < rows - window), float("-inf"))
+    return (torch.softmax(s, dim = -1) @ vf).transpose(0, 1)
+
+
+@pytest.mark.parametrize("Tq, Tkv", [(256, 256), (300, 1000), (37, 37), (64, 5000), (1000, 1000), (1, 700), (65, 81),
+                                      (4096, 4096)])
+@pytest.mark.parametrize("Hq, Hkv", [(16, 4), (8, 8)])
+@pytest.mark.parametrize("window", [0, 1, 15, 16, 63, 255, 256, 2000])
+@pytest.mark.parametrize("D", [128, 256])
+def test_fa60_window_matches_reference(Tq, Tkv, Hq, Hkv, window, D, device):
+    """Causal sliding window (LFM3 sliding layers: window 256, head_dim 128): query i sees keys
+    i + Tkv - Tq - window .. i + Tkv - Tq; windows narrower than a key tile and past the sequence included"""
+    gen = torch.Generator(device = device).manual_seed(Tq * 13 + Tkv + window)
+    q = torch.randn(Tq, Hq, D, device = device, dtype = torch.half, generator = gen)
+    k = torch.randn(Tkv, Hkv, D, device = device, dtype = torch.half, generator = gen)
+    v = torch.randn(Tkv, Hkv, D, device = device, dtype = torch.half, generator = gen)
+    scale = D ** -0.5
+    o = torch.empty_like(q)
+    ext.fa60_fwd_window(q, k, v, o, scale, window)
+    ref = _reference_window(q, k, v, scale, window)
+    assert torch.isfinite(o).all()
+    assert _rel_err(o, ref) < 4e-3
+
+
+def test_fa60_window_wide_equals_causal(device):
+    """A window covering the whole sequence is the plain causal kernel, bit for bit"""
+    gen = torch.Generator(device = device).manual_seed(3)
+    q = torch.randn(300, 16, 128, device = device, dtype = torch.half, generator = gen)
+    k = torch.randn(1000, 4, 128, device = device, dtype = torch.half, generator = gen)
+    v = torch.randn(1000, 4, 128, device = device, dtype = torch.half, generator = gen)
+    o1, o2 = torch.empty_like(q), torch.empty_like(q)
+    ext.fa60_fwd(q, k, v, o1, 128 ** -0.5, True)
+    ext.fa60_fwd_window(q, k, v, o2, 128 ** -0.5, 5000)
+    assert torch.equal(o1, o2)

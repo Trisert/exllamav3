@@ -309,6 +309,13 @@ identical, needle 3/3 at 49k. `tests/kernels/attention/test_decode_native.py`.
 Split target of the native decode kernel, in multiples of the SM count (the Triton kernel keeps 2). On the P100 4 gained
 1 % at 32k and lost 0.7 % at 512; 8 lost at every depth.
 
+### `EXL3_FA60_SWA` (default: `1`)
+
+Sliding-window prefill layers on sm_60 (with `EXL3_SDPA_SWA`): one `fa60_fwd_window` call per sequence (key tiles
+outside each query block's band skipped) instead of the banded chunked SDPA. head_dim 128 under `EXL3_FA60_HD128`, or
+256. Read per call; `0` keeps SDPA. LFM3-1.7B 8.0bpw on the P100: prefill +3.9 % at 512 to +4.9 % at 4k-8k tokens,
+prefill ppl 11.03115 -> 11.03210. `tests/kernels/attention/test_fa60.py`.
+
 ### `EXL3_NORM_POST_PRE` (default: `1`)
 
 Post-norm models (LFM3): the post-norm residual (`r += norm(y) * w`) and the next sublayer's input norm run as one

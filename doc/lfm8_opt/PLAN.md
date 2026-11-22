@@ -276,6 +276,26 @@ conv in_proj ~42, q / o_proj / conv out_proj (2048x2048) ~38, k / v (2048x512) ~
   (+2.3 / +2.0 %); RTX 2060 129.2 / 127.4 / 128.7, 120.9 / 119.6 / 120.7 (+1.2 / +1.0 %). Greedy oracle identical,
   max |dlogit| 0.0000.
 
+### Round 8 — P100 prefill (2026-11-22, after E17)
+Profile, 4096-token prefill (prefill_profile.py, PF_PREFILL=1, 1142 ms wall): hfma2 GEMMs 913 ms (80 %), SDPA (5
+sliding-window layers, banded chunks) 57 ms, fa60 (6 full-attention layers) 55 ms, reconstruct 25 ms, the rest ~90.
+- GEMM at the ceiling of its contract: tests/kernels/gemm/hfma2_bench/bench.py on the LFM3 shapes at M = 4096
+  (doc/lfm8_opt/pf_gemm_bench.sh), efficiency vs the HFMA2 calib kernel: gate/up 79.6 %, conv in 79.0 %, down
+  76.1 %, 2048 x 2048 75.0 %, k/v 69.8 % (cuBLAS 41-46 %, the 128-row tile 58-76 %). doc/pascal_progress.md "hfma2
+  prefill GEMM" (Nov 6) puts the issue ceiling at ~86 % with the 32-term fp16 flush; beyond it needs a longer fp16
+  partial (KSLICE 64, ceiling ~91 %, numerics change) — not done, offered to the user as a labelled trade.
+- **E18 ACCEPTED: sliding-window prefill attention on fa60** (`fa60_fwd_window`, pascal/fa60.cu; `EXL3_FA60_SWA`):
+  fa60 takes a causal window (key tiles below each 64-row query block's band skipped, keys below row - window
+  masked, fully masked leading tiles weigh exactly 0), one call per sequence instead of the banded chunked SDPA.
+  Tests: test_fa60.py window cases (windows 0..2000 incl. narrower than a key tile and wider than the sequence,
+  which is bit-identical to the causal kernel). test_prefill_sdpa_window.py: on sm_60 the fa60 paths (sliding,
+  and head_dim 128 full attention since E11) are held to 5e-3 instead of SDPA's 2e-3 (max 3.4e-3 seen; fa60's fp16
+  partials, model-level KL ~1e-3 per its header), the fa75-forced cases skip below sm_75 (they faulted the context on
+  the P100 and failed every later test); 384 passed on the P100, 392 on the RTX 2060. A/B (doc/lfm8_opt/ab_e18.sh,
+  ctl EXL3_FA60_SWA=0 / fa60 / ctl, t/s): 512 3194 / 3257 / 3078, 2048 3546 / 3679 / 3504, 4096 3596 / 3738 / 3532,
+  8192 3431 / 3571 / 3377, 16384 3148 / 3264 / 3098 (+3.9 / +4.4 / +4.9 / +4.9 / +4.5 %). Prefill ppl 11.03115 ->
+  11.03210 (4096 tokens), top-1 4082/4096, needle 6/6.
+
 ## STATUS after rounds 4-5 (final build 60280f40, re-measured)
 | metric | start | now |
 |---|---:|---:|

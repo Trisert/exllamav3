@@ -7,6 +7,7 @@ and 256 (fa75 and SDPA), several sequences of uneven length, chunk lengths below
 threshold. The reference is the default path on the same device, so this runs on every CUDA device.
 """
 
+import os
 import pytest
 import torch
 
@@ -17,6 +18,14 @@ from testlib.attention import rand_packed_cache
 pytestmark = pytest.mark.cuda_only
 
 PAGE = 256
+
+# fa60 (sm_60) runs S and P V with fp16 partial sums (pascal/fa60.cu header: model-level KL vs SDPA ~1e-3): against
+# the Triton kernel it differs by up to ~3.5e-3 on these unit-variance inputs where SDPA stays within 2e-3
+FA60_ATOL = 5e-3
+
+
+def _fa60(device, head_dim):
+    return backend.fa60_prefill(device) and not backend.fa75_prefill(device) and head_dim in (128, 256)
 
 
 def _run(q, kc, vc, qc, bt, sl, q_len, n_kv, k = None, v = None):
@@ -35,6 +44,8 @@ def _run(q, kc, vc, qc, bt, sl, q_len, n_kv, k = None, v = None):
 def test_window_path_matches_triton(head_dim, bits, n_q, n_kv, q_len, fa75, device, monkeypatch):
     if fa75 and head_dim != 256:
         pytest.skip("fa75 only applies to head_dim 256")
+    if fa75 and torch.cuda.get_device_capability(device) < (7, 5):
+        pytest.skip("fa75 needs sm_75 (mma.m16n8k8); forcing it on Pascal faults the context")
     torch.manual_seed(head_dim + bits + n_q + q_len)
     bsz, ctx = 3, 2048
     num_pages = ctx // PAGE
@@ -64,7 +75,10 @@ def test_window_path_matches_triton(head_dim, bits, n_q, n_kv, q_len, fa75, devi
     out = _run(q, kc.clone(), vc.clone(), qc, bt, sl, q_len, n_kv, *kv)
 
     assert torch.isfinite(out).all()
-    torch.testing.assert_close(out, ref, rtol = 0, atol = 2e-3)
+    # head_dim 128 on sm_60 takes fa60 (EXL3_FA60_HD128), 256 too unless fa75 is forced
+    atol = FA60_ATOL if (not fa75 and _fa60(device, head_dim) and
+                         (head_dim == 256 or os.environ.get("EXL3_FA60_HD128", "1") != "0")) else 2e-3
+    torch.testing.assert_close(out, ref, rtol = 0, atol = atol)
 
 
 def _run_w(q, kc, vc, qc, bt, sl, q_len, n_kv, window, k = None, v = None):
@@ -80,8 +94,9 @@ def _run_w(q, kc, vc, qc, bt, sl, q_len, n_kv, window, k = None, v = None):
 @pytest.mark.parametrize("n_q, n_kv", [(16, 4), (4, 4)], ids = ["gqa", "mha"])
 @pytest.mark.parametrize("q_len", [16, 300, 1100])
 def test_sliding_window_path_matches_triton(window, bits, n_q, n_kv, q_len, device, monkeypatch):
-    """Sliding-window chunks (EXL3_SDPA_SWA): banded chunked SDPA over the dense window vs the Triton kernel, with
-    chunks longer than one SDPA q chunk (512) so the band starts move"""
+    """Sliding-window chunks (EXL3_SDPA_SWA): banded chunked SDPA over the dense window (fa60 with its window on
+    sm_60, EXL3_FA60_SWA) vs the Triton kernel, with chunks longer than one SDPA q chunk (512) so the band starts
+    move"""
     head_dim = 128
     torch.manual_seed(window + bits + n_q + q_len)
     bsz, ctx = 3, 2560
@@ -107,4 +122,5 @@ def test_sliding_window_path_matches_triton(window, bits, n_q, n_kv, q_len, devi
     out = _run_w(q, kc.clone(), vc.clone(), qc, bt, sl, q_len, n_kv, window, *kv)
 
     assert torch.isfinite(out).all()
-    torch.testing.assert_close(out, ref, rtol = 0, atol = 2e-3)
+    atol = FA60_ATOL if (_fa60(device, head_dim) and os.environ.get("EXL3_FA60_SWA", "1") != "0") else 2e-3
+    torch.testing.assert_close(out, ref, rtol = 0, atol = atol)

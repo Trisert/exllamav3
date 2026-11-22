@@ -246,6 +246,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("fa75_fwd", &fa75_fwd, "fa75_fwd");
     m.def("fa75_fwd_slice", &fa75_fwd_slice, "fa75_fwd_slice");
     m.def("fa60_fwd", &fa60_fwd, "fa60_fwd");
+    m.def("fa60_fwd_window", &fa60_fwd_window, "fa60_fwd_window");
 #endif
     m.def("rope", &rope, "rope");
     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");

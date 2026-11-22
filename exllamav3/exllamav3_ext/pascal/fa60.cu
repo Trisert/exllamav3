@@ -50,7 +50,7 @@ fa60_kernel
     const half* __restrict__ v, int64_t v_row, int64_t v_head,
     half* __restrict__ o,
     int Tq, int Tkv, int Hq, int Hkv,
-    float scale_log2, int causal, int offs
+    float scale_log2, int causal, int offs, int window
 )
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 600
@@ -106,6 +106,9 @@ fa60_kernel
     int kv_end = causal ? min(Tkv, m0 + BM + offs) : Tkv;
     kv_end = max(kv_end, 0);
     const int n_tiles = (kv_end + BN - 1) / BN;
+    // Causal sliding window (window >= 0: query i sees keys i + offs - window .. i + offs): tiles below the first
+    // row's band are skipped
+    const int t0 = window >= 0 ? min(max(0, m0 + offs - window) / BN, n_tiles) : 0;
 
     uint4 st[(BN * HD / 8) / NT];
     auto gload = [&] (const half* src, int64_t rs, int n0)
@@ -129,9 +132,9 @@ fa60_kernel
         }
     };
 
-    if (n_tiles > 0)
+    if (n_tiles > t0)
     {
-        gload(k, k_row, 0);
+        gload(k, k_row, t0 * BN);
         sstore();
     }
     __syncthreads();
@@ -141,7 +144,7 @@ fa60_kernel
     const half* ka = KVs + kg * QS;
     const half* kb = KVs + (kg + 8) * QS;
 
-    for (int kt = 0; kt < n_tiles; ++kt)
+    for (int kt = t0; kt < n_tiles; ++kt)
     {
         const int n0 = kt * BN;
 
@@ -189,7 +192,8 @@ fa60_kernel
         }
 
         // Mask, online softmax (log2 domain); P to shared memory as fp16, transposed
-        const bool need_mask = (n0 + BN > Tkv) || (causal && n0 + BN - 1 > m0 + offs);
+        const bool need_mask = (n0 + BN > Tkv) || (causal && n0 + BN - 1 > m0 + offs) ||
+                               (window >= 0 && n0 < m0 + BM - 1 + offs - window);
         #pragma unroll
         for (int hh = 0; hh < 2; ++hh)
         {
@@ -203,7 +207,8 @@ fa60_kernel
                 if (need_mask)
                 {
                     const int key = n0 + kg + 8 * e;
-                    if (key >= Tkv || (causal && key > row + offs)) x[e] = -1e30f;
+                    if (key >= Tkv || (causal && key > row + offs) || (window >= 0 && key < row + offs - window))
+                        x[e] = -1e30f;
                 }
             }
             float mx = fmaxf(x[0], x[1]);
@@ -213,8 +218,9 @@ fa60_kernel
             const float m_new = fmaxf(mrow[hh], mx);
             const float alpha = exp2f(mrow[hh] - m_new);
             mrow[hh] = m_new;
-            const float p0 = exp2f(x[0] - m_new);
-            const float p1 = exp2f(x[1] - m_new);
+            // With a window a row's first tiles can be fully masked (m_new still -1e30): masked keys weigh 0
+            const float p0 = (window >= 0 && x[0] <= -1e29f) ? 0.0f : exp2f(x[0] - m_new);
+            const float p1 = (window >= 0 && x[1] <= -1e29f) ? 0.0f : exp2f(x[1] - m_new);
             float sum = p0 + p1;
             sum += __shfl_xor_sync(0xffffffff, sum, 1);
             sum += __shfl_xor_sync(0xffffffff, sum, 2);
@@ -317,7 +323,7 @@ fa60_kernel
 } // namespace fa60
 
 // q [Tq, Hq, D], k/v [Tkv, Hkv, D] (last dim contiguous), o [Tq, Hq, D] contiguous, D = 256 or 128
-void fa60_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, double scale, bool causal)
+static void fa60_launch(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, double scale, bool causal, int window)
 {
     const at::cuda::OptionalCUDAGuard guard(q.device());
     TORCH_CHECK(q.dtype() == at::kHalf && k.dtype() == at::kHalf && v.dtype() == at::kHalf && o.dtype() == at::kHalf, "fa60_fwd: fp16");
@@ -343,8 +349,20 @@ void fa60_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, double sca
         (const half*) k.data_ptr(), k.stride(0), k.stride(1),
         (const half*) v.data_ptr(), v.stride(0), v.stride(1),
         (half*) o.data_ptr(),
-        Tq, Tkv, Hq, Hkv, (float)(scale * 1.4426950408889634), causal ? 1 : 0, Tkv - Tq);
+        Tq, Tkv, Hq, Hkv, (float)(scale * 1.4426950408889634), causal ? 1 : 0, Tkv - Tq, window);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void fa60_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, double scale, bool causal)
+{
+    fa60_launch(q, k, v, o, scale, causal, -1);
+}
+
+// Causal sliding window: query i (bottom-right aligned) sees keys j with i + Tkv - Tq - window <= j <= i + Tkv - Tq
+void fa60_fwd_window(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, double scale, int64_t window)
+{
+    TORCH_CHECK(window >= 0, "fa60_fwd_window: window must be >= 0");
+    fa60_launch(q, k, v, o, scale, true, (int) window);
 }
 
 #endif
