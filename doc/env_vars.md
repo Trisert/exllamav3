@@ -322,6 +322,19 @@ projections (gate/up, q/k/v, the GatedDeltaNet input projections) are unfused so
 2060's 16 layers: 26.8 -> 18.0 ms GPU time per token. `0` keeps the general heuristic (tile kernel
 for most of these shapes) and the fused MGEMM.
 
+### `EXL3_GEMV_PASCAL_K8` (default: `1`)
+
+7 and 8 bpw (mul1, staged tile words) GEMV on Pascal, as on sm_75. Without it every 7/8 bpw projection on the P100
+runs the tile GEMM at ~80-90 GB/s. With it (plus `EXL3_UNFUSE_K8`) LFM3-1.7B 8.0bpw batch-1 decode on the P100 goes from
+51.7 to 126.5 t/s at depth 512 (50.1 -> 117.4 at 8192), greedy output unchanged. `0` restores the tile GEMM.
+
+### `EXL3_UNFUSE_K8` (default: `1`)
+
+7 / 8 bpw mul1 same-input projections are unfused (separate calls instead of the fused MGEMM) where the separate calls
+take the GEMV: on Pascal every bundle (gate/up, q/k/v; needs `EXL3_GEMV_PASCAL_K8`), on sm_75 only the wide ones
+(n >= 4096, i.e. gate/up; the sliced q/k/v bundle stays fused). RTX 2060, LFM3-1.7B 8.0bpw: 117.8 -> 129.3 t/s at
+depth 512. `0` keeps the fused MGEMM.
+
 ### `EXL3_GEMV_M34` (default: `1`)
 
 Pascal (sm_60), m = 3..4 rows (MTP verify at `-ndt 2/3`): the GEMV takes MMODE 4, the emulated-MMA arithmetic

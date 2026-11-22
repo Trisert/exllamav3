@@ -97,6 +97,13 @@ static bool exl3_gemv_env_sm75_k5()
     return on;
 }
 
+// 7 / 8 bpw GEMV on Pascal (staged tile words, as on sm_75): EXL3_GEMV_PASCAL_K8 = 0 restores the tile GEMM (A/B testing)
+static bool exl3_gemv_env_pascal_k8()
+{
+    static const bool on = [] { const char* env = std::getenv("EXL3_GEMV_PASCAL_K8"); return !env || atoi(env) != 0; }();
+    return on;
+}
+
 // -1: not eligible, 0: narrow config, 1: wide config. narrow_coresident = number of narrow-config
 // blocks that fit on the device at once (its grid is one block per 32 output columns)
 static int exl3_gemv_cfg(int cc, bool sm75, int size_m, int size_k, int size_n, int K, int cb, int mode, int narrow_coresident)
@@ -114,8 +121,8 @@ static int exl3_gemv_cfg(int cc, bool sm75, int size_m, int size_k, int size_n, 
     // 2048 x 128000 lm_head). The gate was "only measured on Pascal", not a Turing defect: forced on the 2060 the
     // GEMV matches the tile GEMM within fp16 error. Wide beats narrow from n = 2048 up (6 bpw lm_head 672 vs 973 us,
     // tile GEMM 1038 us), narrow wins at n = 512 (9 vs 14 us). mcg / 3INST stay on Pascal
-    // 7 / 8 bpw (same staged form) are enabled on sm_75 only, where they are measured
-    if (K >= 7 && !sm75) return -1;
+    // 7 / 8 bpw (same staged form) are enabled on sm_75 and Pascal, where they are measured
+    if (K >= 7 && !sm75 && !(cc == CC_PASCAL && exl3_gemv_env_pascal_k8())) return -1;
     if (K >= 5 && cc != CC_PASCAL)
     {
         // m = 1 only (measured); EXL3_GEMV_SM75_K5=0 restores the tile GEMM for K >= 5 (A/B testing)

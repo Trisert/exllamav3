@@ -84,6 +84,19 @@ class InferParams:
         # (the GEMV covers K <= 5; wider tensors keep the fused kernel). Same on Turing sm_75 for mul1, where every
         # K <= 4 shape takes the GEMV (measured on the RTX 2060; EXL3_GEMV_SM75=0 keeps the tile kernel and the MGEMM)
         # (EXL3_GEMV=0 turns the GEMV off, so there is nothing to unfuse for and the MGEMM stays)
+        # 7 / 8 bpw mul1 (measured on LFM3-1.7B 8.0bpw): Pascal unfuses every projection once its K = 7 / 8 GEMV is on
+        # (EXL3_GEMV_PASCAL_K8), sm_75 only the wide ones (gate / up, n >= 4096; the sliced qkv bundle stays fused).
+        # EXL3_UNFUSE_K8=0 keeps the fused MGEMM (A/B testing)
+        if device is not None and K in (7, 8) and mul1 and os.environ.get("EXL3_GEMV", "1") != "0" \
+                and os.environ.get("EXL3_UNFUSE_K8", "1") != "0":
+            import torch
+            device = torch.device(device)
+            if device.type == "cuda" and device.index is not None and not torch.version.hip:
+                cap = torch.cuda.get_device_capability(device.index)
+                if cap[0] == 6 and os.environ.get("EXL3_GEMV_PASCAL_K8", "1") != "0":
+                    return False
+                if cap == (7, 5) and out_features >= 4096 and os.environ.get("EXL3_GEMV_SM75", "1") != "0":
+                    return False
         if device is not None and K <= 5 and os.environ.get("EXL3_GEMV", "1") != "0":
             import torch
             device = torch.device(device)
