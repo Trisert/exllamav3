@@ -72,14 +72,20 @@ HC_FOLD = _env("EXL3_HC_FOLD", 0, 1) != "0"
 # lengths (more splits at short contexts, far fewer stalls at long ones); the QSA sparse split kernel
 # keeps the pair below
 ATTN_SPLIT_WARPS_STAGES = (8, 1) if ROCM else (4, 2)
-# EXL3_ATTN_DECODE_WS="warps,stages" pins the decode split kernel's launch shape (A/B testing)
-if os.environ.get("EXL3_ATTN_DECODE_WS"):
-    ATTN_SPLIT_WARPS_STAGES = tuple(int(x) for x in os.environ["EXL3_ATTN_DECODE_WS"].split(","))
 
 
 def attn_decode_config(device, hd_pad: int) -> tuple[int, int, int]:
     """(block_n, num_warps, num_stages) for the paged decode attention split kernel; block_n is the
-    kv tile, the top of the shared-memory ladder on devices that cannot hold it"""
+    kv tile, the top of the shared-memory ladder on devices that cannot hold it. EXL3_ATTN_DECODE_WS
+    ("warps,stages", A/B testing) pins the launch shape of this kernel only, not the QSA sparse one"""
+    block_n, warps, stages = _attn_decode_config(device, hd_pad)
+    ws = os.environ.get("EXL3_ATTN_DECODE_WS")
+    if ws:
+        warps, stages = (int(x) for x in ws.split(","))
+    return block_n, warps, stages
+
+
+def _attn_decode_config(device, hd_pad: int) -> tuple[int, int, int]:
     env = os.environ.get("EXL3_ATTN_DECODE_BN")
     if hd_pad <= 128 and gfx_arch(device) == "gfx1100":
         return (int(env) if env else 32), 2, 2

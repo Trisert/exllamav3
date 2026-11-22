@@ -20,6 +20,10 @@ class PromptFormat:
         return None
     def inject_thinktag(self):
         return True
+    def edited_reply_think_block(self):
+        # Reasoning mode, /e: the closed (empty) think block that goes before the edited answer, which then
+        # streams as the answer; None leaves the edited text after the prompt as is
+        return None
 
 
 class PromptFormat_raw(PromptFormat):
@@ -245,6 +249,9 @@ class PromptFormat_lfm3(PromptFormat):
 
     def thinktag(self):
         return "<think>", "</think>"
+
+    def edited_reply_think_block(self):
+        return "<think></think>"
 
 
 class PromptFormat_phi(PromptFormat):

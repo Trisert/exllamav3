@@ -292,8 +292,8 @@ measured neutral on both cards at 32k.
 ### `EXL3_ATTN_DECODE_WS` (default: unset)
 
 `warps,stages` (e.g. `8,1`) pins the launch shape of the paged decode attention split kernel, overriding the backend
-default (4,2 on CUDA, 8,1 on ROCm; gfx1100 at head_dim <= 128 keeps its own 2,2). For A/B testing: on LFM3-1.7B
-8.0bpw no other shape beat 4,2 on the P100 or the RTX 2060 at depth 512 or 32k.
+default (4,2 on CUDA, 8,1 on ROCm, 2,2 on gfx1100 at head_dim <= 128). The QSA sparse split kernel keeps the
+default. For A/B testing: on LFM3-1.7B 8.0bpw no other shape beat 4,2 on the P100 or the RTX 2060 at depth 512 or 32k.
 
 ### `EXL3_QC_PREFILL_NS` (default: `0` = measure)
 
