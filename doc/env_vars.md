@@ -295,6 +295,33 @@ measured neutral on both cards at 32k.
 default (4,2 on CUDA, 8,1 on ROCm, 2,2 on gfx1100 at head_dim <= 128). The QSA sparse split kernel keeps the
 default. For A/B testing: on LFM3-1.7B 8.0bpw no other shape beat 4,2 on the P100 or the RTX 2060 at depth 512 or 32k.
 
+### `EXL3_ATTN_NATIVE` (default: `1`)
+
+CUDA-native split kernel for the graphed decode attention (`exllamav3_ext/attn_decode_native.cu`) in place of the Triton
+`_paged_attn_decode_split_kernel`, where Triton lowers `tl.dot` to scalar FMAs. Same launch sites and partials (the
+Triton combine kernel reduces them); taken for q_len 1, 8-bit K and V cache, head_dim 128, full attention (no window,
+softcap or sinks), GQA group 1 / 2 / 4 / 8. `1`: sm_60 only; `2`: every CUDA device (testing); `0`: Triton. LFM3-1.7B
+8.0bpw on the P100: 141.3 -> 140.6 t/s at depth 512, 129.9 -> 136.2 at 8k, 103.8 -> 123.4 at 32k; greedy oracle
+identical, needle 3/3 at 49k. `tests/kernels/attention/test_decode_native.py`.
+
+### `EXL3_ATTN_NATIVE_SPLITS` (default: `2`)
+
+Split target of the native decode kernel, in multiples of the SM count (the Triton kernel keeps 2). On the P100 4 gained
+1 % at 32k and lost 0.7 % at 512; 8 lost at every depth.
+
+### `EXL3_MGEMV` (default: `1`)
+
+Multi-matrix small-m GEMV (`exl3_mgemv_kernel`) for the exl3_mgemm bundles (gate + up, K + V, Q / K / V) at 7 / 8 bpw
+mul1 on Pascal, m = 1..16; the bundles stay fused there instead of running as separate GEMVs. `0` restores the separate
+GEMVs; `2` takes the kernel on every CUDA device (testing). LFM3-1.7B 8.0bpw on the P100: 132.5 -> 141.3 t/s at depth
+512, 122.7 -> 130.1 at 8k, 99.0 -> 103.7 at 32k. `tests/kernels/gemm/test_exl3_mgemv.py`.
+
+### `EXL3_QKV_HEADWISE` (default: `1`)
+
+A headwise fp16 attention gate (LFM3) no longer excludes the sliced Q / K / V bundle: it runs beside it. Only where the
+bundle takes the multi-matrix GEMV (Pascal); on the RTX 2060 the bundle's tile MGEMM lost 4-7 %. `0` keeps such
+modules on the separate projections.
+
 ### `EXL3_QC_PREFILL_NS` (default: `0` = measure)
 
 Pipeline stage count for the direct quantized-cache prefill kernel. Unset/`0`, the best of

@@ -23,6 +23,16 @@ TritonKernel::TritonKernel(py::bytes cubin, std::string _name, int _num_warps, i
 #endif
 }
 
+TritonKernel::TritonKernel(CUfunction _fn, void* _symbol, std::string _name, int _num_warps, int _shared_bytes,
+                           std::vector<void*> _extra) :
+    fn(_fn),
+    name(std::move(_name)),
+    num_warps(_num_warps),
+    shared_bytes(_shared_bytes),
+    extra_args(std::move(_extra)),
+    node_handle(_symbol)
+{}
+
 TritonKernel::~TritonKernel()
 {
     if (mod) CudaDrv::instance().module_unload(mod);
@@ -30,6 +40,7 @@ TritonKernel::~TritonKernel()
 
 void TritonKernel::launch(int gx, int gy, int gz, std::vector<void*>& args, cudaStream_t stream) const
 {
+    for (void* e : extra_args) args.push_back(e);
     // Two hidden trailing params: global scratch and profile scratch, both unused (size 0)
     args.push_back(nullptr);
     args.push_back(nullptr);

@@ -238,6 +238,28 @@ conv in_proj ~42, q / o_proj / conv out_proj (2048x2048) ~38, k / v (2048x512) ~
   call 2048x7680 / 7680x2048 / 2048x15360 / 2048x6144: static 46.2 / 47.9 / 77.2 / 43.1; 2/16 CL 2: 51.2 / 54.2 /
   80.9 / 44.8; 4/16 CL 1 / 2 / 4: 60.2 / 54.6 / 53.6 ...; 8/16 CL 2: 59.4 / 73.6 / 97.8 / 50.9 — every chunk restarts
   the prefetch ring with its full load latency, worse in all cases (doc/lfm8_opt/dyn_sweep.sh).
+- **E15 ACCEPTED: CUDA-native decode split kernel** (`exllamav3_ext/attn_decode_native.cu`, `EXL3_ATTN_NATIVE`, sm_60):
+  replaces the Triton split kernel inside the BC graph through the same TritonKernel launch site (new constructor
+  from a runtime kernel, constants appended as extra args; graph nodes matched by the runtime symbol, which
+  cudaGraphKernelNodeGetParams reports), partials in the Triton layout, Triton combine unchanged. One key per lane
+  for the scores (fp32 dot of the dequantized 8-bit key with the group's q rows from smem), per-warp online
+  softmax, one 4-dim slice per lane for P x V, warp merge in smem; q rotated by an in-warp Walsh-Hadamard butterfly
+  (the first version's 32-term global-memory dot per element cost ~1 % at depth 512). Test
+  tests/kernels/attention/test_decode_native.py (72: lengths 0..8000 incl. empty splits and page edges, both split
+  modes, GQA 1 / 2 / 4 / 8, vs the eager Triton decode). Split target sweep (EXL3_ATTN_NATIVE_SPLITS, x SMs, t/s at
+  32k / 512 / 8k): Triton 104.3 / 141.1 / 129.9, native 2: 123.0 / 140.1 / 135.8, 4: 124.7 / 139.2 / 135.3, 8:
+  121.2 / 138.0 / 132.9 -> 2. A/B (doc/lfm8_opt/ab_e15.sh, cand / ctl Triton / cand):
+
+  | P100 | 512 | 8192 | 32768 |
+  |---|---:|---:|---:|
+  | native a | 140.5 | 136.0 | 123.4 |
+  | Triton | 141.3 | 129.9 | 103.8 |
+  | native b | 140.7 | 136.4 | 123.3 |
+
+  -0.5 / +4.8 / +18.8 %. Greedy oracle 128/128 identical (max |dlogit| 0.031), decode ppl 9.93979 unchanged,
+  needle 3/3 at 49.0k tokens (doc/lfm8_opt/needle_p100.sh). At 32k the kernel is still ~3x off the HBM2 floor
+  (~173 GB/s per call): instruction count (byte -> fp32 conversion + fp32 FMAs) and occupancy; an HFMA2 inner loop
+  would be the next step there.
 
 ## STATUS after rounds 4-5 (final build 60280f40, re-measured)
 | metric | start | now |

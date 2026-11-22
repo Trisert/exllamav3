@@ -105,6 +105,16 @@ def _attn_decode_config(device, hd_pad: int) -> tuple[int, int, int]:
     return max(16, 8192 // hd_pad), *ATTN_SPLIT_WARPS_STAGES
 
 
+def attn_decode_native(device) -> bool:
+    """EXL3_ATTN_NATIVE: the CUDA-native decode split kernel (exllamav3_ext/attn_decode_native.cu) in place of the
+    Triton one in the graphed decode, where the shape allows it (q_len 1, 8-bit cache, head_dim 128, full attention).
+    0 = off, 1 / unset = sm_60 (Triton's scalar-FMA tl.dot there), 2 = any CUDA device (testing)"""
+    mode = os.environ.get("EXL3_ATTN_NATIVE", "1")
+    if mode == "0" or ROCM:
+        return False
+    return mode == "2" or compute_capability(device) == (6, 0)
+
+
 def attn_live_split(device) -> bool:
     """EXL3_ATTN_LIVE_SPLIT (default on, 0 disables): the decode split kernel divides the live kv length (read from cache_seqlens on the
     device) over its splits instead of the block-table bound the host derives split_len from. The generator pads

@@ -1,6 +1,7 @@
 #include <cuda_fp16.h>
 
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -64,6 +65,7 @@
 
 #include "libtorch/gated_delta_net.h"
 #include "libtorch/attention.h"
+#include "attn_decode_native.h"
 #include "libtorch/shared_kv_attention.h"
 #include "libtorch/mla_attention.h"
 #include "libtorch/linear.h"
@@ -341,6 +343,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     #include "libtorch/linear_bc.h"
     #include "libtorch/gated_delta_net_bc.h"
     #include "libtorch/attention_bc.h"
+    m.def("make_decode_split_native", &make_decode_split_native,
+          py::arg("group"), py::arg("head_dim"), py::arg("bits"), py::arg("scale"), py::arg("n_kv_heads"),
+          py::arg("page_size"), py::arg("live_split"), py::arg("block_rows"));
     #include "libtorch/shared_kv_attention_bc.h"
     #include "libtorch/mla_attention_bc.h"
     #include "libtorch/gated_rmsnorm_bc.h"

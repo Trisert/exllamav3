@@ -1,7 +1,7 @@
 import os
 
 import torch
-from ...util.backend import ROCM, ATTN_SPLIT_WARPS_STAGES, attn_decode_config, attn_live_split
+from ...util.backend import ROCM, ATTN_SPLIT_WARPS_STAGES, attn_decode_config, attn_live_split, attn_decode_native
 
 from ...ext import exllamav3_ext as ext
 from ...constants import PAGE_SIZE
@@ -325,9 +325,15 @@ class BCAttn:
 
         # The live split count and split length are runtime kernel arguments derived from the
         # block-table bound per call (patched into the graph); the grid is sized to the cap
-        target = 2 * _get_sm_count(dev)
-        splits_cap = max(1, min(target // programs, 128))
         window_left, window_right = _normalize_window(self.window_size)
+        # CUDA-native stand-in for the split kernel (same launch sites and partials; EXL3_ATTN_NATIVE)
+        native = (
+            attn_decode_native(dev) and q_len == 1 and self.quant and self.k_bits == 8 and self.v_bits == 8 and
+            hd == 128 and self.v_head_dim == hd and window_left < 0 and window_right < 0 and not self.softcap and
+            self.sinks is None and group_size in (1, 2, 4, 8)
+        )
+        target = (int(os.environ.get("EXL3_ATTN_NATIVE_SPLITS", "2")) if native else 2) * _get_sm_count(dev)
+        splits_cap = max(1, min(target // programs, 128))
 
         cache_t = "*i32" if self.quant else "*fp16"
         # These pointers are whole allocations (cache tensors, graph statics, bucketed partials, the
@@ -354,6 +360,11 @@ class BCAttn:
         )
         k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, split_warps, split_stages,
                                   pointer_range_32 = self._pointer_range_32())
+        if native:
+            k_split = ext.make_decode_split_native(
+                group = group_size, head_dim = hd, bits = 8, scale = float(self.sm_scale), n_kv_heads = kvh,
+                page_size = PAGE_SIZE, live_split = attn_live_split(dev), block_rows = block_rows,
+            )
 
         sig_c = {
             "partial_o": "*fp32:16", "partial_ml": "*fp32:16", "out": "*fp16:16", "h32": "*fp16:16",

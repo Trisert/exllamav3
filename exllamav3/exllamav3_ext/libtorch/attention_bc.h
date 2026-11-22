@@ -6,6 +6,21 @@ py::class_<TritonKernel, std::shared_ptr<TritonKernel>>(m, "TritonKernel")
     py::arg("name"),
     py::arg("num_warps"),
     py::arg("shared_bytes")
+).def
+(
+    // Testing: launch on the current stream with args given as tensors (their data pointers) and ints
+    "launch",
+    [] (TritonKernel& k, int gx, int gy, int gz, py::list items)
+    {
+        std::vector<void*> args;
+        for (auto it : items)
+        {
+            if (THPVariable_Check(it.ptr())) args.push_back(py::cast<at::Tensor>(it).data_ptr());
+            else args.push_back((void*) (intptr_t) py::cast<long long>(it));
+        }
+        k.launch(gx, gy, gz, args, at::cuda::getCurrentCUDAStream().stream());
+    },
+    py::arg("gx"), py::arg("gy"), py::arg("gz"), py::arg("args")
 );
 
 py::class_<BC_Attention, std::shared_ptr<BC_Attention>>(m, "BC_Attention").def
