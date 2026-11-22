@@ -82,15 +82,16 @@ def test_fa60_peaked_scores(peak, device):
 
 @pytest.mark.slow
 @pytest.mark.parametrize("Tq, Tkv", [(2048, 16384), (2048, 30000)])
-def test_fa60_long(Tq, Tkv, device):
+@pytest.mark.parametrize("D, Hq", [(256, 24), (128, 16)])
+def test_fa60_long(Tq, Tkv, D, Hq, device):
     # Long cached prefix, against the SDPA window path (fp32 reference over 30000 keys does not fit everywhere)
     from exllamav3.modules.attention_fn.torch import _sdpa_chunks
     gen = torch.Generator(device = device).manual_seed(Tkv)
-    q = torch.randn(Tq, 24, 256, device = device, dtype = torch.half, generator = gen)
-    k = torch.randn(Tkv, 4, 256, device = device, dtype = torch.half, generator = gen)
-    v = torch.randn(Tkv, 4, 256, device = device, dtype = torch.half, generator = gen)
+    q = torch.randn(Tq, Hq, D, device = device, dtype = torch.half, generator = gen)
+    k = torch.randn(Tkv, 4, D, device = device, dtype = torch.half, generator = gen)
+    v = torch.randn(Tkv, 4, D, device = device, dtype = torch.half, generator = gen)
     o = torch.empty_like(q)
-    ext.fa60_fwd(q, k, v, o, 256 ** -0.5, True)
-    ref = _sdpa_chunks(q, k, v, Tkv, Tq, 24, 4, True, 256 ** -0.5, 512, True)
+    ext.fa60_fwd(q, k, v, o, D ** -0.5, True)
+    ref = _sdpa_chunks(q, k, v, Tkv, Tq, Hq, 4, True, D ** -0.5, 512, True)
     assert torch.isfinite(o).all()
     assert _rel_err(o, ref.float()) < 4e-3

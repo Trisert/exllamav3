@@ -152,6 +152,15 @@ Prefill after E10 + E11 vs the start: P100 2407 -> 3504 t/s at 4096 (+46 %), 187
 4k prefill at ~57 % of the fp16 peak); on the 2060 cuBLAS GEMMs on HMMA at ~22.6 TFLOPS average (70 %), close to
 the card.
 
+### Follow-ups for PR #4
+- Scope: QNF (Qwen3.8-Flash-Next) and Qwen3.6-35B-A3B have head_dim 256 and no sliding window, so E10 / E11 do not
+  apply to them (fa60 at head_dim 256 is bit-identical, output hashes on 3 cases).
+- test_fa60_long now covers head_dim 128 at 16384 / 30000 keys (passed).
+- m = 2..4 (perf script -sd, it/s at context 512; ctl = EXL3_UNFUSE_K8=0):
+  - RTX 2060 S=1/2/3/4: ctl a 117.3 / 101.9 / 100.7 / 99.3, default 130.1 / 104.6 / 104.1 / 102.8, ctl b
+    113.7 / 99.3 / 96.7 / 98.0. No regression at m = 2..4 from the unfused gate/up (+3-5 %).
+  - P100: ctl 67.5 / 62.7 / 60.1 / 60.0, default 122.6 / 97.8 / 87.6 / 87.4.
+
 ## STATUS after rounds 4-5 (final build 60280f40, re-measured)
 | metric | start | now |
 |---|---:|---:|
