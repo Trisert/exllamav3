@@ -58,3 +58,50 @@ glue ~1.7 ms: paged attention 0.58, norms 0.40, cuBLAS gemv2N 0.20, rope 0.12, c
   (wide 21). -> E4.
 - RTX 2060: run-to-run noise 5-8 % (boost clocks), microbench differences of 3-4 us are not resolvable; judged end-to-end
   only (E5: balanced split off).
+
+### Round 2 — both REJECTED
+| arm | d512 greedy | d8192 greedy |
+|---|---:|---:|
+| P100 ctl a (E4 off) | 126.8 | 117.7 |
+| P100 E4 (wide for n == k at K >= 7) | 125.2 | 116.3 |
+| P100 ctl b | 126.5 | 117.5 |
+| 2060 ctl a | 131.1 | 118.3 |
+| 2060 E5 (EXL3_GEMV_BALANCE=0) | 126.7 | 114.7 |
+| 2060 ctl b | 130.5 | 117.8 |
+| 2060 E5 repeat | 126.8 | 114.6 |
+- E4: -1.2 % end-to-end although the isolated microbench had the square shape 26.4 -> 22.7 us. The in-graph cost
+  does not follow the isolated one (back-to-back different shapes, L2 state); code removed.
+- E5: the balanced split is worth +3 % on the 2060 at 8 bpw: stays on.
+
+### Qualification (final build c200e416)
+- tests/kernels/gemm/test_exl3_gemv.py: 46 passed on both cards.
+- Needle (doc/lfm8_opt/needle.py, 16k 8-bit KV cache, chat template, greedy, reasoning on): 6/6 on both cards at
+  8.0k and 13.8k tokens, needle at 10 / 50 / 90 %.
+- Greedy oracle / decode ppl: see round 1.
+
+## STATUS (2026-11-22)
+| metric | baseline | now | floor (copy BW) |
+|---|---:|---:|---:|
+| P100 d512 greedy | 51.7 t/s | 126.5-126.8 t/s (x2.45) | ~323 t/s |
+| P100 d8192 greedy | 50.1 | 117.4-117.7 | |
+| 2060 d512 greedy | 117.8 | 129.3-131.1 (+10-11 %) | ~174 t/s |
+| 2060 d512 user sampler | 116.7 | 128.9 | |
+| 2060 d8192 greedy | 107.2 | 117.5-118.3 (+10 %) | |
+All medians of 3 x 256 tokens, util/bench_decode.py, graphs on, 16k 8-bit KV cache.
+
+What limits further gains:
+- P100 (7.9 ms/token): K=8 GEMV 6.5 ms at ~227 GB/s average in-graph (42 % of copy BW; the trellis decode is
+  instruction-issue bound on sm_60), small shapes (2048x2048, 2048x512) at 50-185 GB/s are fixed-latency bound,
+  glue ~1.7 ms.
+- 2060 (7.6 ms/token): GEMVs at ~226-261 GB/s (78-90 % of copy BW), lm_head 0.66 ms, glue ~0.6 ms. Near the practical
+  ceiling (~137-149 t/s).
+
+Remaining levers, ranked (estimated gain / cost):
+1. P100: per-head attention gate `gate_proj` (2048 -> 16, fp16, cuBLAS gemv2N 11 x ~18 us = 0.20 ms) as a tiny custom
+   kernel or folded into the q GEMV: ~2 %, half a day.
+2. P100: multi-matrix GEMV for the q/k/v bundle (one launch for 2048 x (2048 + 512 + 512)) to cut the fixed latency of
+   the small shapes (~0.3 ms): ~3-4 %, 1-2 days.
+3. P100: K=8 GEMV inner loop (instruction count per weight, HFMA2): the big one (up to ~1.5-2x on 6.5 ms), multi-day
+   kernel work.
+4. Not measured: m = 2..32 (batched decode / speculative verify) on sm_75 now runs two tile GEMMs for gate/up instead of
+   one fused MGEMM at 7 / 8 bpw (the m >= 2 K >= 5 GEMV is not enabled there). Batch-1 decode is unaffected.
