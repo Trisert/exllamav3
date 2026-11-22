@@ -174,6 +174,13 @@ Depth 32768: P100 99.2 t/s (10.08 ms; decode attention 3.09 ms = 28 % of the tok
   test_decode_live_split.py 56 passed. head_dim 256 models (QNF, Qwen3.6) keep 16.
 - Long-context gate (doc/lfm8_opt/longctx_gate.sh, 64k 8-bit cache): needle 3/3 at 49.0k tokens (10 / 50 / 90 %) on
   both cards; prefill to 64k (t/s) P100 16k 3046, 32k 2617, 64k 2024; RTX 2060 16k 5287, 32k 4295, 64k 3110.
+- Split kernel launch shape (warps,stages; `EXL3_ATTN_DECODE_WS`, doc/lfm8_opt/ws_sweep*.sh) — REJECTED, the
+  default 4,2 stays. P100 (tile 16 unless noted), depth 512 / 32768: 4,2 133.0 / 99.4 (control after: 132.8 / 99.3),
+  2,1 124.4 / 87.1, 2,2 124.5 / 87.0, 8,2 133.6 / 85.9, 4,1 132.9 / 99.6; tile 64 at 2,1 107.9 / 82.9, at 8,1
+  129.7 / 100.4 (+1 % at 32k for -2.5 % at 512). RTX 2060 (tile 64): 4,2 129.8 / 101.8 (control after 129.4 / 100.9),
+  2,1 123.8 / 81.3, 8,1 129.9 / 93.6, 2,2 123.7 / 80.9. Per-call profile on the P100 (prof_bn.sh): the split kernel
+  takes 40 us at 512 and 267 us at 32k with 16-key tiles, 71 / 207 us with 64 — the remaining long-context gap is in
+  the Triton kernel itself (scalar-FMA tl.dot on sm_60), not in its launch configuration.
 
 ## STATUS after rounds 4-5 (final build 60280f40, re-measured)
 | metric | start | now |

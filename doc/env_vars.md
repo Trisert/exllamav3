@@ -289,6 +289,12 @@ Key tile of the paged decode attention split kernel (eager and graphed BC paths)
 16), the generic size elsewhere. A value pins it for A/B testing. Raising the split target instead (2 -> 8 / 32 x SMs)
 measured neutral on both cards at 32k.
 
+### `EXL3_ATTN_DECODE_WS` (default: unset)
+
+`warps,stages` (e.g. `8,1`) pins the launch shape of the paged decode attention split kernel, overriding the backend
+default (4,2 on CUDA, 8,1 on ROCm; gfx1100 at head_dim <= 128 keeps its own 2,2). For A/B testing: on LFM3-1.7B
+8.0bpw no other shape beat 4,2 on the P100 or the RTX 2060 at depth 512 or 32k.
+
 ### `EXL3_QC_PREFILL_NS` (default: `0` = measure)
 
 Pipeline stage count for the direct quantized-cache prefill kernel. Unset/`0`, the best of

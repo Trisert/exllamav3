@@ -72,6 +72,9 @@ HC_FOLD = _env("EXL3_HC_FOLD", 0, 1) != "0"
 # lengths (more splits at short contexts, far fewer stalls at long ones); the QSA sparse split kernel
 # keeps the pair below
 ATTN_SPLIT_WARPS_STAGES = (8, 1) if ROCM else (4, 2)
+# EXL3_ATTN_DECODE_WS="warps,stages" pins the decode split kernel's launch shape (A/B testing)
+if os.environ.get("EXL3_ATTN_DECODE_WS"):
+    ATTN_SPLIT_WARPS_STAGES = tuple(int(x) for x in os.environ["EXL3_ATTN_DECODE_WS"].split(","))
 
 
 def attn_decode_config(device, hd_pad: int) -> tuple[int, int, int]:
