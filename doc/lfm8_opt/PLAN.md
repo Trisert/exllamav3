@@ -100,6 +100,40 @@ hit the fused router top-k and every other fp16 linear at <= 4 rows inside graph
 Lever 2 (one launch for k + v) cannot be done by concatenating the weights: each EXL3 tensor has its own input
 Hadamard signs (suh), so it needs a multi-matrix GEMV kernel.
 
+### Round 4 — K=8 GEMV inner loop on the P100 (kernel work)
+The P100 GEMV is instruction-bound: one 15.7M-weight matrix takes 38.6 / 47.0 / 48.9 us at 4 / 6 / 8 bpw (memory
+floor at 8 bpw: 29 us). SASS of the 8 bpw wide kernel's hot loop (doc/lfm8_opt/sass_hist.py): 634 instructions per
+64 weights per lane (XMAD 224, VABSDIFF4 64, HFMA2 64, MOV 58, fold 64, SHF.R.U64 48, LDS 32). Measured issue rates
+(doc/lfm8_opt/instr_rate.py): XMAD, LOP3, HFMA2, IADD full rate; VABSDIFF4, SHF, PRMT half rate.
+- E7 REJECTED: prefetch / fold depth 4 for the wide and balanced configs: 2048x7680 46.8-53.5 -> 54.6 us, K=4 worse too.
+- E8 ACCEPTED: fixed-offset staged decode for 8 bpw mul1 on sm_60 (s2 = 0 for every lane: windows at 24/16/8/0, 3 LDS
+  instead of 4, one immediate funnel shift instead of three variable SHF.R.U64). Bit-identical (output hashes on 5
+  shapes, greedy oracle 128/128 with dlogit 0). Microbench 2048x7680 49.0 -> 46.7 us, 7680x2048 50.2 -> 48.1.
+  End-to-end P100 127.3-127.8 -> **132.9-133.0** t/s at depth 512, 118.3-118.9 -> **123.0-123.1** at 8192.
+- E9 REJECTED: `#pragma unroll 2` on the k-slice loop (to drop the ring-rotation MOVs): big shapes 46.8 -> 50.8 us.
+Remaining in the loop: the 3 XMAD per weight of the mul1 product (no 32-bit IMAD on Pascal) and the half-rate
+VABSDIFF4 byte sum are inherent to this codebook; estimated floor ~7.4 issue slots per weight vs ~9.4 now.
+
+### Prefill (2026-11-22)
+Measurement note: the repo perf script only appends its own parent to sys.path, so a script under doc/ imported the
+venv's editable install (the main checkout) until doc/lfm8_opt/prefill_perf.py inserted the tree first; the first
+prefill numbers were from the main checkout (same prefill code, the control arms below agree with them).
+Profile, P100, 4096-token prefill (model.prefill, 1698 ms): exl3 GEMMs (reconstruct + HFMA2 GEMM) 911 ms at ~10.6
+TFLOPS (57 % of fp16 peak), **Triton `_paged_attn_prefill_kernel` 495 ms (the 5 sliding-window layers, ~0.13 TFLOPS)**,
+SDPA (6 full-attention layers) 190 ms.
+- E10 ACCEPTED (`EXL3_SDPA_SWA`): sliding-window layers on the dense-window SDPA path with a banded mask per q chunk.
+  Test: tests/kernels/attention/test_prefill_sdpa_window.py::test_sliding_window_path_matches_triton (24 cases, both
+  cards, vs the Triton kernel at 2e-3). Prefill ppl (doc/lfm8_opt/prefill_ppl.py): P100 11.03163 -> 11.03238 (4096
+  tokens, top-1 4082/4096), 2060 8.61278 -> 8.61413 (2048 tokens, top-1 2044/2048). Needle 6/6 on both cards.
+
+| prefill t/s (ctl a / E10 / ctl b) | P100 | RTX 2060 |
+|---|---|---|
+| 512 | 2452 / **3061** / 2397 | 3592 / **4899** / 3630 |
+| 2048 | 2504 / **3284** / 2459 | 4016 / **6473** / 4078 |
+| 4096 | 2427 / **3163** / 2386 | 4086 / **6628** / 4064 |
+| 8192 | 2211 / **2796** / 2184 | 3877 / **6156** / 3853 |
+| 16384 | 1885 / **2275** / 1861 | 3568 / **5399** / 3545 |
+
 ## STATUS (2026-11-22)
 | metric | baseline | now | floor (copy BW) |
 |---|---:|---:|---:|

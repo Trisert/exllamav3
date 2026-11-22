@@ -233,6 +233,16 @@ kernel keeps Turing's HMMA units busy. Decode and draft verification stay on the
 off on Turing. On sm_60 it is on because the Triton prefill kernel hits an illegal memory access
 there; head_dim 256 then runs `fa60` (below), other head sizes SDPA.
 
+### `EXL3_SDPA_SWA` (default: `1`)
+
+Extends the path above to causal sliding-window layers (left window, no softcap or sinks): each SDPA q chunk attends
+over its key band [first query - window, last query] with a banded mask instead of running the Triton prefill
+kernel, which has no tensor-core path on sm_60 / sm_75 (LFM3's 256-token windows ran at ~0.13 TFLOPS, 29 % of a
+4096-token prefill on the P100). LFM3-1.7B 8.0bpw prefill: P100 2407 -> 3163 t/s at 4096 tokens (1873 -> 2275 at
+16k), RTX 2060 4075 -> 6628 (3557 -> 5399). Matches the Triton kernel to 2e-3
+(`tests/kernels/attention/test_prefill_sdpa_window.py`); prefill ppl +0.007 % / +0.016 %. Read per call; `0` keeps
+the Triton kernel for windowed layers.
+
 ### `EXL3_FA75` (default: on for sm_75, off elsewhere)
 
 On the path above, head_dim 256 attention runs the `fa75` kernel (`exllamav3_ext/turing/fa75.cu`,

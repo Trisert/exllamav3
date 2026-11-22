@@ -65,3 +65,46 @@ def test_window_path_matches_triton(head_dim, bits, n_q, n_kv, q_len, fa75, devi
 
     assert torch.isfinite(out).all()
     torch.testing.assert_close(out, ref, rtol = 0, atol = 2e-3)
+
+
+def _run_w(q, kc, vc, qc, bt, sl, q_len, n_kv, window, k = None, v = None):
+    return paged_attn_triton_prefill(
+        q = q, k = k, v = v, k_cache = kc, v_cache = vc, block_table = bt, cache_seqlens = sl, causal = True,
+        qc = qc, max_kv_len = bt.shape[1] * PAGE, pre_appended_len = 0 if k is not None else q_len,
+        n_kv_heads_override = n_kv if qc is not None else None, window_size = (window, 0),
+    )
+
+
+@pytest.mark.parametrize("window", [64, 256])
+@pytest.mark.parametrize("bits", [0, 8], ids = ["fp16_cache", "q8_cache"])
+@pytest.mark.parametrize("n_q, n_kv", [(16, 4), (4, 4)], ids = ["gqa", "mha"])
+@pytest.mark.parametrize("q_len", [16, 300, 1100])
+def test_sliding_window_path_matches_triton(window, bits, n_q, n_kv, q_len, device, monkeypatch):
+    """Sliding-window chunks (EXL3_SDPA_SWA): banded chunked SDPA over the dense window vs the Triton kernel, with
+    chunks longer than one SDPA q chunk (512) so the band starts move"""
+    head_dim = 128
+    torch.manual_seed(window + bits + n_q + q_len)
+    bsz, ctx = 3, 2560
+    num_pages = ctx // PAGE
+    bt = torch.arange(bsz * num_pages, dtype = torch.int32, device = device).view(bsz, num_pages)
+    sl = torch.tensor([1000, 37, ctx - q_len - 5], dtype = torch.int32, device = device)
+    assert int(sl.max()) + q_len <= ctx
+    q = torch.randn((bsz, q_len, n_q, head_dim), dtype = torch.float16, device = device)
+    if bits:
+        kc, vc, qc = rand_packed_cache(bsz * num_pages, PAGE, n_kv, head_dim, bits, device)
+        kv = (None, None)
+    else:
+        kc = torch.randn((bsz * num_pages, PAGE, n_kv, head_dim), dtype = torch.float16, device = device)
+        vc = torch.randn_like(kc); qc = None
+        kv = (torch.randn((bsz, q_len, n_kv, head_dim), dtype = torch.float16, device = device),
+              torch.randn((bsz, q_len, n_kv, head_dim), dtype = torch.float16, device = device))
+
+    monkeypatch.setenv("EXL3_SDPA_PREFILL", "0")
+    ref = _run_w(q, kc.clone(), vc.clone(), qc, bt, sl, q_len, n_kv, window, *kv)
+
+    monkeypatch.setenv("EXL3_SDPA_PREFILL", "1")
+    monkeypatch.setenv("EXL3_SDPA_SWA", "1")
+    out = _run_w(q, kc.clone(), vc.clone(), qc, bt, sl, q_len, n_kv, window, *kv)
+
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, ref, rtol = 0, atol = 2e-3)
