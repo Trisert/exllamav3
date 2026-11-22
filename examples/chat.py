@@ -262,6 +262,8 @@ def main(args):
                     print_info("Press Alt-Enter to submit")
                     user_prompt = context[-1][0]
                     last_reply = context[-1][-1]
+                    if think:
+                        last_reply = prompt_format.edit_prefill(last_reply)
                     try:
                         prefix = read_input_fn(args, bot_name, True, last_reply)
                         context = context[:-1]

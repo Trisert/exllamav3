@@ -361,10 +361,13 @@ class BCAttn:
         k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, split_warps, split_stages,
                                   pointer_range_32 = self._pointer_range_32())
         if native:
-            k_split = ext.make_decode_split_native(
-                group = group_size, head_dim = hd, bits = 8, scale = float(self.sm_scale), n_kv_heads = kvh,
-                page_size = PAGE_SIZE, live_split = attn_live_split(dev), block_rows = block_rows,
-            )
+            # The function handle belongs to the current device's context: resolve it on the layer's device (as the
+            # Triton builder loads its module there), not on whichever GPU is current in layer-split inference
+            with torch.cuda.device(dev):
+                k_split = ext.make_decode_split_native(
+                    group = group_size, head_dim = hd, bits = 8, scale = float(self.sm_scale), n_kv_heads = kvh,
+                    page_size = PAGE_SIZE, live_split = attn_live_split(dev), block_rows = block_rows,
+                )
 
         sig_c = {
             "partial_o": "*fp32:16", "partial_ml": "*fp32:16", "out": "*fp16:16", "h32": "*fp16:16",

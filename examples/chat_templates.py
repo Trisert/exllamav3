@@ -25,6 +25,13 @@ class PromptFormat:
         # streams as the answer; None leaves the edited text after the prompt as is
         return None
 
+    def edit_prefill(self, reply):
+        # Reasoning mode, /e: the editor's starting text for a saved reply. Formats that resume the edit after a closed
+        # think block take the answer alone (the basic console saves the reply with its reasoning)
+        if self.edited_reply_think_block() and self.thinktag()[1] in reply:
+            return reply.split(self.thinktag()[1])[-1].lstrip()
+        return reply
+
 
 class PromptFormat_raw(PromptFormat):
     description = "Model-agnostic mode simulating a raw chatlog"

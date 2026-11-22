@@ -61,4 +61,10 @@ print(f"edited reply (/e, think): {'OK' if ok else 'MISMATCH'}")
 if not ok:
     print("  ours:", repr(tokenizer.bos_token + ours))
     print("  ref: ", repr(ref))
+# /e after a basic-console reply: the saved text still holds the reasoning; the editor starts from the answer alone, so
+# the resumed prompt is the one checked above
+saved = "<think>The user wants a quicksort.</think>" + edited
+ok = fmt.edit_prefill(saved) == edited and fmt.edit_prefill(edited) == edited
+fails += not ok
+print(f"edit prefill strips saved reasoning (/e, basic console): {'OK' if ok else 'MISMATCH'}")
 sys.exit(1 if fails else 0)
