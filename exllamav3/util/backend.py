@@ -77,9 +77,9 @@ ATTN_SPLIT_WARPS_STAGES = (8, 1) if ROCM else (4, 2)
 def attn_decode_config(device, hd_pad: int) -> tuple[int, int, int]:
     """(block_n, num_warps, num_stages) for the paged decode attention split kernel; block_n is the
     kv tile, the top of the shared-memory ladder on devices that cannot hold it"""
-    if hd_pad <= 128 and gfx_arch(device) == "gfx1100":
-        return 32, 2, 2
     env = os.environ.get("EXL3_ATTN_DECODE_BN")
+    if hd_pad <= 128 and gfx_arch(device) == "gfx1100":
+        return (int(env) if env else 32), 2, 2
     if env:
         return int(env), *ATTN_SPLIT_WARPS_STAGES
     if (attn_live_split(device) and not ROCM and hd_pad <= 128 and

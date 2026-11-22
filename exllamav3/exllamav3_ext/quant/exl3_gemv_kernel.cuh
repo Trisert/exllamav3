@@ -182,6 +182,10 @@ __device__ __forceinline__ void dq8_staged_8bits_mul1_sm60(const uint32_t* tp, i
     f0[1] = decode_mul1_product_2(mul1_product_h16<false>(wc >> 8), mul1_product_h16<false>(wc));
     f1[0] = decode_mul1_product_2(mul1_product_h16<false>(__funnelshift_r(wn, wc, 24)), mul1_product_h16<true>(wn));
     f1[1] = decode_mul1_product_2(mul1_product_h16<false>(wn >> 8), mul1_product_h16<false>(wn));
+#else
+    // The caller's EXL3_SM60 gate also covers native sm_61 / sm_62 builds, where mul1_product_h16 is not available:
+    // the generic staged decode there (same result)
+    dq_dispatch<8, 2>(tp, lane << 3, f0, f1);
 #endif
 }
 
