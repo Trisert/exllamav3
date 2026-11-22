@@ -88,6 +88,11 @@ glue ~1.7 ms: paged attention 0.58, norms 0.40, cuBLAS gemv2N 0.20, rope 0.12, c
 | 2060 d512 user sampler | 116.7 | 128.9 | |
 | 2060 d8192 greedy | 107.2 | 117.5-118.3 (+10 %) | |
 All medians of 3 x 256 tokens, util/bench_decode.py, graphs on, 16k 8-bit KV cache.
+Final build c200e416 re-measured: P100 126.5 / 117.5 greedy, user sampler 110.4 (d512) / 115.2 (d8192); 2060 130.5 /
+118.0 greedy, 129.3 / 116.7 user. Open observation: on the P100 the user sampler costs 1.15 ms/token at depth 512 but
+0.17 ms at 8192 (no P100 user-sampler baseline to compare; not investigated).
+Scope: the change applies to every 7 / 8 bpw mul1 tensor on Pascal and sm_75. The other local quants (Qwen3.8-Flash-Next
+1.66bpw, Qwen3.6-35B-A3B 4.00bpw) were not A/B'd; only an 8 bpw tensor in them (e.g. a head) would be affected.
 
 What limits further gains:
 - P100 (7.9 ms/token): K=8 GEMV 6.5 ms at ~227 GB/s average in-graph (42 % of copy BW; the trellis decode is
