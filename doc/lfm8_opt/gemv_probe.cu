@@ -90,5 +90,53 @@ int main(int argc, char** argv)
            k, n, cfg, bal, grid, block, copies, us, wbytes / us / 1e3,
            ph[0] / grid * c2us, mx[0] * c2us, ph[1] / grid * c2us, mx[1] * c2us, ph[2] / grid * c2us, mx[2] * c2us,
            ph[3] / grid * c2us, mx[3] * c2us, ph[4] / grid * c2us, mx[4] * c2us);
+#if (EXL3_GEMV_BAL_DBG) & 256
+    // Per-warp device-wide timeline of the last launch (ns from the earliest warp entry)
+    {
+        const int nw = grid * block / 32;
+        std::vector<unsigned long long> wt(nw * 4);
+        CK(cudaMemcpyFromSymbol(wt.data(), g_bal_wt, nw * 4 * sizeof(unsigned long long)));
+        unsigned long long t0 = ~0ull;
+        for (int w = 0; w < nw; ++w) t0 = std::min(t0, (EXL3_GEMV_BAL_DBG & 512) ? wt[w * 4 + 1] : wt[w * 4]);
+#if (EXL3_GEMV_BAL_DBG) & 512
+        // PROBE_SM=path: per warp "smid,main_end_us" lines
+        if (const char* smf = getenv("PROBE_SM"))
+        {
+            FILE* f = fopen(smf, "w");
+            for (int w = 0; w < nw; ++w) fprintf(f, "%llu,%d,%.2f,%.2f\n", wt[w * 4], w / (block / 32),
+                                                 (wt[w * 4 + 1] - t0) / 1e3, (wt[w * 4 + 2] - t0) / 1e3);
+            fclose(f);
+        }
+        for (int w = 0; w < nw; ++w) wt[w * 4] = t0;
+#endif
+        std::vector<double> entry(nw), in_end(nw), main_d(nw), main_end(nw), out(nw);
+        for (int w = 0; w < nw; ++w)
+        {
+            entry[w] = (wt[w * 4 + 0] - t0) / 1e3;
+            in_end[w] = (wt[w * 4 + 1] - t0) / 1e3;
+            main_end[w] = (wt[w * 4 + 2] - t0) / 1e3;
+            main_d[w] = main_end[w] - in_end[w];
+            out[w] = (wt[w * 4 + 3] - t0) / 1e3;
+        }
+        auto st = [] (std::vector<double> v) { std::sort(v.begin(), v.end()); return std::make_tuple(v.front(), v[v.size() / 2], v.back()); };
+        auto [e0, e1, e2] = st(entry); auto [i0, i1, i2] = st(in_end); auto [d0, d1, d2] = st(main_d);
+        auto [m0, m1, m2] = st(main_end); auto [o0, o1, o2] = st(out);
+        printf("  warps %d, us min/med/max: entry %.1f/%.1f/%.1f  input done %.1f/%.1f/%.1f  main dur %.1f/%.1f/%.1f  "
+               "main end %.1f/%.1f/%.1f  after sync %.1f/%.1f/%.1f\n",
+               nw, e0, e1, e2, i0, i1, i2, d0, d1, d2, m0, m1, m2, o0, o1, o2);
+        // Main duration by warp slot within the SM (block % 2 = co-resident pair index) and by block
+        double sum_slow = 0; int nslow = 0;
+        for (int w = 0; w < nw; ++w) if (main_d[w] > d1 * 1.1) { sum_slow += main_d[w]; ++nslow; }
+        printf("  warps > 1.1 x median main: %d (avg %.1f us)\n", nslow, nslow ? sum_slow / nslow : 0.0);
+        // PROBE_CSV=path: append one line of per-warp main durations (us), for cross-launch correlation
+        if (const char* csv = getenv("PROBE_CSV"))
+        {
+            FILE* f = fopen(csv, "a");
+            for (int w = 0; w < nw; ++w) fprintf(f, w ? ",%.2f" : "%.2f", main_d[w]);
+            fprintf(f, "\n");
+            fclose(f);
+        }
+    }
+#endif
     return 0;
 }

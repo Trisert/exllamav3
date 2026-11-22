@@ -42,6 +42,20 @@ __device__ unsigned long long g_bal_probe[4096 * 8];
 #else
 static __device__ unsigned long long g_bal_probe[1];
 #endif
+// & 256: per-warp %globaltimer (ns, device-wide) at kernel entry (& 512: the SM id instead), after the input stage, at
+// the end of the main loop and after the output-stage grid.sync, at [warp * 4 + i] (warp = block * warps per block +
+// warp in block); read by doc/lfm8_opt/gemv_probe.cu
+#if (EXL3_GEMV_BAL_DBG) & 256
+__device__ unsigned long long g_bal_wt[8192 * 4];
+#else
+static __device__ unsigned long long g_bal_wt[1];
+#endif
+__device__ __forceinline__ unsigned long long exl3_globaltimer()
+{
+    unsigned long long t;
+    asm volatile ("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
 
 namespace exl3_gemv_ns {
 
@@ -477,6 +491,13 @@ void exl3_gemv_body(EXL3_GEMM_ARGS, const exl3_gemv_ns::MultiView& mv)
     auto grid = cooperative_groups::this_grid();
     [[maybe_unused]] long long pr[5];
     if constexpr (EXL3_GEMV_BAL_DBG & 128) pr[0] = clock64();
+    [[maybe_unused]] const int wt_i = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * 4;
+    if constexpr (EXL3_GEMV_BAL_DBG & 256) if (threadIdx.x % 32 == 0)
+    {
+        unsigned int smid;
+        asm volatile ("mov.u32 %0, %%smid;" : "=r"(smid));
+        g_bal_wt[wt_i + 0] = (EXL3_GEMV_BAL_DBG & 512) ? (unsigned long long) smid : exl3_globaltimer();
+    }
 
     // Input scales and Hadamard transform, same as exl3_gemm_kernel
     {
@@ -513,6 +534,7 @@ void exl3_gemv_body(EXL3_GEMM_ARGS, const exl3_gemv_ns::MultiView& mv)
         grid.sync();
         A = A_had;
         if constexpr (EXL3_GEMV_BAL_DBG & 128) pr[1] = clock64();
+        if constexpr (EXL3_GEMV_BAL_DBG & 256) if (threadIdx.x % 32 == 0) g_bal_wt[wt_i + 1] = exl3_globaltimer();
     }
 
     const int warp = threadIdx.x / 32;
@@ -1041,11 +1063,13 @@ void exl3_gemv_body(EXL3_GEMM_ARGS, const exl3_gemv_ns::MultiView& mv)
 
     #undef XP
     if constexpr (EXL3_GEMV_BAL_DBG & 128) pr[2] = clock64();
+    if constexpr (EXL3_GEMV_BAL_DBG & 256) if (threadIdx.x % 32 == 0) g_bal_wt[wt_i + 2] = exl3_globaltimer();
 
     // Output scales and Hadamard transform, same semantics as the inner GEMM epilogue
     {
         grid.sync();
         if constexpr (EXL3_GEMV_BAL_DBG & 128) pr[3] = clock64();
+        if constexpr (EXL3_GEMV_BAL_DBG & 256) if (threadIdx.x % 32 == 0) g_bal_wt[wt_i + 3] = exl3_globaltimer();
 
         int total_warps = size_m * size_n / 128;
         if constexpr (MULTI) total_warps *= mv.num_slices;

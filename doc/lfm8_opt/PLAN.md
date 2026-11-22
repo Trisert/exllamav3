@@ -228,6 +228,16 @@ conv in_proj ~42, q / o_proj / conv out_proj (2048x2048) ~38, k / v (2048x512) ~
   REJECTED for sm_75: the headwise bundle is now limited to where the multi-matrix GEMV runs
   (InferParams.qkv_headwise_bundle: Pascal, EXL3_MGEMV and EXL3_QKV_HEADWISE on). After the gate: RTX 2060
   131.2 / 122.9 (unchanged), P100 141.8 / 130.4.
+- E14 balanced-split dynamic tail — REJECTED (code removed, probes kept). Per-warp %globaltimer / %smid probe
+  (gemv_probe.cu, EXL3_GEMV_BAL_DBG & 256 / 512), 2048x7680: no entry skew; main loop 25.6 / 36.9 / 42.0 us min /
+  median / max per warp for equal work, bimodal per block (~30 vs ~40) and uncorrelated between launches (r = 0.22).
+  But every SM holds exactly two blocks and the pair is fast + slow (29.7 / 41.0, ...): the warp scheduler favours one
+  block, the SM stays busy until its last block ends, and the per-SM end times are tight (37.9 / 38.9 / 42.0). The
+  "sync wait" is not idle SM time; at most ~3 us is recoverable across SMs. Tried anyway: the last DYN_NUM / 16 of each
+  group's k range as CL-slice chunks from an atomic counter (fixed slots, deterministic sum), probe in graph, us per
+  call 2048x7680 / 7680x2048 / 2048x15360 / 2048x6144: static 46.2 / 47.9 / 77.2 / 43.1; 2/16 CL 2: 51.2 / 54.2 /
+  80.9 / 44.8; 4/16 CL 1 / 2 / 4: 60.2 / 54.6 / 53.6 ...; 8/16 CL 2: 59.4 / 73.6 / 97.8 / 50.9 — every chunk restarts
+  the prefetch ring with its full load latency, worse in all cases (doc/lfm8_opt/dyn_sweep.sh).
 
 ## STATUS after rounds 4-5 (final build 60280f40, re-measured)
 | metric | start | now |
