@@ -729,10 +729,24 @@ void exl3_gemv_body(EXL3_GEMM_ARGS, const exl3_gemv_ns::MultiView& mv)
             const int i = ib + d;
             if (i >= myn) break;
 
+            // Staged words go to smem straight from the ring slot, which is refilled after the store: no register copy
+            // of the slot is live across the refill (the copy cost ~24 MOVs per 64 weights on sm_60)
             uint32_t bw[LOADS];
-            #pragma unroll
-            for (int l = 0; l < LOADS; ++l)
-                bw[l] = pf[d][l];
+            if constexpr (SMEM_STAGE)
+            {
+                __syncwarp();
+                #pragma unroll
+                for (int l = 0; l < LOADS; ++l)
+                    if (LSTRIDE == 32 || lane < LSTRIDE)
+                        sh_stage[warp][l * LSTRIDE + lane] = pf[d][l];
+                __syncwarp();
+            }
+            else
+            {
+                #pragma unroll
+                for (int l = 0; l < LOADS; ++l)
+                    bw[l] = pf[d][l];
+            }
 
             if (i + PF < myn)
             {
@@ -741,16 +755,6 @@ void exl3_gemv_body(EXL3_GEMM_ARGS, const exl3_gemv_ns::MultiView& mv)
                     pf[d][l] = EXL3_SM60 ? ld_b_off(pf_off, l) : ld_b(i + PF, l);
             }
             if constexpr (EXL3_SM60) pf_off += slice_stride;
-
-            if constexpr (SMEM_STAGE)
-            {
-                __syncwarp();
-                #pragma unroll
-                for (int l = 0; l < LOADS; ++l)
-                    if (LSTRIDE == 32 || lane < LSTRIDE)
-                        sh_stage[warp][l * LSTRIDE + lane] = bw[l];
-                __syncwarp();
-            }
 
             // A fragment: lane covers row lane/4, k pairs (2(lane%4), +1) and (+8, +9)
             const size_t a_col = (size_t) (ks0 + i) * 8 + (lane & 3);

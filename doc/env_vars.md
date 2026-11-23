@@ -308,6 +308,22 @@ identical, needle 3/3 at 49k. `tests/kernels/attention/test_decode_native.py`.
 
 Warps per CTA of the native decode split kernel (4 or 8). 8 measured +2.3 % at 32k on the P100 (LFM3), same at 512.
 
+### `EXL3_ATTN_NATIVE_HF` (default: `1`)
+
+Score loop of the native decode split kernel in HFMA2:
+- q is held as fp16 in shared memory, one LDS.128 per 8 dims and head;
+- key bytes are converted to exact centered half2 with LOP3 | 0x6400 plus one HSUB2;
+- each half accumulator takes 16 products, folded to fp32 per 32-dim scale group;
+- P × V stays fp32.
+
+`0` keeps the fp32 FMA loop.
+
+Measured on the P100, LFM3 8.0bpw, two A/Bs:
+- decode +1.1 % at depth 512, +1.1..1.6 % at 8k, +1.7..2.4 % at 32k;
+- greedy oracle 128/128 identical (max |dlogit| 0.031), decode ppl 9.93979 unchanged.
+
+Read when the kernel is created.
+
 ### `EXL3_ATTN_NATIVE_SPLITS` (default: `2`)
 
 Split target of the native decode kernel, in multiples of the SM count (the Triton kernel keeps 2). On the P100 4 gained
