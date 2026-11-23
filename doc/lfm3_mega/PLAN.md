@@ -74,3 +74,65 @@ The nsys trace gives the call counts. The per-call phases come from the round-7 
   - the input norm into the GEMV input stage (47.6 norm calls × ~5.6 µs);
   - the attention combine at short depth (11 × ~13 µs).
   - Roughly 2-4 % in total, days of work. These ops are also the building blocks (A) needs.
+
+## Round H: the decode GEMV hot loop on the P100 (2026-11-23)
+
+**Hot loop SASS** (doc/lfm3_mega/hot_loop.py: the loop with the most VABSDIFF4) of `exl3_mgemv_kernel<8,0,0,1,BAL>` (gate/up, 2.3 ms per token):
+- 599 instructions per 64 weights per lane, 10.6 issue slots per weight;
+- XMAD 128 + XMAD.PSL 96 (3.5 per weight);
+- VABSDIFF4 64 (half rate);
+- HFMA2 64 (0.5 per weight codebook scale, 0.5 per weight dot);
+- HADD2.F32 + FADD 32 + 32 (fp16 → fp32 fold);
+- MOV 56.
+
+GP100 issues 2 warp-instructions per clock per SM. At ~149 G per second the loop alone accounts for ~37 of the 46.7 µs, so the kernel is issue bound.
+
+- **H1 REJECTED** (code removed): fold every 64 terms instead of 32 in the CFG 1 (balanced) kernels.
+  - The fold became a branch every other ring pass, adding 16 MOVs.
+  - Microbench (ab_so_micro.sh, ctl / cand / ctl after warm-up): 2048 × 7680 46.8 / 46.7 µs, 7680 × 2048 48.1 / 47.9. Neutral.
+  - It would also have changed the numerics.
+- **H3a ACCEPTED**, bit-identical: the staged path stores the ring slot `pf[d]` to smem before refilling it, instead of copying it to `bw` first.
+  - MOVs drop from 56 to 16, and the loop from 599 to 562 instructions.
+  - The gated down kernel likewise goes to 564.
+  - Microbench (ctl / H3a / ctl, µs):
+
+    | shape | ctl | H3a | ctl | change |
+    |---|---:|---:|---:|---:|
+    | 2048 × 7680 | 50.7* | 45.3 | 46.8 | −3.2 % |
+    | 7680 × 2048 | 52.0* | 46.5 | 48.1 | −3.3 % |
+    | 2048 × 6144 | 43.5* | 39.9 | 40.9 | −2.5 % |
+    | 2048 × 2048 | 27.8 | 26.1 | 27.5 | −5 % |
+    | 2048 × 512 | 15.7 | 14.8 | 15.7 | −5.7 % |
+
+    \* The first control arm runs warm-up-cold.
+  - Decode A/B (ab_so_dec.sh, .so swap, t/s):
+
+    | card | depth | ctl | H3a | ctl | change |
+    |---|---|---:|---:|---:|---:|
+    | P100 | 512 | 144.9 | 149.2 | 144.2 | +3.0 % |
+    | P100 | 8k | 141.6 | 145.2 | 140.8 | +2.8 % |
+    | P100 | 32k | 131.0 | 133.3 | 129.4 | +2.4 % |
+    | RTX 2060 | 512 | 132.0 | 134.4 | 133.0 | +1.0-1.8 % |
+    | RTX 2060 | 8k | 124.0 | 125.9 | 124.6 | +1.0-1.8 % |
+    | RTX 2060 | 32k | 102.6 | 104.6 | 103.6 | +1.0-1.8 % |
+
+  - Greedy oracle: max |dlogit| 0 on both cards.
+  - test_exl3_gemv + test_exl3_mgemv: 190 passed on the P100, 187 on the 2060.
+- **Next:**
+  - H3b: the first product after a fold writes the fp16 partial fresh (`hmul2`) instead of accumulating into a reset zero. Bit-identical up to the sign of a zero.
+  - H2: the mul1 product in 2 XMADs (`XMAD.PSL x, 0x83DC, lo`). Needs SASS-level editing; ptxas never selects it.
+- **E16 (HFMA2 decode attention) re-read: the −4.7 % was that implementation, not HFMA2.**
+  - It loaded q one half2 at a time from smem: 2 LDS.32 per 4 dims and head, against 1 LDS.128 in the fp32 path.
+  - It converted bytes with half-rate PRMT.
+  - It converted p for every key in P × V.
+  - Registers grew from 94 to 118 on an occupancy-limited kernel.
+  - It ran before E20.
+  - **E16b plan:**
+    - HFMA2 for Q·K only, with P × V kept in fp32;
+    - q as uint4 (8 halves per LDS.128);
+    - bytes → half2 with LOP3 | 0x6400 plus an exact HSUB2;
+    - built on top of E20 (8 warps).
+
+**DSpark draft** (rasyosef/LFM3-1.7B-DSpark): looked at and dropped at the user's request.
+- It is a speculators DFlash backbone plus a Markov logit bias (rank 256), a confidence head and a 32k draft vocab with d2t.
+- The download was deleted.
