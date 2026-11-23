@@ -548,8 +548,9 @@ void rms_norm_post_pre_kernel
         if constexpr (residual_fp16)
         {
             write_half4(x4, ((half4*) (r + row_off)) + t);
-            // The second norm sees r as stored
-            read_half4<false>(x4, ((const half4*) (r + row_off)) + t);
+            // The second norm sees r as stored, clamped like the standalone norm's input loader (an overflowing
+            // residual update stores inf; the stored r keeps it)
+            read_half4<true>(x4, ((const half4*) (r + row_off)) + t);
         }
         else
             write_float4(x4, ((float4*) (r + row_off)) + t);
