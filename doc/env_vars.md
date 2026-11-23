@@ -304,6 +304,10 @@ softcap or sinks), GQA group 1 / 2 / 4 / 8. `1`: sm_60 only; `2`: every CUDA dev
 8.0bpw on the P100: 141.3 -> 140.6 t/s at depth 512, 129.9 -> 136.2 at 8k, 103.8 -> 123.4 at 32k; greedy oracle
 identical, needle 3/3 at 49k. `tests/kernels/attention/test_decode_native.py`.
 
+### `EXL3_ATTN_NATIVE_WARPS` (default: `8`)
+
+Warps per CTA of the native decode split kernel (4 or 8). 8 measured +2.3 % at 32k on the P100 (LFM3), same at 512.
+
 ### `EXL3_ATTN_NATIVE_SPLITS` (default: `2`)
 
 Split target of the native decode kernel, in multiples of the SM count (the Triton kernel keeps 2). On the P100 4 gained

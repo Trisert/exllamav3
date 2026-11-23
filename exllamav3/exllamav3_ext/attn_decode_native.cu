@@ -21,6 +21,7 @@
 #include <memory>
 #include <vector>
 #include <cstring>
+#include <cstdlib>
 #include <c10/util/Exception.h>
 #include "triton_kernel.h"
 #include "util.h"
@@ -30,7 +31,6 @@ namespace attn_native {
 
 constexpr int HD = 128;
 constexpr int NG = HD / 32;     // scale groups per head
-constexpr int WARPS = 4;
 constexpr int TILE = 32;        // keys per warp step
 
 __device__ __forceinline__ float byte_f(uint32_t w, int i)
@@ -39,7 +39,9 @@ __device__ __forceinline__ float byte_f(uint32_t w, int i)
     return __uint_as_float(0x4B000000u | ((w >> (8 * i)) & 0xffu)) - 8388608.0f;
 }
 
-template <int GROUP>
+// WARPS: warps per CTA, each walking every WARPS-th key tile of the split (EXL3_ATTN_NATIVE_WARPS; 8 by default:
+// LFM3 on the P100 at 32k 125.2 -> 128.1 t/s over 4, unchanged at 512)
+template <int GROUP, int WARPS>
 __global__ __launch_bounds__(WARPS * 32)
 void decode_split_kernel
 (
@@ -136,23 +138,35 @@ void decode_split_kernel
     const int* bt = block_table + (size_t) batch * num_pages_per_seq;
     const int gl = lane / 8;                    // scale group of this lane's 4 dims (P x V)
 
+    // This lane's key of the tile at n0_ (row 0 past the split end; its score is masked)
+    auto tok_of = [&] (int n0_) -> int
+    {
+        const int n = n0_ + lane;
+        if (n >= n_end) return 0;
+        const int page = n / page_size;
+        return bt[page] * page_size + (n - page * page_size);
+    };
+    auto load_k = [&] (int t, uint4 (&kw)[8], uint2& ks)
+    {
+        const uint4* kr = reinterpret_cast<const uint4*>(k_cache + (size_t) t * wpt + kv_head * (HD / 4));
+        #pragma unroll
+        for (int c = 0; c < 8; ++c) kw[c] = kr[c];
+        ks = *reinterpret_cast<const uint2*>(k_scales + (size_t) t * gpt + kv_head * NG);
+    };
+
     for (int n0 = n_start + warp * TILE; n0 < n_end; n0 += WARPS * TILE)
     {
         const int n = n0 + lane;
         const bool valid = n < n_end;
         const int nvalid = min(TILE, n_end - n0);
-        int tok = 0;
-        if (valid)
-        {
-            const int page = n / page_size;
-            tok = bt[page] * page_size + (n - page * page_size);
-        }
+        const int tok = tok_of(n0);
+        uint4 kw[8];
+        uint2 ksw;
+        load_k(tok, kw, ksw);
 
         // Scores, one key per lane
         float sc[GROUP];
         {
-            const uint4* kr = reinterpret_cast<const uint4*>(k_cache + (size_t) tok * wpt + kv_head * (HD / 4));
-            const uint2 ksw = *reinterpret_cast<const uint2*>(k_scales + (size_t) tok * gpt + kv_head * NG);
             const half2 ks01 = *reinterpret_cast<const half2*>(&ksw.x);
             const half2 ks23 = *reinterpret_cast<const half2*>(&ksw.y);
             const float ksc[NG] = { __low2float(ks01), __high2float(ks01), __low2float(ks23), __high2float(ks23) };
@@ -167,7 +181,7 @@ void decode_split_kernel
                 #pragma unroll
                 for (int c = 0; c < 2; ++c)
                 {
-                    const uint4 w = kr[g * 2 + c];
+                    const uint4 w = kw[g * 2 + c];
                     const uint32_t ws[4] = { w.x, w.y, w.z, w.w };
                     #pragma unroll
                     for (int wi = 0; wi < 4; ++wi)
@@ -279,7 +293,7 @@ void decode_split_kernel
 }
 
 template <int GROUP>
-static void* kernel_ptr() { return (void*) decode_split_kernel<GROUP>; }
+static void* kernel_ptr(int warps) { return warps == 4 ? (void*) decode_split_kernel<GROUP, 4> : (void*) decode_split_kernel<GROUP, 8>; }
 
 }  // namespace attn_native
 
@@ -298,13 +312,15 @@ std::shared_ptr<TritonKernel> make_decode_split_native
 {
     TORCH_CHECK(head_dim == attn_native::HD && bits == 8, "make_decode_split_native: head_dim 128, 8-bit cache only");
     TORCH_CHECK(group >= 1 && group <= block_rows && block_rows <= 32, "make_decode_split_native: bad row layout");
+    const char* w_env = std::getenv("EXL3_ATTN_NATIVE_WARPS");
+    const int warps = w_env && std::atoi(w_env) == 4 ? 4 : 8;
     void* fptr = nullptr;
     switch (group)
     {
-        case 1: fptr = attn_native::kernel_ptr<1>(); break;
-        case 2: fptr = attn_native::kernel_ptr<2>(); break;
-        case 4: fptr = attn_native::kernel_ptr<4>(); break;
-        case 8: fptr = attn_native::kernel_ptr<8>(); break;
+        case 1: fptr = attn_native::kernel_ptr<1>(warps); break;
+        case 2: fptr = attn_native::kernel_ptr<2>(warps); break;
+        case 4: fptr = attn_native::kernel_ptr<4>(warps); break;
+        case 8: fptr = attn_native::kernel_ptr<8>(warps); break;
         default: TORCH_CHECK(false, "make_decode_split_native: GQA group ", group, " not instantiated");
     }
     cudaFunction_t fn;
@@ -319,5 +335,5 @@ std::shared_ptr<TritonKernel> make_decode_split_native
         (void*) (intptr_t) (live_split ? 1 : 0),
         (void*) (intptr_t) block_rows,
     };
-    return std::make_shared<TritonKernel>((CUfunction) fn, fptr, "decode_split_native", attn_native::WARPS, 0, extra);
+    return std::make_shared<TritonKernel>((CUfunction) fn, fptr, "decode_split_native", warps, 0, extra);
 }

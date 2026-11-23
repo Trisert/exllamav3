@@ -307,6 +307,16 @@ sliding-window layers, banded chunks) 57 ms, fa60 (6 full-attention layers) 55 m
   (tests/kernels/gemm/test_hgemm_hfma2.py::test_hfma2_k64_flag, 53 passed). `EXL3_HGEMM_HFMA2_K64` = 0 / 1 forces it
   off / on for every model. Default run re-checked: LFM3 prefill ppl 11.02903.
 
+### Round 9 — native decode attention at long context (2026-11-23)
+- E20 ACCEPTED: 8 warps per CTA instead of 4 (same splits, so the combine is unchanged; `EXL3_ATTN_NATIVE_WARPS=4`
+  restores 4). P100 4 / 8 / 4 warps (doc/lfm8_opt/ab_dec.sh): 512 143.3 / 143.1 / 143.1, 8192 138.4 / 139.4 / 138.0,
+  32768 125.2 / 128.1 / 125.3 (+2.3 % at 32k). Per call at 32k ~206 -> ~156 us. test_decode_native 72 passed (both).
+- E21 REJECTED (code removed): the next tile's page lookup, key words and scales loaded before this tile's P x V.
+  8 warps, PF off / on / off: 512 143.0 / 142.7 / 142.9, 8192 139.5 / 139.3 / 139.1, 32768 128.1 / 127.9 / 128.4.
+- Where it stands: at 32k the attention is ~14 % of the token (~1.1 ms incl. the sliding layers' Triton split and
+  the combine) against a ~0.4 ms HBM2 floor; the rest is spread (P x V shuffles and dependent loads per key, the
+  scalar-FMA score loop); further work there is worth at most ~6 % at 32k.
+
 ## STATUS after rounds 7-8 (final build 68d6ba38, 2026-11-23; doc/lfm8_opt/qual_final.sh, one card at a time)
 | metric | start (Nov 22) | now P100 | now RTX 2060 |
 |---|---:|---:|---:|
