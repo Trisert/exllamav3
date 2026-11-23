@@ -327,6 +327,12 @@ outside each query block's band skipped) instead of the banded chunked SDPA. hea
 256. Read per call; `0` keeps SDPA. LFM3-1.7B 8.0bpw on the P100: prefill +3.9 % at 512 to +4.9 % at 4k-8k tokens,
 prefill ppl 11.03115 -> 11.03210. `tests/kernels/attention/test_fa60.py`.
 
+### `EXL3_GATED_DOWN` (default: `1`)
+
+At one token, the SwiGLU product (silu(gate) * up) runs inside the down projection's GEMV input stage instead of its
+own kernel (7 / 8 bpw mul1, act_limit 0). Bit-identical. `0` keeps the separate kernel. LFM3-1.7B 8.0bpw on the P100:
++0.6..0.8 % decode, neutral on the RTX 2060.
+
 ### `EXL3_NORM_POST_PRE` (default: `1`)
 
 Post-norm models (LFM3): the post-norm residual (`r += norm(y) * w`) and the next sublayer's input norm run as one

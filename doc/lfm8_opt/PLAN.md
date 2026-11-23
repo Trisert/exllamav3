@@ -317,6 +317,15 @@ sliding-window layers, banded chunks) 57 ms, fa60 (6 full-attention layers) 55 m
   the combine) against a ~0.4 ms HBM2 floor; the rest is spread (P x V shuffles and dependent loads per key, the
   scalar-FMA score loop); further work there is worth at most ~6 % at 32k.
 
+### Round 10 — decode fusions (2026-11-23)
+- E22 ACCEPTED: SwiGLU product inside the down projection's GEMV (`exl3_gemv_gated_kernel`, `EXL3_GATED_DOWN`):
+  at one token BC_GatedMLP passes the [gate | up] rows and the GEMV's input stage forms silu(gate) * up with
+  act_mul_kernel_h's half2 arithmetic before the Hadamard (had_hf_r_128_gated), so act_mul (24 launches per token)
+  goes; `exl3_gemv_gated_ok` decides ahead of the graph capture (dry run of the GEMV dispatch). Bit-identical:
+  greedy oracle off vs on max |dlogit| 0.0000 on both cards (doc/lfm8_opt/gated_check.sh); 243 kernels per token
+  (was 267). A/B (ab_dec.sh, ctl EXL3_GATED_DOWN=0): P100 512 143.4 / 144.3 / 143.1, 8192 139.6 / 140.2 / 139.2,
+  32768 129.0 / 129.5 / 128.3 (+0.6..0.8 %); RTX 2060 133.1 / 133.0 / 132.7, 124.7 / 124.6 / 124.1 (neutral).
+
 ## STATUS after rounds 7-8 (final build 68d6ba38, 2026-11-23; doc/lfm8_opt/qual_final.sh, one card at a time)
 | metric | start (Nov 22) | now P100 | now RTX 2060 |
 |---|---:|---:|---:|

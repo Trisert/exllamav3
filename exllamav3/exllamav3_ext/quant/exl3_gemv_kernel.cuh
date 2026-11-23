@@ -445,10 +445,14 @@ __device__ __forceinline__ void* multi_out(const MultiView& mv, int sl, int r, i
 
 }  // namespace exl3_gemv_ns
 
-template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF, bool BAL, bool MULTI>
+// GATED (m = 1, single matrix): A holds the gate row and the up row follows it (A + size_k); the input stage feeds
+// silu(gate) * up into the Hadamard transform (had_hf_r_128_gated), so the SwiGLU product needs no launch of its own
+template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF, bool BAL, bool MULTI,
+          bool GATED = false>
 __device__ __forceinline__
 void exl3_gemv_body(EXL3_GEMM_ARGS, const exl3_gemv_ns::MultiView& mv)
 {
+    static_assert(!GATED || (MMODE == 0 && !MULTI && !HALF), "gated input: m == 1, single matrix");
     static_assert(!BAL || MMODE == 0, "balanced work split: m == 1 only");
     static_assert(!MULTI || !HALF, "multi-matrix view: integer rates only");
     static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2) : (bits >= 2 && bits <= 8),
@@ -521,6 +525,15 @@ void exl3_gemv_body(EXL3_GEMM_ARGS, const exl3_gemv_ns::MultiView& mv)
                     0.088388347648f  // 1/sqrt(128)
                 );
             }
+            else if constexpr (GATED)
+                had_hf_r_128_gated
+                (
+                    A + this_warp * 128,
+                    A + size_k + this_warp * 128,
+                    A_had + this_warp * 128,
+                    suh + this_warp * 128,
+                    0.088388347648f  // 1/sqrt(128)
+                );
             else
                 had_hf_r_128_inner<true, false>
                 (
@@ -1167,6 +1180,15 @@ __global__ __launch_bounds__(CFG == 0 ? 512 : 256, ((HALF && CFG == 0) || BAL) ?
 void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 {
     exl3_gemv_body<bits, c_fp32, cb, MMODE, CFG, SMEM_STAGE, HALF, BAL, false>
+        (A, B, C, size_m, size_k, size_n, locks, suh, A_had, svh, exl3_gemv_ns::MultiView {});
+}
+
+// m = 1 GEMV over a gated input (SwiGLU down projection): A = [gate row | up row] (see GATED), mul1, staged words
+template <int bits, bool c_fp32, int CFG, bool BAL>
+__global__ __launch_bounds__(CFG == 0 ? 512 : 256, BAL ? 2 : 1)
+void exl3_gemv_gated_kernel(EXL3_GEMM_ARGS)
+{
+    exl3_gemv_body<bits, c_fp32, 2, 0, CFG, true, false, BAL, false, true>
         (A, B, C, size_m, size_k, size_n, locks, suh, A_had, svh, exl3_gemv_ns::MultiView {});
 }
 

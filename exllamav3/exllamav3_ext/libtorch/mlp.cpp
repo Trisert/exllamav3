@@ -72,6 +72,17 @@ void BC_GatedMLP::run_bszN_gr
     at::Tensor g = gu_n.select(0, 0).unsqueeze(0);
     at::Tensor u = gu_n.select(0, 1).unsqueeze(0);
 
+    // One token, SwiGLU without a limit: the down projection's GEMV reads [gate | up] (contiguous rows of gu_n) and
+    // forms silu(gate) * up in its input stage, bit-identical to silu_mul + the plain GEMV (EXL3_GATED_DOWN)
+    at::Tensor g_row = gu_n.select(0, 0);
+    if (num_tokens == 1 && act_silu && act_limit == 0.0f && !down->bias && g_row.dtype() == at::kHalf &&
+        exl3_gemv_gated_ok(g_row, down->trellis, d, down->mcg, down->mul1, down->suh, down_xh_n, down->svh))
+    {
+        exl3_gemm_gr(g_row, down->trellis, d, down->suh, down_xh_n, down->svh, -1, down->mcg, down->mul1, 0, graph,
+                     true);
+        return;
+    }
+
     if (act_silu)
         silu_mul_gr(g, u, a_n, act_limit, graph);
     else if (act_gelu)

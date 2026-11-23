@@ -24,8 +24,15 @@ bool exl3_gemv_try_launch
     int device,
     cudaStream_t stream,
     void** launched_kernel,
-    bool force
+    bool force,
+    // gated: A is [gate row | up row] and the kernel feeds silu(gate) * up (m = 1, mul1, 7 / 8 bpw); dry: decide
+    // without launching (true = this call would launch)
+    bool gated = false,
+    bool dry = false
 );
+
+// Gated-input GEMV instances (comp_units/exl3_gemv_gated_inst.cu)
+void* exl3_gemv_select_kernel_gated(int bits, bool c_fp32, int cfg, bool bal);
 
 // Kernel instances for the half-integer bitrates (comp_units/exl3_gemv_half_inst.cu)
 void* exl3_gemv_select_kernel_half(int bits, bool c_fp32, int mmode, int cfg, bool smem);

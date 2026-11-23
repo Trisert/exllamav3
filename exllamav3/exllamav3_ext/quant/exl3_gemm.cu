@@ -115,6 +115,40 @@ uint64_t mgemm_autotune_hash
     return h;
 }
 
+bool exl3_gemv_gated_ok
+(
+    const at::Tensor& A,
+    const at::Tensor& B,
+    const at::Tensor& C,
+    bool mcg,
+    bool mul1,
+    const c10::optional<at::Tensor>& suh,
+    const c10::optional<at::Tensor>& A_had,
+    const c10::optional<at::Tensor>& svh
+)
+{
+#if defined(USE_ROCM)
+    return false;
+#else
+    static const bool on = [] { const char* e = std::getenv("EXL3_GATED_DOWN"); return !e || std::atoi(e) != 0; }();
+    if (!on || !mul1 || mcg) return false;
+    if (!suh || !A_had || !svh) return false;
+    if (A.dtype() != at::kHalf || B.dtype() != at::kShort || B.dim() != 3) return false;
+    if (C.dtype() != at::kHalf && C.dtype() != at::kFloat) return false;
+    int size_m = 1;
+    for (int d = 0; d < A.dim() - 1; ++d) size_m *= A.size(d);
+    if (size_m != 1) return false;
+    const int tile_u16 = B.size(2);
+    if (tile_u16 % 16) return false;
+    const int size_k = A.size(-1), size_n = B.size(1) * 16;
+    const at::cuda::OptionalCUDAGuard device_guard(A.device());
+    int device;
+    cudaGetDevice(&device);
+    return exl3_gemv_try_launch(nullptr, 1, size_k, size_n, tile_u16 / 16, false, 2, C.dtype() == at::kFloat, true,
+                                device, nullptr, nullptr, false, true, true);
+#endif
+}
+
 int exl3_gemm_gr
 (
     const at::Tensor& A,
@@ -127,11 +161,15 @@ int exl3_gemm_gr
     bool mcg,
     bool mul1,
     int force_num_sms,
-    Graph* graph
+    Graph* graph,
+    bool gated
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+#if defined(USE_ROCM)
+    TORCH_CHECK(!gated, "exl3_gemm: no gated-input GEMV on ROCm");
+#endif
 
     TORCH_CHECK_DIM(B, 3);
     TORCH_CHECK_SHAPES(A, -1, B, 0, 16);
@@ -221,7 +259,7 @@ int exl3_gemm_gr
     // processed as successive GEMV launches, so this is only sensible for small m (the reconstruct
     // threshold keeps m <= 144 in practice). Not graph-capturable yet; graphed callers fall through
     // to the regular kernel.
-    if (mul1 && exl3_gemv_int8_enabled())
+    if (!gated && mul1 && exl3_gemv_int8_enabled())
     {
         if (exl3_gemv_int8(A, B, C, suh, A_had, svh, stream, graph))
             return 0;
@@ -285,7 +323,7 @@ int exl3_gemm_gr
             (
                 kernelArgs, size_m, size_k, size_n, K, half_k, cb, c_fp32,
                 suh_ptr && A_had_ptr && svh_ptr,
-                device, stream, &gemv_kernel, false
+                device, stream, &gemv_kernel, false, gated
             ))
             {
                 add_graph_args(gemv_kernel);
@@ -294,6 +332,8 @@ int exl3_gemm_gr
             }
         }
     }
+
+    TORCH_CHECK(!gated, "exl3_gemm: gated-input GEMV not applicable (check exl3_gemv_gated_ok first)");
 
 #if defined(USE_ROCM)
     // RDNA: blocks request only the LDS the compatible shapes need rather than the whole workgroup allocation,

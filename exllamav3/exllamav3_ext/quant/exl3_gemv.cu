@@ -212,9 +212,12 @@ bool exl3_gemv_try_launch
     int device,
     cudaStream_t stream,
     void** launched_kernel,
-    bool force
+    bool force,
+    bool gated,
+    bool dry
 )
 {
+    if (gated && (size_m != 1 || half_k || cb != 2)) return false;
     // Free integer checks first; the env read (~64 ns) and device queries only run for calls
     // that could actually take this path
     if (!has_su_sv) return false;
@@ -272,6 +275,7 @@ bool exl3_gemv_try_launch
 
     auto select = [&] (int cfg_) -> void*
     {
+        if (gated) return exl3_gemv_select_kernel_gated(K, c_fp32, cfg_, false);
         return half_k ? exl3_gemv_select_kernel_half(K, c_fp32, mmode, cfg_, smem)
                       : exl3_gemv_select_kernel(K, cb, c_fp32, mmode, cfg_, smem);
     };
@@ -304,7 +308,7 @@ bool exl3_gemv_try_launch
         const int bal_mode = force ? (exl3_gemv_env_balance() == 2 ? 2 : 0) : exl3_gemv_env_balance();
         if (bal_mode)
         {
-            void* bal_kernel = exl3_gemv_select_kernel_bal(K, c_fp32, 1);
+            void* bal_kernel = gated ? exl3_gemv_select_kernel_gated(K, c_fp32, 1, true) : exl3_gemv_select_kernel_bal(K, c_fp32, 1);
             if (bal_kernel)
             {
                 const int bal_blocks = occupancy(bal_kernel, 256) * num_sms;
@@ -329,6 +333,7 @@ bool exl3_gemv_try_launch
         }
     }
 
+    if (dry) return true;
     cuda_check(cudaLaunchCooperativeKernel
     (
         kernel,
