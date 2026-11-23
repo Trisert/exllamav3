@@ -118,8 +118,12 @@ GP100 issues 2 warp-instructions per clock per SM. At ~149 G per second the loop
 
   - Greedy oracle: max |dlogit| 0 on both cards.
   - test_exl3_gemv + test_exl3_mgemv: 190 passed on the P100, 187 on the 2060.
+- **H3b REJECTED** (code removed): the first product after a fold writes the fp16 partial fresh (`hmul2`) instead of accumulating into a reset zero.
+  - Hot loop 562 → 549 instructions.
+  - Microbench H3a / H3b / H3a: 2048 × 7680 45.3 / 45.2 / 45.3 µs, 7680 × 2048 46.5 / 46.5 / 46.5. Neutral: the resets were already hidden.
+  - Static instruction counts over-predict (H1, H3b). H3a's win comes from the earlier smem store as much as from the dropped MOVs.
 - **Next:**
-  - H3b: the first product after a fold writes the fp16 partial fresh (`hmul2`) instead of accumulating into a reset zero. Bit-identical up to the sign of a zero.
+  - E16b (below).
   - H2: the mul1 product in 2 XMADs (`XMAD.PSL x, 0x83DC, lo`). Needs SASS-level editing; ptxas never selects it.
 - **E16 (HFMA2 decode attention) re-read: the −4.7 % was that implementation, not HFMA2.**
   - It loaded q one half2 at a time from smem: 2 LDS.32 per 4 dims and head, against 1 LDS.128 in the fp32 path.
