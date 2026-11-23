@@ -39,9 +39,23 @@ __device__ __forceinline__ float byte_f(uint32_t w, int i)
     return __uint_as_float(0x4B000000u | ((w >> (8 * i)) & 0xffu)) - 8388608.0f;
 }
 
+// Key word w (dims d .. d + 3) as two half2 of exact centered bytes: lo = {b0, b2} - 128, hi = {b1, b3} - 128. The
+// masked bytes under 0x6400 are the fp16 patterns of 1024 + byte (LOP3, full rate), one HSUB2 takes 1152 off each
+__device__ __forceinline__ void key_h2(uint32_t w, half2& lo, half2& hi)
+{
+    const half2 c1152 = __half2half2(__ushort_as_half(0x6480));
+    half2_uint32 ul((w & 0x00ff00ffu) | 0x64006400u);
+    half2_uint32 uh(((w >> 8) & 0x00ff00ffu) | 0x64006400u);
+    lo = __hsub2(ul.as_half2, c1152);
+    hi = __hsub2(uh.as_half2, c1152);
+}
+
 // WARPS: warps per CTA, each walking every WARPS-th key tile of the split (EXL3_ATTN_NATIVE_WARPS; 8 by default:
 // LFM3 on the P100 at 32k 125.2 -> 128.1 t/s over 4, unchanged at 512)
-template <int GROUP, int WARPS>
+// HF: the score loop in HFMA2 (EXL3_ATTN_NATIVE_HF): q as fp16 in smem, interleaved {q0, q2}, {q1, q3} per 4 dims to
+// pair with key_h2, one LDS.128 per 8 dims and head; runs of 16 products per half accumulator, folded to fp32 per
+// scale group. P x V stays fp32
+template <int GROUP, int WARPS, bool HF>
 __global__ __launch_bounds__(WARPS * 32)
 void decode_split_kernel
 (
@@ -83,8 +97,9 @@ void decode_split_kernel
     const int gpt = n_kv_heads * NG;            // scale groups per token row
     const int wpt = n_kv_heads * HD / 4;        // 32-bit words per token row
 
-    __shared__ float q_s[GROUP][HD];            // rotated, pre-scaled q rows
-    __shared__ float qsum_s[GROUP][NG];         // per scale group sum of q_s (the 127.5 offset)
+    __shared__ float q_s[HF ? 1 : GROUP][HF ? 1 : HD];      // rotated, pre-scaled q rows
+    __shared__ __align__(16) half qh_s[HF ? GROUP : 1][HF ? HD : 8];   // HF: rotated q rows (fp16, unscaled, interleaved)
+    __shared__ float qsum_s[GROUP][NG];         // per scale group sum of the q row (the 127.5 offset; HF: unscaled)
     __shared__ float m_s[WARPS][GROUP], l_s[WARPS][GROUP];
     __shared__ float acc_s[WARPS][GROUP][HD];
 
@@ -101,8 +116,19 @@ void decode_split_kernel
             const float y = __shfl_xor_sync(0xffffffffu, x, s);
             x = (lane & s) ? y - x : x + y;
         }
-        x = __half2float(__float2half_rn(x * 0.17677669529663687f)) * scale;   // 1 / sqrt(32)
-        q_s[h][g * 32 + lane] = x;
+        const half xh = __float2half_rn(x * 0.17677669529663687f);   // 1 / sqrt(32)
+        if constexpr (HF)
+        {
+            // dim 4j + r -> half2 entry 2j + (r & 1), half r >> 1
+            const int dd = g * 32 + lane, j = dd >> 2, r = dd & 3;
+            qh_s[h][(2 * j + (r & 1)) * 2 + (r >> 1)] = xh;
+            x = __half2float(xh);
+        }
+        else
+        {
+            x = __half2float(xh) * scale;
+            q_s[h][g * 32 + lane] = x;
+        }
         float sum = x;
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
@@ -172,6 +198,45 @@ void decode_split_kernel
             const float ksc[NG] = { __low2float(ks01), __high2float(ks01), __low2float(ks23), __high2float(ks23) };
             #pragma unroll
             for (int h = 0; h < GROUP; ++h) sc[h] = 0.0f;
+            if constexpr (HF)
+            {
+                // q . (b - 127.5) = sum q (b - 128) + 0.5 sum q, per scale group
+                #pragma unroll
+                for (int g = 0; g < NG; ++g)
+                {
+                    half2 dh[GROUP];
+                    #pragma unroll
+                    for (int h = 0; h < GROUP; ++h) dh[h] = __half2half2(__ushort_as_half(0));
+                    #pragma unroll
+                    for (int c = 0; c < 2; ++c)
+                    {
+                        const uint4 w = kw[g * 2 + c];
+                        const uint32_t ws[4] = { w.x, w.y, w.z, w.w };
+                        #pragma unroll
+                        for (int wp = 0; wp < 2; ++wp)
+                        {
+                            half2 lo0, hi0, lo1, hi1;
+                            key_h2(ws[wp * 2], lo0, hi0);
+                            key_h2(ws[wp * 2 + 1], lo1, hi1);
+                            const int e0 = (g * 32 + c * 16 + wp * 8) / 2;      // half2 entry of the 8 dims
+                            #pragma unroll
+                            for (int h = 0; h < GROUP; ++h)
+                            {
+                                const uint4 qu = *reinterpret_cast<const uint4*>(&qh_s[h][e0 * 2]);
+                                dh[h] = __hfma2(*reinterpret_cast<const half2*>(&qu.x), lo0, dh[h]);
+                                dh[h] = __hfma2(*reinterpret_cast<const half2*>(&qu.y), hi0, dh[h]);
+                                dh[h] = __hfma2(*reinterpret_cast<const half2*>(&qu.z), lo1, dh[h]);
+                                dh[h] = __hfma2(*reinterpret_cast<const half2*>(&qu.w), hi1, dh[h]);
+                            }
+                        }
+                    }
+                    #pragma unroll
+                    for (int h = 0; h < GROUP; ++h)
+                        sc[h] = fmaf(ksc[g] * (scale * (1.0f / 128.0f)),
+                                     __low2float(dh[h]) + __high2float(dh[h]) + 0.5f * qsum_s[h][g], sc[h]);
+                }
+            }
+            else
             #pragma unroll
             for (int g = 0; g < NG; ++g)
             {
@@ -293,7 +358,11 @@ void decode_split_kernel
 }
 
 template <int GROUP>
-static void* kernel_ptr(int warps) { return warps == 4 ? (void*) decode_split_kernel<GROUP, 4> : (void*) decode_split_kernel<GROUP, 8>; }
+static void* kernel_ptr(int warps, bool hf)
+{
+    if (hf) return warps == 4 ? (void*) decode_split_kernel<GROUP, 4, true> : (void*) decode_split_kernel<GROUP, 8, true>;
+    return warps == 4 ? (void*) decode_split_kernel<GROUP, 4, false> : (void*) decode_split_kernel<GROUP, 8, false>;
+}
 
 }  // namespace attn_native
 
@@ -314,13 +383,15 @@ std::shared_ptr<TritonKernel> make_decode_split_native
     TORCH_CHECK(group >= 1 && group <= block_rows && block_rows <= 32, "make_decode_split_native: bad row layout");
     const char* w_env = std::getenv("EXL3_ATTN_NATIVE_WARPS");
     const int warps = w_env && std::atoi(w_env) == 4 ? 4 : 8;
+    const char* hf_env = std::getenv("EXL3_ATTN_NATIVE_HF");
+    const bool hf = !hf_env || std::atoi(hf_env) != 0;     // default on (P100 +1.1 % at 512, +1.7..2.4 % at 32k)
     void* fptr = nullptr;
     switch (group)
     {
-        case 1: fptr = attn_native::kernel_ptr<1>(warps); break;
-        case 2: fptr = attn_native::kernel_ptr<2>(warps); break;
-        case 4: fptr = attn_native::kernel_ptr<4>(warps); break;
-        case 8: fptr = attn_native::kernel_ptr<8>(warps); break;
+        case 1: fptr = attn_native::kernel_ptr<1>(warps, hf); break;
+        case 2: fptr = attn_native::kernel_ptr<2>(warps, hf); break;
+        case 4: fptr = attn_native::kernel_ptr<4>(warps, hf); break;
+        case 8: fptr = attn_native::kernel_ptr<8>(warps, hf); break;
         default: TORCH_CHECK(false, "make_decode_split_native: GQA group ", group, " not instantiated");
     }
     cudaFunction_t fn;

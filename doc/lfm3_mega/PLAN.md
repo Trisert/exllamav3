@@ -140,3 +140,36 @@ GP100 issues 2 warp-instructions per clock per SM. At ~149 G per second the loop
 **DSpark draft** (rasyosef/LFM3-1.7B-DSpark): looked at and dropped at the user's request.
 - It is a speculators DFlash backbone plus a Markov logit bias (rank 256), a confidence head and a 32k draft vocab with d2t.
 - The download was deleted.
+
+## E16b ACCEPTED: HFMA2 score loop in the native decode attention (2026-11-23)
+
+`EXL3_ATTN_NATIVE_HF`, default on. The changes against E16:
+- HFMA2 for Q·K only; P × V stays fp32, so there is no per-key p conversion;
+- q is held as fp16 in smem, interleaved {q0, q2}, {q1, q3}, and read with one LDS.128 per 8 dims and head (E16 needed 4×);
+- bytes → half2 with LOP3 | 0x6400 plus an exact HSUB2 (E16 used PRMT, half rate on sm_60);
+- 94-96 registers (E16 used 118).
+
+Results:
+- test_decode_native: 72 passed on both cards.
+- P100 decode A/B (ab_dec.sh, HF 0 / 1 / 0, t/s):
+
+  | run | depth 512 | depth 8k | depth 32k |
+  |---|---|---|---|
+  | 1 | 149.5 / 151.1 / 149.3 | 145.6 / 147.2 / 144.9 | 134.6 / 135.9 / 132.7 |
+  | 2 (repeat) | 149.5 / 151.1 / 149.3 | 145.3 / 147.0 / 145.0 | 132.8 / 135.5 / 133.2 |
+
+  That is +1.1 % / +1.1..1.6 % / +1.7..2.4 %.
+- Greedy oracle 128/128 identical (max |dlogit| 0.031); decode ppl 9.93979 in both arms.
+- RTX 2060: neutral (134.3 / 134.4 / 134.6 at 512), as expected: the native kernel is sm_60-only by default.
+
+## LFM3-1.7B 4.0bpw vs 8.0bpw on the current build (doc/lfm3_mega/bench_4bpw.sh)
+
+| card | 8.0bpw t/s (512 / 8k / 32k) | 4.0bpw t/s | decode ppl 8.0 → 4.0 |
+|---|---|---|---|
+| P100 | 149.4 / 145.2 / 133.0 | 156.1 / 152.0 / 139.8 (+4.5 %) | 9.93979 → 9.97686 |
+| RTX 2060 | 134.5 / 125.8 / 104.6 | 189.6 / 172.4 / 134.2 (+41 / +37 / +28 %) | 9.94076 → 9.97451 |
+
+- **RTX 2060:** the decode is bandwidth bound, so halving the weight bytes nearly pays out in full.
+- **P100:** the gain is small. The hill-climb tuned the K = 7/8 paths, and K = 4 on Pascal has no multi-matrix GEMV (use_mgemm gates K 7/8) and no staged sm_60 decode.
+  - Round-4 microbench: 38.6 µs (4 bpw) vs 48.9 µs (8 bpw) per 15.7 M-weight matrix.
+  - That leaves an estimated +15-20 % for a K = 4 pass on the P100.
