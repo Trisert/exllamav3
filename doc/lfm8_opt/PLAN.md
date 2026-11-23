@@ -307,6 +307,21 @@ sliding-window layers, banded chunks) 57 ms, fa60 (6 full-attention layers) 55 m
   (tests/kernels/gemm/test_hgemm_hfma2.py::test_hfma2_k64_flag, 53 passed). `EXL3_HGEMM_HFMA2_K64` = 0 / 1 forces it
   off / on for every model. Default run re-checked: LFM3 prefill ppl 11.02903.
 
+## STATUS after rounds 7-8 (final build 68d6ba38, 2026-11-23; doc/lfm8_opt/qual_final.sh, one card at a time)
+| metric | start (Nov 22) | now P100 | now RTX 2060 |
+|---|---:|---:|---:|
+| decode d512 / d8192 / d32768 (t/s) | P100 51.7 / 50.1 / -; 2060 117.8 / 107.2 / 90.5 | **143.5 / 138.7 / 125.8** | **132.9 / 124.5 / 103.4** |
+| prefill 4096 / 16384 (t/s) | P100 2407 / 1873; 2060 4075 / 3557 | **3767 / 3278** | **6646 / 5455** |
+Kernel suites (gemv / mgemv / hfma2 / mgemm sliced / native decode / fa60 / sdpa window / live split / norms): 1345
+passed on the P100, 1297 on the RTX 2060. Greedy oracle 128/128 identical to the round-6/7 builds on both cards
+(2060 max |dlogit| 0, P100 0.031), decode ppl 9.93979 (P100) / 9.94076 (2060), needle 3/3 at 49.0k tokens on both,
+chat.py one-shot (lfm3 mode, think, recommended sampling) correct Lomuto quicksort in Go at 106 t/s (P100) / 129 t/s
+(2060).
+Rounds 7-8 on the P100: decode +8.3 % at 512, +13 % at 8k, +27 % at 32k over round 6; prefill +5 % (4k).
+Remaining (ranked): native decode attention at ~173 GB/s per call at 32k (occupancy / latency, not HFMA2: E16);
+fusions toward a megakernel (act_mul into the down GEMV input stage, the input norm into the GEMV); small prefill
+kernels (~90 ms of ~1050 at 4k).
+
 ## STATUS after rounds 4-5 (final build 60280f40, re-measured)
 | metric | start | now |
 |---|---:|---:|
