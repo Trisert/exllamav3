@@ -1,6 +1,7 @@
 #include <cuda_fp16.h>
 
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -64,6 +65,7 @@
 
 #include "libtorch/gated_delta_net.h"
 #include "libtorch/attention.h"
+#include "attn_decode_native.h"
 #include "libtorch/shared_kv_attention.h"
 #include "libtorch/mla_attention.h"
 #include "libtorch/linear.h"
@@ -121,6 +123,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         py::arg("constant_bias"), py::arg("constant_scale"), py::arg("span_heads"),
         py::arg("add_residual"), py::arg("w_groups") = 1);
     m.def("rms_norm_res_in", &rms_norm_res_in, "rms_norm_res_in");
+    m.def("rms_norm_post_pre", &rms_norm_post_pre, "rms_norm_post_pre");
     m.def("gated_rms_norm", &gated_rms_norm, "gated_rms_norm");
     m.def("softcap", &softcap, "softcap");
     m.def("sparse_head_argmax", &sparse_head_argmax, "sparse_head_argmax");
@@ -209,6 +212,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_cpu_has_avx2", &exl3_moe_cpu_has_avx2, "exl3_moe_cpu_has_avx2");
     m.def("exl3_moe_flag_write", &exl3_moe_flag_write, "exl3_moe_flag_write");
     m.def("exl3_moe_flag_wait", &exl3_moe_flag_wait, "exl3_moe_flag_wait");
+    m.def("exl3_moe_wait_ts_report", &exl3_moe_wait_ts_report, "exl3_moe_wait_ts_report");
     m.def("exl3_moe_split_issue_fused", &exl3_moe_split_issue_fused, "exl3_moe_split_issue_fused");
     m.def("exl3_moe_split_collect_fused", &exl3_moe_split_collect_fused, "exl3_moe_split_collect_fused");
     m.def("moe_unswizzle_trellis", &moe_unswizzle_trellis, "moe_unswizzle_trellis",
@@ -233,7 +237,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("n_stride_list") = py::none(), py::arg("had_src_list") = py::none(), py::arg("num_had_src") = 0);
     m.def("hgemm", &hgemm, "hgemm");
     m.def("hgemm_batched", &hgemm_batched, "hgemm_batched");
-    m.def("hgemm_recon", &hgemm_recon, "hgemm_recon");
+    m.def("hgemm_recon", &hgemm_recon, "hgemm_recon", py::arg("a"), py::arg("b"), py::arg("c"), py::arg("k64") = false);
 #if !defined(USE_ROCM)
     m.def("hgemm_f16acc", &hgemm_f16acc, "hgemm_f16acc");
     m.def("hgemm_f16acc_status", &hgemm_f16acc_status, "hgemm_f16acc_status");
@@ -242,6 +246,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("fa75_fwd", &fa75_fwd, "fa75_fwd");
     m.def("fa75_fwd_slice", &fa75_fwd_slice, "fa75_fwd_slice");
     m.def("fa60_fwd", &fa60_fwd, "fa60_fwd");
+    m.def("fa60_fwd_window", &fa60_fwd_window, "fa60_fwd_window");
 #endif
     m.def("rope", &rope, "rope");
     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
@@ -340,6 +345,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     #include "libtorch/linear_bc.h"
     #include "libtorch/gated_delta_net_bc.h"
     #include "libtorch/attention_bc.h"
+    m.def("make_decode_split_native", &make_decode_split_native,
+          py::arg("group"), py::arg("head_dim"), py::arg("bits"), py::arg("scale"), py::arg("n_kv_heads"),
+          py::arg("page_size"), py::arg("live_split"), py::arg("block_rows"));
     #include "libtorch/shared_kv_attention_bc.h"
     #include "libtorch/mla_attention_bc.h"
     #include "libtorch/gated_rmsnorm_bc.h"

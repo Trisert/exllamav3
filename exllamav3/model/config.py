@@ -78,12 +78,40 @@ class InferParams:
         # loading the model
         self.embed_stream_from_disk = os.environ.get("EXL3_EMBED_STREAM", "0") != "0"
 
+    def qkv_headwise_bundle(self, device) -> bool:
+        # A headwise fp16 attention gate beside the sliced Q / K / V bundle: only where the bundle runs as the
+        # multi-matrix GEMV (Pascal). On the RTX 2060 the bundle takes the tile MGEMM and LFM3-1.7B 8.0bpw decode
+        # lost 4-7 % against the separate GEMVs (131.3 -> 122.6 t/s at depth 512). EXL3_QKV_HEADWISE=0 disables
+        if os.environ.get("EXL3_QKV_HEADWISE", "1") == "0" or os.environ.get("EXL3_MGEMV", "1") == "0":
+            return False
+        import torch
+        device = torch.device(device)
+        if device.type != "cuda" or device.index is None or torch.version.hip:
+            return False
+        return torch.cuda.get_device_capability(device.index)[0] == 6
+
     def use_mgemm(self, K: int, out_features: int, mul1: bool = False, device = None) -> bool:
-        # Pre-Volta CUDA parts (Pascal) have no multi-matrix GEMV: the fused MGEMM runs the block-pipelined tile
+        # Pre-Volta CUDA parts (Pascal) have a multi-matrix GEMV only for 7 / 8 bpw mul1 (below); elsewhere the fused
+        # MGEMM runs the block-pipelined tile
         # kernel, which is far below the memory roofline there, while separate calls take the GEMV path
         # (the GEMV covers K <= 5; wider tensors keep the fused kernel). Same on Turing sm_75 for mul1, where every
         # K <= 4 shape takes the GEMV (measured on the RTX 2060; EXL3_GEMV_SM75=0 keeps the tile kernel and the MGEMM)
         # (EXL3_GEMV=0 turns the GEMV off, so there is nothing to unfuse for and the MGEMM stays)
+        # 7 / 8 bpw mul1 (measured on LFM3-1.7B 8.0bpw): Pascal unfuses every projection once its K = 7 / 8 GEMV is on
+        # (EXL3_GEMV_PASCAL_K8), sm_75 only the wide ones (gate / up, n >= 4096; the sliced qkv bundle stays fused).
+        # EXL3_UNFUSE_K8=0 keeps the fused MGEMM (A/B testing)
+        if device is not None and K in (7, 8) and mul1 and os.environ.get("EXL3_GEMV", "1") != "0" \
+                and os.environ.get("EXL3_UNFUSE_K8", "1") != "0":
+            import torch
+            device = torch.device(device)
+            if device.type == "cuda" and device.index is not None and not torch.version.hip:
+                cap = torch.cuda.get_device_capability(device.index)
+                if cap[0] == 6 and os.environ.get("EXL3_GEMV_PASCAL_K8", "1") != "0":
+                    # The bundle stays fused where the multi-matrix GEMV takes it (exl3_mgemv_kernel, m <= 16:
+                    # one launch for gate + up, K + V or Q / K / V); EXL3_MGEMV=0 restores the separate GEMVs
+                    return os.environ.get("EXL3_MGEMV", "1") != "0"
+                if cap == (7, 5) and out_features >= 4096 and os.environ.get("EXL3_GEMV_SM75", "1") != "0":
+                    return False
         if device is not None and K <= 5 and os.environ.get("EXL3_GEMV", "1") != "0":
             import torch
             device = torch.device(device)

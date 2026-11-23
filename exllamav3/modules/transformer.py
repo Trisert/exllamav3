@@ -153,6 +153,7 @@ class TransformerBlock(Module):
         export_state = export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0
 
         y_resid = None  # pending attn output whose residual add is folded into the MLP input norm
+        mlp_in = None   # MLP input already normed by the fused attn post-norm
 
         # Previous block's MLP output whose residual add is folded into this block's input norm (forward_ls sets
         # resid_defer when the next module is a TransformerBlock on the same device)
@@ -164,6 +165,17 @@ class TransformerBlock(Module):
         if pending is not None and not fuse_in:
             x += pending
 
+        # Previous block's MLP output under its post-norm, deferred so the post-norm and this block's input norm run
+        # as one launch (RMSNorm.forward_post_pre)
+        attn_in = None
+        post = params.pop("post_pending", None)
+        if post is not None:
+            py, pnorm = post
+            if self.attn is not None and not self.attn_hc and pnorm.can_fuse_post_pre(self.attn_norm, py, x, params):
+                attn_in = pnorm.forward_post_pre(py, x, self.attn_norm, params)
+            else:
+                pnorm.forward(py, params, residual = x)
+
         if self.attn:
             if self.attn_hc:
                 hc_post, hc_comb, y, normed = self.attn_hc.mix_norm(x, params, self.attn_norm)
@@ -173,6 +185,8 @@ class TransformerBlock(Module):
                     y = self.attn_norm.forward(y, params, out_dtype = torch.half)
                 else:
                     y = y.half()
+            elif attn_in is not None:
+                y = attn_in
             elif fuse_in:
                 y = self.attn_norm.forward(pending, params, out_dtype = torch.half, residual_in = x)
             elif self.attn_norm:
@@ -193,7 +207,13 @@ class TransformerBlock(Module):
             if self.attn_hc:
                 x = self.attn_hc.apply_(x, y, hc_post, hc_comb, params)
             elif self.attn_post_norm:
-                self.attn_post_norm.forward(y, params, residual = x)
+                if (
+                    self.mlp is not None and not self.mlp_hc and isinstance(self.attn_post_norm, RMSNorm) and
+                    self.attn_post_norm.can_fuse_post_pre(self.mlp_norm, y, x, params)
+                ):
+                    mlp_in = self.attn_post_norm.forward_post_pre(y, x, self.mlp_norm, params)
+                else:
+                    self.attn_post_norm.forward(y, params, residual = x)
             elif self.mlp is not None and self.mlp_norm is not None and self.mlp_norm.can_fuse_residual(x, y):
                 y_resid = y
             else:
@@ -210,7 +230,9 @@ class TransformerBlock(Module):
                     y = y.half()
             else:
                 params["residual"] = x
-                if y_resid is not None:
+                if mlp_in is not None:
+                    y = mlp_in
+                elif y_resid is not None:
                     y = self.mlp_norm.forward(y_resid, params, out_dtype = torch.half, residual_in = x)
                 elif self.mlp_norm:
                     y = self.mlp_norm.forward(x, params, out_dtype = torch.half)
@@ -222,6 +244,13 @@ class TransformerBlock(Module):
             if self.mlp_hc:
                 x = self.mlp_hc.apply_(x, y, hc_post, hc_comb, params)
             elif self.mlp_post_norm:
+                if (
+                    params.get("resid_defer") and not export_state and self.layer_scalar_f is None and
+                    (out_dtype or self.out_dtype) in (None, x.dtype) and isinstance(self.mlp_post_norm, RMSNorm)
+                ):
+                    # The next block runs this post-norm together with its input norm
+                    params["post_pending"] = (y, self.mlp_post_norm)
+                    return x
                 self.mlp_post_norm.forward(y, params, residual = x)
             elif (
                 params.get("resid_defer") and not export_state and self.layer_scalar_f is None and

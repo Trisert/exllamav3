@@ -138,3 +138,36 @@ def test_hfma2_rejects_uncovered(device):
     c = torch.empty(64, 128, device = device, dtype = torch.float)
     with pytest.raises(RuntimeError):
         ext.hgemm_hfma2(a, b, c)
+
+
+@pytest.mark.parametrize("M, K, N", [(4096, 2048, 7680), (4096, 7680, 2048), (1000, 2048, 512), (130, 96, 256)])
+@pytest.mark.parametrize("dtype", [torch.half, torch.float])
+@torch.inference_mode()
+def test_hfma2_k64_flag(device, M, K, N, dtype):
+    """hgemm_recon's k64 flag (Lfm3Config.prefill_gemm_k64): unset, the call is the 32-element contract bit for bit
+    (every other model); set, 64-element fp16 partials stay within rel RMS 1.5e-3 of an fp32 matmul. Needs sm_60 and
+    EXL3_HGEMM_HFMA2_K64 unset (it overrides the flag)"""
+    if torch.cuda.get_device_capability(device) != (6, 0):
+        pytest.skip("sm_60 HFMA2 kernel")
+    import os
+    if os.environ.get("EXL3_HGEMM_HFMA2_K64") is not None:
+        pytest.skip("EXL3_HGEMM_HFMA2_K64 overrides the per-call flag")
+    gen = torch.Generator(device = device).manual_seed(M + K + N)
+    a = torch.randn((M, K), device = device, generator = gen).half()
+    b = (torch.randn((K, N), device = device, generator = gen) * K ** -0.5).half()
+    c_ref = torch.empty((M, N), dtype = dtype, device = device)
+    ext.hgemm_hfma2(a, b, c_ref, 64)
+    c32 = torch.empty_like(c_ref)
+    ext.hgemm_recon(a, b, c32)
+    c64 = torch.empty_like(c_ref)
+    ext.hgemm_recon(a, b, c64, True)
+    torch.cuda.synchronize()
+    if ((M + 63) // 64) * (N // 128) < 96:
+        # Below the HFMA2 kernel's grid threshold the call takes cuBLAS, where the flag does nothing
+        assert torch.equal(c64, c32)
+        return
+    assert torch.equal(c32, c_ref)
+    ref = a.float() @ b.float()
+    rel = ((c64.float() - ref).pow(2).mean().sqrt() / ref.pow(2).mean().sqrt()).item()
+    assert rel < 1.5e-3, rel
+    assert not torch.equal(c64, c32) or K <= 32

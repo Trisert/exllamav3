@@ -564,8 +564,9 @@ constexpr int64_t MIN_BLOCKS_64 = 96;
 
 // BM = 64 (128 threads, three blocks per SM with STAGES = 1, two with STAGES = 2) or 128 (256 threads, one block per
 // SM) rows per block; the 64-row tile halves the grid granularity for narrow outputs (N = 512 projections, small
-// expert groups)
-template <bool OUT_F32, int BM, int STAGES>
+// expert groups). KS: K elements per fp16 partial (32: one K tile, the contract above; 64: the two tiles of a loop
+// iteration, half the fp16 -> fp32 flushes, longer fp16 sums; EXL3_HGEMM_HFMA2_K64)
+template <bool OUT_F32, int BM, int STAGES, int KS = 32>
 __global__ void __launch_bounds__(BM * 2, BM == 64 ? (STAGES == 1 ? 3 : 2) : 1)
 gemm_kernel
 (
@@ -646,15 +647,19 @@ gemm_kernel
 
     // One K tile from stage buf (a constant after inlining); more: another tile follows (its global loads are in
     // flight during this tile's math; with one stage its shared stores wait for every warp to finish this tile)
-    auto tile = [&] (const int buf, const bool more)
+    // zero / flush: this tile opens / closes an fp16 partial (every tile at KS = 32, tile pairs at KS = 64)
+    auto tile = [&] (const int buf, const bool more, const bool zero, const bool flush)
     {
         if (more) gload();
 
-        #pragma unroll
-        for (int i = 0; i < 8; ++i)
+        if (zero)
         {
             #pragma unroll
-            for (int j = 0; j < 4; ++j) acc[i][j] = __float2half2_rn(0.0f);
+            for (int i = 0; i < 8; ++i)
+            {
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) acc[i][j] = __float2half2_rn(0.0f);
+            }
         }
 
         #pragma unroll
@@ -673,15 +678,18 @@ gemm_kernel
             }
         }
 
-        #pragma unroll
-        for (int i = 0; i < 8; ++i)
+        if (flush)
         {
             #pragma unroll
-            for (int j = 0; j < 4; ++j)
+            for (int i = 0; i < 8; ++i)
             {
-                const float2 f = __half22float2(acc[i][j]);
-                accf[i][2 * j] += f.x;
-                accf[i][2 * j + 1] += f.y;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j)
+                {
+                    const float2 f = __half22float2(acc[i][j]);
+                    accf[i][2 * j] += f.x;
+                    accf[i][2 * j + 1] += f.y;
+                }
             }
         }
 
@@ -694,10 +702,10 @@ gemm_kernel
     int kt = 0;
     for (; kt + 2 <= KT; kt += 2)
     {
-        tile(0, true);
-        tile(STAGES == 1 ? 0 : 1, kt + 2 < KT);
+        tile(0, true, true, KS == 32);
+        tile(STAGES == 1 ? 0 : 1, kt + 2 < KT, KS == 32, true);
     }
-    if (kt < KT) tile(0, false);
+    if (kt < KT) tile(0, false, true, true);
 
     #pragma unroll
     for (int i = 0; i < 8; ++i)
@@ -826,8 +834,18 @@ static int pick_stages(int64_t blocks, int sms)
     return fill(2 * sms) > 1.3 * fill(3 * sms) ? 2 : 1;
 }
 
-static void launch(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, cudaStream_t stream, int bm)
+// 64-element fp16 partials (half the flushes; a numerics change, see gemm_kernel): per call, requested by the
+// caller's model (Lfm3Config.prefill_gemm_k64). EXL3_HGEMM_HFMA2_K64 = 0 / 1 forces it off / on for every call
+static bool k64(bool requested)
 {
+    static const int env = [] { const char* e = std::getenv("EXL3_HGEMM_HFMA2_K64"); return e ? std::atoi(e) : -1; }();
+    return env < 0 ? requested : env != 0;
+}
+
+static void launch(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c, cudaStream_t stream, int bm,
+                   bool want_k64 = false)
+{
+    const bool use_k64 = k64(want_k64);
     const bool batched = b.dim() == 3;
     const int batch = batched ? a.size(0) : 1;
     const int K = a.size(-1), N = b.size(-1);
@@ -843,12 +861,22 @@ static void launch(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c
         const int sms = at::cuda::getDeviceProperties(a.device().index())->multiProcessorCount;
         if (pick_stages((int64_t) grid.x * grid.y * grid.z, sms) == 2)
         {
-            if (f32) gemm_kernel<true, 64, 2><<<grid, 128, 0, stream>>>(ap, bp, c.data_ptr(), (int) M, N, K, ldc, as, bs, cs);
+            if (use_k64)
+            {
+                if (f32) gemm_kernel<true, 64, 2, 64><<<grid, 128, 0, stream>>>(ap, bp, c.data_ptr(), (int) M, N, K, ldc, as, bs, cs);
+                else gemm_kernel<false, 64, 2, 64><<<grid, 128, 0, stream>>>(ap, bp, c.data_ptr(), (int) M, N, K, ldc, as, bs, cs);
+            }
+            else if (f32) gemm_kernel<true, 64, 2><<<grid, 128, 0, stream>>>(ap, bp, c.data_ptr(), (int) M, N, K, ldc, as, bs, cs);
             else gemm_kernel<false, 64, 2><<<grid, 128, 0, stream>>>(ap, bp, c.data_ptr(), (int) M, N, K, ldc, as, bs, cs);
         }
         else
         {
-            if (f32) gemm_kernel<true, 64, 1><<<grid, 128, 0, stream>>>(ap, bp, c.data_ptr(), (int) M, N, K, ldc, as, bs, cs);
+            if (use_k64)
+            {
+                if (f32) gemm_kernel<true, 64, 1, 64><<<grid, 128, 0, stream>>>(ap, bp, c.data_ptr(), (int) M, N, K, ldc, as, bs, cs);
+                else gemm_kernel<false, 64, 1, 64><<<grid, 128, 0, stream>>>(ap, bp, c.data_ptr(), (int) M, N, K, ldc, as, bs, cs);
+            }
+            else if (f32) gemm_kernel<true, 64, 1><<<grid, 128, 0, stream>>>(ap, bp, c.data_ptr(), (int) M, N, K, ldc, as, bs, cs);
             else gemm_kernel<false, 64, 1><<<grid, 128, 0, stream>>>(ap, bp, c.data_ptr(), (int) M, N, K, ldc, as, bs, cs);
         }
     }
@@ -863,7 +891,7 @@ static void launch(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c
 } // namespace hfma2
 
 // Pascal HFMA2 kernel for the reconstruct-path GEMMs; false = not sm_60, disabled or shape not covered
-bool hgemm_hfma2_try(const at::Tensor& a, const at::Tensor& b, at::Tensor& c)
+bool hgemm_hfma2_try(const at::Tensor& a, const at::Tensor& b, at::Tensor& c, bool k64)
 {
     if (!a.is_cuda() || !hfma2::enabled(a.device().index())) return false;
     if (!hfma2::covered(a, b, c)) return false;
@@ -871,7 +899,7 @@ bool hgemm_hfma2_try(const at::Tensor& a, const at::Tensor& b, at::Tensor& c)
     if (!bm) return false;
     const at::cuda::OptionalCUDAGuard device_guard(a.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-    hfma2::launch(a, b, c, stream, bm);
+    hfma2::launch(a, b, c, stream, bm, k64);
     return true;
 }
 
@@ -889,9 +917,9 @@ void hgemm_hfma2(at::Tensor a, at::Tensor b, at::Tensor c, int64_t bm)
 }
 
 // Try the fp16-accumulator kernel; false = caller should use cuBLAS
-bool hgemm_f16acc_try(const at::Tensor& a, const at::Tensor& b, at::Tensor& c)
+bool hgemm_f16acc_try(const at::Tensor& a, const at::Tensor& b, at::Tensor& c, bool k64)
 {
-    if (hgemm_hfma2_try(a, b, c)) return true;
+    if (hgemm_hfma2_try(a, b, c, k64)) return true;
     if (!f16acc::covered(a, b, c) || !f16acc::worthwhile(a, b)) return false;
     if (!f16acc::enabled(a.device().index())) return false;
     const at::cuda::OptionalCUDAGuard device_guard(a.device());
@@ -925,8 +953,8 @@ int hgemm_f16acc_status(int device)
 }
 
 // Reconstruct-path GEMM: the fp16-accumulator kernel where it pays, else cuBLAS
-void hgemm_recon(at::Tensor a, at::Tensor b, at::Tensor c)
+void hgemm_recon(at::Tensor a, at::Tensor b, at::Tensor c, bool k64)
 {
-    if (hgemm_f16acc_try(a, b, c)) return;
+    if (hgemm_f16acc_try(a, b, c, k64)) return;
     hgemm(a, b, c);
 }

@@ -90,6 +90,9 @@ class Lfm3VlConfig(Lfm3Config):
 
     def __init__(self, directory: str, **kwargs):
         super().__init__(directory, **kwargs)
+        # The 64-element prefill GEMM partials were measured on the text-only LFM3; the VL checkpoint (vision tower
+        # and projector on the same config) keeps the 32-element contract
+        self.prefill_gemm_k64 = False
 
         # Vision tower
         self.vision = Lfm3VlVisionConfig(self.read_cfg(dict, "vision_config", no_default))

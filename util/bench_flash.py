@@ -538,12 +538,20 @@ def main(args):
                     step_i += 1
                     if step_i == args.profile_from:
                         _wait_collect()                     # clear: the window starts here
+                        if os.environ.get("EXL3_MOE_WAIT_TS"):
+                            from exllamav3.ext import exllamav3_ext as _ext
+                            for _d in range(torch.cuda.device_count()): _ext.exl3_moe_wait_ts_report(_d)
                         t_win0 = time.perf_counter()
                     if step_i == args.profile_from + 60:
                         t_win1 = time.perf_counter()
             if t_win0 is not None and step_i >= args.profile_from + 60:
                 win = 1000 * (t_win1 - t_win0) / 60
                 print(f"WINDOW decode: {win:.1f} ms per iterate() over 60 profiled iterations | smi {smi_pre} -> {smi(args.smi_index)}", flush = True)
+                if os.environ.get("EXL3_MOE_WAIT_TS"):
+                    from exllamav3.ext import exllamav3_ext as _ext
+                    for _d in range(torch.cuda.device_count()):
+                        r = _ext.exl3_moe_wait_ts_report(_d)
+                        print(f"WAITTS window (per iterate) cuda:{_d} collect/done-wait {r[0] / 60e3:.2f} ms ({r[1] / 60:.1f} waits, max {r[2] / 1e3:.1f} ms) | issue/consumed-wait {r[3] / 60e3:.2f} ms ({r[4] / 60:.1f} waits, max {r[5] / 1e3:.1f} ms)", flush = True)
                 w = _wait_collect()
                 if w:
                     print("WAITPROF window (per iterate, ms) " + " | ".join(

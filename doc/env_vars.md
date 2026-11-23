@@ -233,6 +233,16 @@ kernel keeps Turing's HMMA units busy. Decode and draft verification stay on the
 off on Turing. On sm_60 it is on because the Triton prefill kernel hits an illegal memory access
 there; head_dim 256 then runs `fa60` (below), other head sizes SDPA.
 
+### `EXL3_SDPA_SWA` (default: `1`)
+
+Extends the path above to causal sliding-window layers (left window, no softcap or sinks): each SDPA q chunk attends
+over its key band [first query - window, last query] with a banded mask instead of running the Triton prefill
+kernel, which has no tensor-core path on sm_60 / sm_75 (LFM3's 256-token windows ran at ~0.13 TFLOPS, 29 % of a
+4096-token prefill on the P100). LFM3-1.7B 8.0bpw prefill: P100 2407 -> 3163 t/s at 4096 tokens (1873 -> 2275 at
+16k), RTX 2060 4075 -> 6628 (3557 -> 5399). Matches the Triton kernel to 2e-3
+(`tests/kernels/attention/test_prefill_sdpa_window.py`); prefill ppl +0.007 % / +0.016 %. Read per call; `0` keeps
+the Triton kernel for windowed layers.
+
 ### `EXL3_FA75` (default: on for sm_75, off elsewhere)
 
 On the path above, head_dim 256 attention runs the `fa75` kernel (`exllamav3_ext/turing/fa75.cu`,
@@ -252,6 +262,13 @@ the model-level KL against SDPA is ~1e-3, below the 0.8e-3..5.4e-3 between the f
 cache. The switch is read per call. `1` forces it on any CUDA device (it is HFMA2 / fp32 SIMT code and
 runs from sm_60 up), `0` keeps SDPA.
 
+### `EXL3_FA60_HD128` (default: `1`)
+
+fa60 also takes head_dim 128 (where fa75 does not apply): the same kernel templated on the head dim, 4 rows x 8 columns
+per thread in the P V mapping, two blocks per SM. LFM3-1.7B 8.0bpw prefill on the P100 (6 full-attention layers):
+3184 -> 3504 t/s at 4096 tokens, 2807 -> 3346 at 8k, 2294 -> 3074 at 16k; prefill ppl 11.03238 -> 11.03115, needle
+6/6. `tests/kernels/attention/test_fa60.py` covers both head dims. Read per call; `0` keeps SDPA for head_dim 128.
+
 ### `EXL3_ATTN_LIVE_SPLIT` (default: `1`)
 
 Flash-decoding split of the paged decode attention (`_paged_attn_decode_split_kernel`, also inside the
@@ -263,6 +280,78 @@ boundaries move; the result equals the bound split up to the reduction order
 (`tests/kernels/attention/test_decode_live_split.py`). Microbenchmark (head_dim 256, 16 q / 2 kv heads,
 q_len 2, 4-bit cache): P100 63 -> 30 us at 500 keys, 98 -> 62 us at 3500; RTX 2060 90 -> 29 us and
 127 -> 83 us.
+
+### `EXL3_ATTN_DECODE_BN` (default: unset)
+
+Key tile of the paged decode attention split kernel (eager and graphed BC paths). Unset: 64 on sm_75 for head_dim <= 128
+(LFM3-1.7B 8.0bpw on the RTX 2060: 130.6 -> 129.4 t/s at depth 512, 118.2 -> 121.5 at 8k, 90.5 -> 101.4 at 32k),
+16 on sm_60 / sm_75 otherwise (on the P100 64 cost 7.5 % at depth 512 for +3.8 % at 32k; head_dim 256 was measured at
+16), the generic size elsewhere. A value pins it for A/B testing. Raising the split target instead (2 -> 8 / 32 x SMs)
+measured neutral on both cards at 32k.
+
+### `EXL3_ATTN_DECODE_WS` (default: unset)
+
+`warps,stages` (e.g. `8,1`) pins the launch shape of the paged decode attention split kernel, overriding the backend
+default (4,2 on CUDA, 8,1 on ROCm, 2,2 on gfx1100 at head_dim <= 128). The QSA sparse split kernel keeps the
+default. For A/B testing: on LFM3-1.7B 8.0bpw no other shape beat 4,2 on the P100 or the RTX 2060 at depth 512 or 32k.
+
+### `EXL3_ATTN_NATIVE` (default: `1`)
+
+CUDA-native split kernel for the graphed decode attention (`exllamav3_ext/attn_decode_native.cu`) in place of the Triton
+`_paged_attn_decode_split_kernel`, where Triton lowers `tl.dot` to scalar FMAs. Same launch sites and partials (the
+Triton combine kernel reduces them); taken for q_len 1, 8-bit K and V cache, head_dim 128, full attention (no window,
+softcap or sinks), GQA group 1 / 2 / 4 / 8. `1`: sm_60 only; `2`: every CUDA device (testing); `0`: Triton. LFM3-1.7B
+8.0bpw on the P100: 141.3 -> 140.6 t/s at depth 512, 129.9 -> 136.2 at 8k, 103.8 -> 123.4 at 32k; greedy oracle
+identical, needle 3/3 at 49k. `tests/kernels/attention/test_decode_native.py`.
+
+### `EXL3_ATTN_NATIVE_WARPS` (default: `8`)
+
+Warps per CTA of the native decode split kernel (4 or 8). 8 measured +2.3 % at 32k on the P100 (LFM3), same at 512.
+
+### `EXL3_ATTN_NATIVE_SPLITS` (default: `2`)
+
+Split target of the native decode kernel, in multiples of the SM count (the Triton kernel keeps 2). On the P100 4 gained
+1 % at 32k and lost 0.7 % at 512; 8 lost at every depth.
+
+### `EXL3_HGEMM_HFMA2_K64` (default: unset = per model)
+
+The sm_60 HFMA2 prefill GEMM with 64-element fp16 partials instead of 32 (half the fp16 -> fp32 flushes; rel RMS vs fp32
+8.5e-4 -> 1.2e-3). Unset: only where the model's config asks for it (`prefill_gemm_k64`: LFM3, measured: prefill
++2.7..3.1 % on the P100, prefill ppl 11.03210 -> 11.02903); every other model keeps the 32-element contract. `0` / `1`
+force it off / on for every call. Read once.
+
+### `EXL3_FA60_SWA` (default: `1`)
+
+Sliding-window prefill layers on sm_60 (with `EXL3_SDPA_SWA`): one `fa60_fwd_window` call per sequence (key tiles
+outside each query block's band skipped) instead of the banded chunked SDPA. head_dim 128 under `EXL3_FA60_HD128`, or
+256. Read per call; `0` keeps SDPA. LFM3-1.7B 8.0bpw on the P100: prefill +3.9 % at 512 to +4.9 % at 4k-8k tokens,
+prefill ppl 11.03115 -> 11.03210. `tests/kernels/attention/test_fa60.py`.
+
+### `EXL3_GATED_DOWN` (default: `1`)
+
+At one token, the SwiGLU product (silu(gate) * up) runs inside the down projection's GEMV input stage instead of its
+own kernel (7 / 8 bpw mul1, act_limit 0). Bit-identical. `0` keeps the separate kernel. LFM3-1.7B 8.0bpw on the P100:
++0.6..0.8 % decode, neutral on the RTX 2060.
+
+### `EXL3_NORM_POST_PRE` (default: `1`)
+
+Post-norm models (LFM3): the post-norm residual (`r += norm(y) * w`) and the next sublayer's input norm run as one
+launch (`rms_norm_post_pre`), within a block and across blocks (the MLP post-norm is deferred to the next block).
+Bit-identical to the two launches. `0` keeps them separate. LFM3-1.7B 8.0bpw decode: P100 +2.3 % at depth 512, RTX
+2060 +1.2 %. `tests/kernels/norm/test_rms_norm_post_pre.py`.
+
+### `EXL3_MGEMV` (default: `1`)
+
+Multi-matrix small-m GEMV (`exl3_mgemv_kernel`) for the exl3_mgemm bundles (gate + up, K + V, Q / K / V) at 7 / 8 bpw
+mul1 on Pascal, m = 1..16; the bundles stay fused there instead of running as separate GEMVs. `0` restores the separate
+GEMVs; `2` takes the kernel on every CUDA device (testing). LFM3-1.7B 8.0bpw on the P100: 132.5 -> 141.3 t/s at depth
+512, 122.7 -> 130.1 at 8k, 99.0 -> 103.7 at 32k. `tests/kernels/gemm/test_exl3_mgemv.py`.
+
+### `EXL3_QKV_HEADWISE` (default: `1`)
+
+A headwise fp16 attention gate (LFM3) no longer excludes the sliced Q / K / V bundle: it runs beside it. Only where the
+bundle takes the multi-matrix GEMV (Pascal); on the RTX 2060 the bundle's tile MGEMM lost 4-7 %. `0` keeps such
+modules on the separate projections.
 
 ### `EXL3_QC_PREFILL_NS` (default: `0` = measure)
 
@@ -322,6 +411,19 @@ projections (gate/up, q/k/v, the GatedDeltaNet input projections) are unfused so
 2060's 16 layers: 26.8 -> 18.0 ms GPU time per token. `0` keeps the general heuristic (tile kernel
 for most of these shapes) and the fused MGEMM.
 
+### `EXL3_GEMV_PASCAL_K8` (default: `1`)
+
+7 and 8 bpw (mul1, staged tile words) GEMV on Pascal, as on sm_75. Without it every 7/8 bpw projection on the P100
+runs the tile GEMM at ~80-90 GB/s. With it (plus `EXL3_UNFUSE_K8`) LFM3-1.7B 8.0bpw batch-1 decode on the P100 goes from
+51.7 to 126.5 t/s at depth 512 (50.1 -> 117.4 at 8192), greedy output unchanged. `0` restores the tile GEMM.
+
+### `EXL3_UNFUSE_K8` (default: `1`)
+
+7 / 8 bpw mul1 same-input projections are unfused (separate calls instead of the fused MGEMM) where the separate calls
+take the GEMV: on Pascal every bundle (gate/up, q/k/v; needs `EXL3_GEMV_PASCAL_K8`), on sm_75 only the wide ones
+(n >= 4096, i.e. gate/up; the sliced q/k/v bundle stays fused). RTX 2060, LFM3-1.7B 8.0bpw: 117.8 -> 129.3 t/s at
+depth 512. `0` keeps the fused MGEMM.
+
 ### `EXL3_GEMV_M34` (default: `1`)
 
 Pascal (sm_60), m = 3..4 rows (MTP verify at `-ndt 2/3`): the GEMV takes MMODE 4, the emulated-MMA arithmetic
@@ -352,6 +454,16 @@ at 110-330 GB/s on the P100 (gemv2N at m = 1, sgemm at m = 2: 119 GB/s on a 2483
 the GEMV reaches 440-490 GB/s on 2048 x 4096..8192 projections and 588 GB/s on the lm_head (a 1 GB
 fp16 read runs at 593 GB/s on this card), and 280-300 GB/s of 317 on the RTX 2060.
 `0` keeps cuBLAS, `1` forces it on any CUDA device.
+
+### `EXL3_HGEMV_GRAPH` (default: `1`)
+
+Split-K scratch of the fp16 GEMV above inside CUDA graph captures. The scratch is kept per (device, stream) and a
+capture stream is new, so before this every split-K call inside a decode graph silently fell back to cuBLAS (the
+LFM3 headwise attention gate, 2048 -> 16: cuBLAS gemv2N ~18 us vs ~7 us on the P100). With `1` a per-device set is
+allocated beside the first eager one and captured launches use it. LFM3-1.7B 8.0bpw on the P100: 126.5-126.8 ->
+127.4-127.6 t/s at depth 512, greedy output unchanged; neutral on the RTX 2060. Also applies to the fused router
+top-k (`EXL3_ROUTER_FUSED`) and other fp16 linears at <= 4 rows inside graphs (not measured on other models). `0`
+restores the cuBLAS fallback inside captures.
 
 ### `EXL3_FP16_LINEAR_HFMA2` (default: `1`, sm_60 only)
 

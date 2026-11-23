@@ -20,6 +20,17 @@ class PromptFormat:
         return None
     def inject_thinktag(self):
         return True
+    def edited_reply_think_block(self):
+        # Reasoning mode, /e: the closed (empty) think block that goes before the edited answer, which then
+        # streams as the answer; None leaves the edited text after the prompt as is
+        return None
+
+    def edit_prefill(self, reply):
+        # Reasoning mode, /e: the editor's starting text for a saved reply. Formats that resume the edit after a closed
+        # think block take the answer alone (the basic console saves the reply with its reasoning)
+        if self.edited_reply_think_block() and self.thinktag()[1] in reply:
+            return reply.split(self.thinktag()[1])[-1].lstrip()
+        return reply
 
 
 class PromptFormat_raw(PromptFormat):
@@ -203,6 +214,51 @@ class PromptFormat_qwen35(PromptFormat):
 
     def thinktag(self):
         return "<think>\n", "</think>"
+
+
+class PromptFormat_lfm3(PromptFormat):
+    description = "LFM3 (Liquid AI), reasoning-aware ChatML with BOS"
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def default_system_prompt(self, think):
+        return (
+            f"You are a helpful AI assistant."
+        )
+
+    def format(self, system_prompt, messages, think):
+        # As the model's chat_template.jinja: reasoning from earlier turns is dropped and replaced by an empty
+        # think block; with reasoning off the reply opens with one too
+        context = ""
+        if system_prompt:
+            context += f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        for (u, a) in messages:
+            context += f"<|im_start|>user\n{u}<|im_end|>\n"
+            context += f"<|im_start|>assistant\n"
+            if a is not None:
+                if "</think>" in a:
+                    a = a.split("</think>")[-1].strip()
+                context += f"<think></think>{a}<|im_end|>\n"
+            elif not think:
+                context += f"<think></think>"
+        return context
+
+    def add_bos(self):
+        return True
+
+    def stop_conditions(self, tokenizer):
+        return [
+            tokenizer.eos_token_id,
+            tokenizer.single_id("<|im_end|>"),
+            """<|im_end|>"""
+        ]
+
+    def thinktag(self):
+        return "<think>", "</think>"
+
+    def edited_reply_think_block(self):
+        return "<think></think>"
 
 
 class PromptFormat_phi(PromptFormat):
@@ -1265,6 +1321,7 @@ prompt_formats = {
     "llama3": PromptFormat_llama3,
     "chatml": PromptFormat_chatml,
     "qwen35": PromptFormat_qwen35,
+    "lfm3": PromptFormat_lfm3,
     "phi": PromptFormat_phi,
     "mistral": PromptFormat_mistral,
     "mistral3": PromptFormat_mistral3,

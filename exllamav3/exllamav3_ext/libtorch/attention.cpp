@@ -142,7 +142,7 @@ BC_Attention::BC_Attention
     if (qkv_ptrs_trellis)
     {
         TORCH_CHECK(qkv_ptrs_suh && qkv_ptrs_svh && qkv_meta, "BC_Attention: incomplete qkv bundle");
-        TORCH_CHECK(gate_mode == 0 || gate_mode == 2 || gate_mode == 3, "BC_Attention: qkv bundle needs gate mode 0, 2 or 3");
+        TORCH_CHECK(gate_mode <= 3, "BC_Attention: qkv bundle needs gate mode 0..3");
         const at::Tensor& meta = qkv_meta.value();
         TORCH_CHECK(meta.device().is_cpu() && meta.dtype() == at::kInt && meta.dim() == 2 && meta.size(0) == 5,
                     "BC_Attention: qkv_meta must be a CPU int32 (5, slices) tensor");
@@ -452,7 +452,9 @@ void BC_Attention::run_gr
         exl3_mgemm_gr(x3, qkv_ptrs_trellis.value(), carrier, qkv_ptrs_suh.value(), xh_b, qkv_ptrs_svh.value(),
                       c10::nullopt, c10::nullopt, qkv_K, -1, qkv_mcg, qkv_mul1, -1, -1, 0, graph,
                       1, qkv_size_n, s.qkv_c_ptrs, qkv_n_stride, qkv_had_src, qkv_num_src);
-        if (gate_mode == 2 && g_weight)
+        // An fp16 gate (headwise, or a full gate stored unquantized) is not in the bundle: cublas gemm over the
+        // staged input
+        if ((gate_mode == 1 || gate_mode == 2) && g_weight)
             hgemm_gr(x2, g_weight.value(), s.g2, graph);
         if (gate_mode == 3)
             deinterleave_qg_gr(s.qg2, s.q2, s.g2, head_dim, graph);

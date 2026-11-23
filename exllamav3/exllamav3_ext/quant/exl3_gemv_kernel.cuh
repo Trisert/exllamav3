@@ -29,9 +29,33 @@
 #include "exl3_dq.cuh"
 #include "exl3_kernel_map.cuh"
 #include "hadamard_inner.cuh"
+#include "exl3_devctx.cuh"
 
 #define EXL3_GEMV_MAX_M 8        // MMODE 1 (m = 2..8)
 #define EXL3_GEMV_MAX_M16 16     // MMODE 5 (m = 9..16)
+
+#ifndef EXL3_GEMV_BAL_DBG
+#define EXL3_GEMV_BAL_DBG 0
+#endif
+#if (EXL3_GEMV_BAL_DBG) & 128
+__device__ unsigned long long g_bal_probe[4096 * 8];
+#else
+static __device__ unsigned long long g_bal_probe[1];
+#endif
+// & 256: per-warp %globaltimer (ns, device-wide) at kernel entry (& 512: the SM id instead), after the input stage, at
+// the end of the main loop and after the output-stage grid.sync, at [warp * 4 + i] (warp = block * warps per block +
+// warp in block); read by doc/lfm8_opt/gemv_probe.cu
+#if (EXL3_GEMV_BAL_DBG) & 256
+__device__ unsigned long long g_bal_wt[8192 * 4];
+#else
+static __device__ unsigned long long g_bal_wt[1];
+#endif
+__device__ __forceinline__ unsigned long long exl3_globaltimer()
+{
+    unsigned long long t;
+    asm volatile ("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
 
 namespace exl3_gemv_ns {
 
@@ -154,6 +178,31 @@ __device__ __forceinline__ void dq8_regs_4bits(uint32_t a, uint32_t b, FragB& f0
     decode8<cb>(w0, w1, w2, w3, w4, w5, w6, w7, f0, f1);
 }
 
+// sm_60, 8 bpw mul1, staged tile (64 words): dq_dispatch<8> (two dq4) for lane l reads words 2l + 63, 2l + 64 and
+// 2l + 64, 2l + 65 (mod 64), and its shift s2 works out to 0 for every lane, so the 16-bit windows sit at the fixed
+// offsets 24, 16, 8, 0 of each word pair. Three LDS instead of four, one immediate funnel shift per four weights
+// instead of three variable 64-bit ones, the offset-16 window is the high half the HI product reads directly.
+// Bit-identical to dq_dispatch<8, 2>. -DEXL3_GEMV_K8_STAGED_SM60=0 restores dq_dispatch (A/B builds)
+#ifndef EXL3_GEMV_K8_STAGED_SM60
+#define EXL3_GEMV_K8_STAGED_SM60 1
+#endif
+__device__ __forceinline__ void dq8_staged_8bits_mul1_sm60(const uint32_t* tp, int lane, FragB& f0, FragB& f1)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610 && !defined(USE_ROCM)
+    const uint32_t wm = tp[(2 * lane + 63) & 63];
+    const uint32_t wc = tp[(2 * lane + 64) & 63];
+    const uint32_t wn = tp[(2 * lane + 65) & 63];
+    f0[0] = decode_mul1_product_2(mul1_product_h16<false>(__funnelshift_r(wc, wm, 24)), mul1_product_h16<true>(wc));
+    f0[1] = decode_mul1_product_2(mul1_product_h16<false>(wc >> 8), mul1_product_h16<false>(wc));
+    f1[0] = decode_mul1_product_2(mul1_product_h16<false>(__funnelshift_r(wn, wc, 24)), mul1_product_h16<true>(wn));
+    f1[1] = decode_mul1_product_2(mul1_product_h16<false>(wn >> 8), mul1_product_h16<false>(wn));
+#else
+    // The caller's EXL3_SM60 gate also covers native sm_61 / sm_62 builds, where mul1_product_h16 is not available:
+    // the generic staged decode there (same result)
+    dq_dispatch<8, 2>(tp, lane << 3, f0, f1);
+#endif
+}
+
 // Register form of dq8_aligned_2bits: the two words and the funnel shift are lane-dependent
 template <int cb>
 __device__ __forceinline__ void dq8_regs_2bits(uint32_t a, uint32_t b, int t_offset, FragB& f0, FragB& f1)
@@ -225,6 +274,126 @@ __device__ __forceinline__ void gather_a_rows16(const FragB& a01, const FragB& a
 }
 #endif
 
+// Balanced split (BAL), shared by the kernel and the host (capacity check, heuristic).
+// MINL: smallest per-warp cell count worth a warp (below it the active warp count is reduced).
+#ifndef EXL3_GEMV_BAL_MINL
+#define EXL3_GEMV_BAL_MINL 8
+#endif
+#ifndef EXL3_GEMV_BAL_DBG
+#define EXL3_GEMV_BAL_DBG 0
+#endif
+// Largest cell count the float-based division below handles exactly (float mantissa)
+#define EXL3_GEMV_BAL_MAX_CELLS (1 << 23)
+
+// Integer division of a, b >= 0 (a < 2^24) through the float reciprocal on the device (the integer division is a ~70
+// instruction routine on sm_60 and sat on the epilogue's critical path), exact: the quotient is off by at most one
+__host__ __device__ __forceinline__ int bal_div(int a, int b)
+{
+#ifdef __CUDA_ARCH__
+    int q = __float2int_rz(__fdividef(__int2float_rn(a), __int2float_rn(b)));
+    const int r = a - q * b;
+    q += (r >= b) ? 1 : 0;
+    q -= (r < 0) ? 1 : 0;
+    return q;
+#else
+    return a / b;
+#endif
+}
+
+// The G x ks (column group, k-slice) cells, group-major, are divided over twa active warps: warp w owns the Lq + 1
+// (w < Lr) or Lq contiguous cells starting at w * Lq + min(w, Lr). A group is one work unit; its k range is cut at
+// the warp boundaries, each (warp, group) segment writes its fp32 partial row to slot (w - warp owning the group's
+// first cell), and the output stage sums the slots of a group in ascending order
+struct BalPlan { int G, ks, twa, Lq, Lr; };
+
+__host__ __device__ __forceinline__ BalPlan bal_plan(int G, int ks, int tw)
+{
+    BalPlan p;
+    p.G = G; p.ks = ks;
+    const int cells = G * ks;
+    p.twa = max(1, min(tw, bal_div(cells, EXL3_GEMV_BAL_MINL)));
+    p.Lq = bal_div(cells, p.twa);
+    p.Lr = cells - p.Lq * p.twa;
+    return p;
+}
+
+// Warp owning cell c
+__host__ __device__ __forceinline__ int bal_owner(const BalPlan& p, int c)
+{
+    const int big = p.Lr * (p.Lq + 1);
+    return c < big ? bal_div(c, p.Lq + 1) : p.Lr + bal_div(c - big, p.Lq);
+}
+
+// First cell of warp w
+__host__ __device__ __forceinline__ int bal_start(const BalPlan& p, int w)
+{
+    return w * p.Lq + min(w, p.Lr);
+}
+
+// Warps (hence slots) group g spans, at most
+__host__ __device__ __forceinline__ int bal_max_slots(const BalPlan& p)
+{
+    return bal_div(p.ks + p.Lq - 1, p.Lq) + 1;
+}
+
+// Output stage on register input: half rounding of the summed row (as the unbalanced path stores it to C), 128-point
+// Hadamard, svh. Same arithmetic as had_hf_r_128_inner<false, true> / had_ff_r_128_inner<false, true>
+__device__ __forceinline__ void had_hf_post_regs(float4 s, half* __restrict__ output_ptr, const half* __restrict__ scale, const float r_scale)
+{
+    const int t = threadIdx.x & 31;
+    half4 v;
+    v.x = __floats2half2_rn(s.x, s.y);
+    v.y = __floats2half2_rn(s.z, s.w);
+    float v0 = __half2float(__low2half(v.x));
+    float v1 = __half2float(__high2half(v.x));
+    float v2 = __half2float(__low2half(v.y));
+    float v3 = __half2float(__high2half(v.y));
+    float s0 = v0 + v1;
+    float d0 = v0 - v1;
+    float s1 = v2 + v3;
+    float d1 = v2 - v3;
+    float h0 = s0 + s1;
+    float h1 = d0 + d1;
+    float h2 = s0 - s1;
+    float h3 = d0 - d1;
+    shuffle_had_f4x32(h0, h1, h2, h3, t);
+    v.x = __floats2half2_rn(h0 * r_scale, h1 * r_scale);
+    v.y = __floats2half2_rn(h2 * r_scale, h3 * r_scale);
+    half4 scales = ((const half4*) scale)[t];
+    v.x = __hmul2(v.x, scales.x);
+    v.y = __hmul2(v.y, scales.y);
+    ((half4*) output_ptr)[t] = v;
+}
+
+__device__ __forceinline__ void had_ff_post_regs(float4 v, float* __restrict__ output_ptr, const half* __restrict__ scale, const float r_scale)
+{
+    const int t = threadIdx.x & 31;
+    float v0 = v.x;
+    float v1 = v.y;
+    float v2 = v.z;
+    float v3 = v.w;
+    float s0 = v0 + v1;
+    float d0 = v0 - v1;
+    float s1 = v2 + v3;
+    float d1 = v2 - v3;
+    v.x = s0 + s1;
+    v.y = d0 + d1;
+    v.z = s0 - s1;
+    v.w = d0 - d1;
+    shuffle_had_f2x32(v.x, v.y, t);
+    shuffle_had_f2x32(v.z, v.w, t);
+    v.x *= r_scale;
+    v.y *= r_scale;
+    v.z *= r_scale;
+    v.w *= r_scale;
+    half4 scales = ((const half4*) scale)[t];
+    v.x *= __low2float(scales.x);
+    v.y *= __high2float(scales.x);
+    v.z *= __low2float(scales.y);
+    v.w *= __high2float(scales.y);
+    ((float4*) output_ptr)[t] = v;
+}
+
 }  // namespace exl3_gemv_ns
 
 // HALF: bitrate is bits + 0.5 (bits = 1, 2, 3; mul1 codebook): 12 / 20 / 28 uint32 per tile. 1.5 bpw packs two tiles
@@ -234,16 +403,70 @@ __device__ __forceinline__ void gather_a_rows16(const FragB& a01, const FragB& a
 // ptxas spends 81-85 registers on them on sm_86/sm_89 (one 512-thread block per SM instead of two, measured
 // 18-28% slower at attention-projection shapes on the 3090). They are packed into one register (see x_pack) and
 // the bound keeps the compiler at the integer instances' 64
-template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF = false>
-__global__ __launch_bounds__(CFG == 0 ? 512 : 256, HALF && CFG == 0 ? 2 : 1)
-void exl3_gemv_kernel(EXL3_GEMM_ARGS)
+namespace exl3_gemv_ns {
+
+// Multi-matrix view (exl3_mgemv_kernel, MULTI): num_slices column slices of width size_n that share the input rows,
+// scheduled as one virtual matrix of num_slices * size_n columns, so a launch covers e.g. gate + up or Q / K / V. The
+// tables are exl3_mgemm's: slice j reads trellis B_list[j] and svh_list[j] (pre-offset to the slice's first column in
+// sliced mode), its input is transformed with suh_list[src], src = had_src_list[j] (or j), into the A_had slab src
+// (m x k at src * m * k), its trellis and output row stride is n_stride_list[j] columns (or size_n), and it writes
+// C_list[j] (or C + j * m * size_n, row stride size_n)
+struct MultiView
 {
+    int num_slices;
+    int num_src;
+    const uint16_t* const* B_list;
+    const half* const* suh_list;
+    const half* const* svh_list;
+    void* C;
+    void* const* C_list;
+    const int* n_stride_list;
+    const int* had_src_list;
+};
+
+// Output of slice sl, row r: its C_list entry, else slot sl of C (rows of size_n)
+template <bool c_fp32>
+__device__ __forceinline__ void* multi_out(const MultiView& mv, int sl, int r, int size_m, int size_n)
+{
+    size_t off;
+    char* base;
+    if (mv.C_list)
+    {
+        base = (char*) mv.C_list[sl];
+        off = (size_t) r * (mv.n_stride_list ? mv.n_stride_list[sl] : size_n);
+    }
+    else
+    {
+        base = (char*) mv.C;
+        off = ((size_t) sl * size_m + r) * size_n;
+    }
+    return base + off * (c_fp32 ? sizeof(float) : sizeof(half));
+}
+
+}  // namespace exl3_gemv_ns
+
+// GATED (m = 1, single matrix): A holds the gate row and the up row follows it (A + size_k); the input stage feeds
+// silu(gate) * up into the Hadamard transform (had_hf_r_128_gated), so the SwiGLU product needs no launch of its own
+template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF, bool BAL, bool MULTI,
+          bool GATED = false>
+__device__ __forceinline__
+void exl3_gemv_body(EXL3_GEMM_ARGS, const exl3_gemv_ns::MultiView& mv)
+{
+    static_assert(!GATED || (MMODE == 0 && !MULTI && !HALF), "gated input: m == 1, single matrix");
+    static_assert(!BAL || MMODE == 0, "balanced work split: m == 1 only");
+    static_assert(!MULTI || !HALF, "multi-matrix view: integer rates only");
     static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2) : (bits >= 2 && bits <= 8),
                   "exl3_gemv_kernel supports 2..8 bpw, and 1.5, 2.5 and 3.5 bpw with mul1");
     static_assert(bits < 5 || (SMEM_STAGE && !HALF), "5..8 bpw run through the staged tile words only");
     constexpr int WK   = CFG == 0 ? 16 : 8;     // k-split (warps per block)
     constexpr int WNT  = CFG == 0 ? 2 : 4;      // adjacent n-tiles per warp
-    constexpr int PF   = CFG == 0 ? 4 : 2;      // prefetch ring depth
+#ifndef EXL3_GEMV_BAL_PF0
+#define EXL3_GEMV_BAL_PF0 4
+#endif
+#ifndef EXL3_GEMV_BAL_PF1
+#define EXL3_GEMV_BAL_PF1 2
+#endif
+    constexpr int PF   = BAL ? (CFG == 0 ? EXL3_GEMV_BAL_PF0 : EXL3_GEMV_BAL_PF1) : (CFG == 0 ? 4 : 2);      // prefetch ring depth
     constexpr int FOLD = CFG == 0 ? 4 : 2;      // fp16->fp32 fold cadence (divides PF)
     constexpr int THREADS = WK * 32;
     // MMODE 0: m = 1, MMODE 1: 2 <= m <= 8 (MMA path), MMODE 2: m = 2 and MMODE 3: m = 3..4 on sm_60 (direct dot
@@ -270,24 +493,61 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
     static_assert(!TWO_PER_LOAD || WNT % 2 == 0, "two tiles per warp load needs an even tile count per warp");
 
     auto grid = cooperative_groups::this_grid();
+    [[maybe_unused]] long long pr[5];
+    if constexpr (EXL3_GEMV_BAL_DBG & 128) pr[0] = clock64();
+    [[maybe_unused]] const int wt_i = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * 4;
+    if constexpr (EXL3_GEMV_BAL_DBG & 256) if (threadIdx.x % 32 == 0)
+    {
+        unsigned int smid;
+        asm volatile ("mov.u32 %0, %%smid;" : "=r"(smid));
+        g_bal_wt[wt_i + 0] = (EXL3_GEMV_BAL_DBG & 512) ? (unsigned long long) smid : exl3_globaltimer();
+    }
 
     // Input scales and Hadamard transform, same as exl3_gemm_kernel
     {
         int total_warps = size_m * size_k / 128;
+        if constexpr (MULTI) total_warps *= mv.num_src;   // one transformed m x k slab per source
         int warps_grid = gridDim.x * blockDim.x / 32;
         int this_warp = threadIdx.x / 32 + blockDim.x / 32 * blockIdx.x;
 
         for(; this_warp < total_warps; this_warp += warps_grid)
-            had_hf_r_128_inner<true, false>
-            (
-                A + this_warp * 128,
-                A_had + this_warp * 128,
-                suh + (this_warp * 128) % size_k,
-                0.088388347648f  // 1/sqrt(128)
-            );
+        {
+            if constexpr (MULTI)
+            {
+                const int kw = size_m * size_k / 128;
+                const int src = this_warp / kw;
+                const int o = (this_warp - src * kw) * 128;
+                had_hf_r_128_inner<true, false>
+                (
+                    A + o,
+                    A_had + (size_t) src * size_m * size_k + o,
+                    mv.suh_list[src] + o % size_k,
+                    0.088388347648f  // 1/sqrt(128)
+                );
+            }
+            else if constexpr (GATED)
+                had_hf_r_128_gated
+                (
+                    A + this_warp * 128,
+                    A + size_k + this_warp * 128,
+                    A_had + this_warp * 128,
+                    suh + this_warp * 128,
+                    0.088388347648f  // 1/sqrt(128)
+                );
+            else
+                had_hf_r_128_inner<true, false>
+                (
+                    A + this_warp * 128,
+                    A_had + this_warp * 128,
+                    suh + (this_warp * 128) % size_k,
+                    0.088388347648f  // 1/sqrt(128)
+                );
+        }
 
         grid.sync();
         A = A_had;
+        if constexpr (EXL3_GEMV_BAL_DBG & 128) pr[1] = clock64();
+        if constexpr (EXL3_GEMV_BAL_DBG & 256) if (threadIdx.x % 32 == 0) g_bal_wt[wt_i + 1] = exl3_globaltimer();
     }
 
     const int warp = threadIdx.x / 32;
@@ -295,15 +555,26 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
     const int ntiles = size_n / 16;
     const int kslices = size_k / 16;
-    const int num_groups = size_n / COLS;
+    const int num_groups = (MULTI ? mv.num_slices : 1) * (size_n / COLS);   // MULTI: over the virtual matrix
 
     const int chunk = CEIL_DIVIDE(kslices, WK);
-    const int ks0 = warp * chunk;
-    const int myn = max(0, min(chunk, kslices - ks0));
 
+    // Balanced split (BAL, see bal_plan): the warp walks its contiguous cell range as segments inside one group,
+    // writes each segment's fp32 partial row to its workspace slot, and the output stage sums the slots of a group in
+    // ascending slot order before the Hadamard transform. No block-level reduction, no atomics
+    [[maybe_unused]] int bal_c = 0, bal_slot = 0;
+    [[maybe_unused]] float* bal_ws = reinterpret_cast<float*>(locks + EXL3_GEMV_WS_OFFSET);
+    if constexpr (BAL)
+    {
+        const exl3_gemv_ns::BalPlan pl = exl3_gemv_ns::bal_plan(num_groups, kslices, gridDim.x * WK);
+        bal_c = exl3_gemv_ns::bal_start(pl, blockIdx.x * WK + warp);
+    }
     const uint32_t* B32 = (const uint32_t*) B;
-    const size_t slice_stride = (size_t) ntiles * TWORDS;   // uint32 per k-slice row
+    size_t slice_stride = (size_t) ntiles * TWORDS;   // uint32 per k-slice row (MULTI: of the group's slice)
     const half2* A2 = (const half2*) A;
+    // MULTI: the group's slice output and its first column there
+    [[maybe_unused]] void* mc = nullptr;
+    [[maybe_unused]] int mcol0 = 0, mrs = 0;
     const half2 hzero = __half2half2(__ushort_as_half(0));
 
     // A fragment row indices for this lane
@@ -346,12 +617,50 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
         x_src_b = i2 % 24;
     }
 
-    __shared__ float sh_red[WK][ROWS][COLS];
+    __shared__ float sh_red[BAL ? 1 : WK][ROWS][COLS];
     [[maybe_unused]] __shared__ uint32_t sh_stage[SMEM_STAGE ? WK : 1][SMEM_STAGE ? LOADS * LSTRIDE : 1];
 
-    for (int group = blockIdx.x; group < num_groups; group += gridDim.x)
+    for (int seg = 0; ; ++seg)
     {
-        const uint32_t* bp = B32 + (size_t) ks0 * slice_stride + group * WNT * TWORDS + lane;
+        int group, ks0, myn;
+        if constexpr (BAL)
+        {
+            const int gw = blockIdx.x * WK + warp;
+            const exl3_gemv_ns::BalPlan pl = exl3_gemv_ns::bal_plan(num_groups, kslices, gridDim.x * WK);
+            const int c1 = gw < pl.twa ? exl3_gemv_ns::bal_start(pl, gw + 1) : 0;
+            if (bal_c >= c1) break;
+            group = exl3_gemv_ns::bal_div(bal_c, kslices);
+            ks0 = bal_c - group * kslices;
+            myn = min(c1 - bal_c, kslices - ks0);
+            // Workspace layout: the S slots of a group are contiguous (slot rows of COLS floats), so the output stage
+            // reads one contiguous run per group
+            bal_slot = ((group * exl3_gemv_ns::bal_max_slots(pl) + gw - exl3_gemv_ns::bal_owner(pl, group * kslices))) * COLS;
+            bal_c += myn;
+            if constexpr (EXL3_GEMV_BAL_DBG & 1) myn = 0;
+        }
+        else
+        {
+            group = blockIdx.x + seg * gridDim.x;
+            if (group >= num_groups) break;
+            ks0 = warp * chunk;
+            myn = max(0, min(chunk, kslices - ks0));
+            if constexpr (EXL3_GEMV_BAL_DBG & 1) myn = 0;
+        }
+        const uint32_t* bp;
+        if constexpr (MULTI)
+        {
+            const int gps = size_n / COLS;
+            const int sl = group / gps;
+            const int lg = group - sl * gps;
+            slice_stride = (size_t) ((mv.n_stride_list ? mv.n_stride_list[sl] : size_n) / 16) * TWORDS;
+            A2 = (const half2*) (A_had + (size_t) (mv.had_src_list ? mv.had_src_list[sl] : sl) * size_m * size_k);
+            bp = (const uint32_t*) mv.B_list[sl] + (size_t) ks0 * slice_stride + lg * WNT * TWORDS + lane;
+            mc = exl3_gemv_ns::multi_out<c_fp32>(mv, sl, 0, size_m, size_n);
+            mrs = mv.C_list && mv.n_stride_list ? mv.n_stride_list[sl] : size_n;
+            mcol0 = lg * COLS;
+        }
+        else
+            bp = B32 + (size_t) ks0 * slice_stride + group * WNT * TWORDS + lane;
 
         // Prefetch ring (indices must be compile-time or pf lands in local memory)
         // off: uint32 offset of the k-slice from bp
@@ -514,6 +823,8 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                     const uint32_t* tp = &sh_stage[warp][t * TWORDS];
                     if constexpr (HALF)
                         exl3_gemv_ns::dq8_regs_half<bits, cb>(tp[XP(0)], tp[XP(1)], XP(2), tp[XP(3)], tp[XP(4)], XP(5), f0, f1);
+                    else if constexpr (bits == 8 && cb == 2 && EXL3_SM60 && EXL3_GEMV_K8_STAGED_SM60)
+                        exl3_gemv_ns::dq8_staged_8bits_mul1_sm60(tp, lane, f0, f1);
                     else if constexpr (bits >= 5)
                         dq_dispatch<bits, cb>(tp, lane << 3, f0, f1);
                     else if constexpr (bits == 4)
@@ -656,6 +967,33 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
         // Cross-warp reduction over the k splits. Lane l holds row l/4, cols
         // tile*16 + frag*8 + 2*(l%4) (+1)
+        if constexpr (BAL)
+        {
+            // The partial row of this (warp, group) segment goes to the workspace; no block-level reduction
+            float* wp = bal_ws + (size_t) bal_slot;
+            if constexpr (DIRECT)
+            {
+                #pragma unroll
+                for (int t = 0; t < WNT; ++t)
+                    #pragma unroll
+                    for (int f = 0; f < 2; ++f)
+                    {
+                        float s = da[t][f][0].x + da[t][f][0].y;
+                        s += __shfl_xor_sync(0xffffffffu, s, 1);
+                        s += __shfl_xor_sync(0xffffffffu, s, 2);
+                        if ((lane & 3) == 0) wp[t * 16 + f * 8 + (lane >> 2)] = s;
+                    }
+            }
+            else if (lane < 4)
+            {
+                #pragma unroll
+                for (int t = 0; t < WNT; ++t)
+                    #pragma unroll
+                    for (int f = 0; f < 2; ++f)
+                        *reinterpret_cast<float2*>(wp + t * 16 + f * 8 + 2 * lane) = acc0[t][f];
+            }
+            continue;
+        }
         if constexpr (TRANS)
         {
             const int r = lane & 3;
@@ -721,41 +1059,152 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             #pragma unroll
             for (int j = 0; j < WK; ++j)
                 sum += sh_red[j][r][c];
-            const int col = group * COLS + c;
-            if constexpr (c_fp32) ((float*) C)[(size_t) r * size_n + col] = sum;
-            else                  ((half*)  C)[(size_t) r * size_n + col] = __float2half_rn(sum);
+            if constexpr (MULTI)
+            {
+                if constexpr (c_fp32) ((float*) mc)[(size_t) r * mrs + mcol0 + c] = sum;
+                else                  ((half*)  mc)[(size_t) r * mrs + mcol0 + c] = __float2half_rn(sum);
+            }
+            else
+            {
+                const int col = group * COLS + c;
+                if constexpr (c_fp32) ((float*) C)[(size_t) r * size_n + col] = sum;
+                else                  ((half*)  C)[(size_t) r * size_n + col] = __float2half_rn(sum);
+            }
         }
         __syncthreads();
     }
 
     #undef XP
+    if constexpr (EXL3_GEMV_BAL_DBG & 128) pr[2] = clock64();
+    if constexpr (EXL3_GEMV_BAL_DBG & 256) if (threadIdx.x % 32 == 0) g_bal_wt[wt_i + 2] = exl3_globaltimer();
 
     // Output scales and Hadamard transform, same semantics as the inner GEMM epilogue
     {
         grid.sync();
+        if constexpr (EXL3_GEMV_BAL_DBG & 128) pr[3] = clock64();
+        if constexpr (EXL3_GEMV_BAL_DBG & 256) if (threadIdx.x % 32 == 0) g_bal_wt[wt_i + 3] = exl3_globaltimer();
 
         int total_warps = size_m * size_n / 128;
+        if constexpr (MULTI) total_warps *= mv.num_slices;
         int warps_grid = gridDim.x * blockDim.x / 32;
         int this_warp = threadIdx.x / 32 + blockDim.x / 32 * blockIdx.x;
 
         for(; this_warp < total_warps; this_warp += warps_grid)
         {
-            if constexpr (c_fp32)
+            // This warp's 128 output columns and their svh: in place in C, or in its slice's output (MULTI)
+            void* oc;
+            const half* osv;
+            if constexpr (MULTI)
+            {
+                // Warps of a slice: its rows in order, size_n / 128 per row
+                const int per_row = size_n / 128;
+                const int sl = this_warp / (size_m * per_row);
+                const int rem = this_warp - sl * size_m * per_row;
+                const int r = rem / per_row;
+                const int loc = (rem - r * per_row) * 128;
+                void* sc = exl3_gemv_ns::multi_out<c_fp32>(mv, sl, r, size_m, size_n);
+                oc = c_fp32 ? (void*) ((float*) sc + loc) : (void*) ((half*) sc + loc);
+                osv = mv.svh_list[sl] + loc;
+            }
+            else
+            {
+                oc = c_fp32 ? (void*) (((float*) C) + this_warp * 128) : (void*) (((half*) C) + this_warp * 128);
+                osv = svh + (this_warp * 128) % size_n;
+            }
+            if constexpr (BAL)
+            {
+                const exl3_gemv_ns::BalPlan pl = exl3_gemv_ns::bal_plan(num_groups, size_k / 16, gridDim.x * WK);
+                const int col0 = this_warp * 128 + 4 * lane;
+                const int g = col0 / COLS;
+                const float* rp = bal_ws + (size_t) g * exl3_gemv_ns::bal_max_slots(pl) * COLS + (col0 & (COLS - 1));
+                const int u0 = g * pl.ks;
+                int m = exl3_gemv_ns::bal_owner(pl, u0 + pl.ks - 1) - exl3_gemv_ns::bal_owner(pl, u0) + 1;
+                if constexpr (EXL3_GEMV_BAL_DBG & 2) m = 1;
+                if constexpr (EXL3_GEMV_BAL_DBG & 4) m = 16;
+                // Slots 0 .. m - 1 in ascending order; the next batch of eight loads is issued before the current one is summed
+                float4 sum = make_float4(0.f, 0.f, 0.f, 0.f);
+                float4 v[8];
+                #pragma unroll
+                for (int u = 0; u < 8; ++u)
+                    if (u < m) v[u] = __ldcg(reinterpret_cast<const float4*>(rp + (size_t) u * COLS));
+                for (int j = 0; j < m; j += 8)
+                {
+                    float4 w[8];
+                    #pragma unroll
+                    for (int u = 0; u < 8; ++u)
+                        if (j + 8 + u < m) w[u] = __ldcg(reinterpret_cast<const float4*>(rp + (size_t) (j + 8 + u) * COLS));
+                    #pragma unroll
+                    for (int u = 0; u < 8; ++u)
+                        if (j + u < m) { sum.x += v[u].x; sum.y += v[u].y; sum.z += v[u].z; sum.w += v[u].w; }
+                    #pragma unroll
+                    for (int u = 0; u < 8; ++u)
+                        v[u] = w[u];
+                }
+                if constexpr (c_fp32)
+                    exl3_gemv_ns::had_ff_post_regs(sum, (float*) oc, osv, 0.088388347648f);
+                else
+                    exl3_gemv_ns::had_hf_post_regs(sum, (half*) oc, osv, 0.088388347648f);
+            }
+            else if constexpr (c_fp32)
                 had_ff_r_128_inner<false, true>
                 (
-                    ((const float*) C) + this_warp * 128,
-                    ((float*) C) + this_warp * 128,
-                    svh + (this_warp * 128) % size_n,
+                    (const float*) oc,
+                    (float*) oc,
+                    osv,
                     0.088388347648f  // 1/sqrt(128)
                 );
             else
                 had_hf_r_128_inner<false, true>
                 (
-                    ((const half*) C) + this_warp * 128,
-                    ((half*) C) + this_warp * 128,
-                    svh + (this_warp * 128) % size_n,
+                    (const half*) oc,
+                    (half*) oc,
+                    osv,
                     0.088388347648f  // 1/sqrt(128)
                 );
         }
     }
+    if constexpr (EXL3_GEMV_BAL_DBG & 128)
+    {
+        __syncthreads();
+        if (threadIdx.x == 0)
+        {
+            pr[4] = clock64();
+            for (int i = 0; i < 4; ++i) g_bal_probe[blockIdx.x * 8 + i] = pr[i + 1] - pr[i];
+            g_bal_probe[blockIdx.x * 8 + 4] = pr[4] - pr[0];
+        }
+    }
+}
+
+template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF = false, bool BAL = false>
+__global__ __launch_bounds__(CFG == 0 ? 512 : 256, ((HALF && CFG == 0) || BAL) ? 2 : 1)
+void exl3_gemv_kernel(EXL3_GEMM_ARGS)
+{
+    exl3_gemv_body<bits, c_fp32, cb, MMODE, CFG, SMEM_STAGE, HALF, BAL, false>
+        (A, B, C, size_m, size_k, size_n, locks, suh, A_had, svh, exl3_gemv_ns::MultiView {});
+}
+
+// m = 1 GEMV over a gated input (SwiGLU down projection): A = [gate row | up row] (see GATED), mul1, staged words
+template <int bits, bool c_fp32, int CFG, bool BAL>
+__global__ __launch_bounds__(CFG == 0 ? 512 : 256, BAL ? 2 : 1)
+void exl3_gemv_gated_kernel(EXL3_GEMM_ARGS)
+{
+    exl3_gemv_body<bits, c_fp32, 2, 0, CFG, true, false, BAL, false, true>
+        (A, B, C, size_m, size_k, size_n, locks, suh, A_had, svh, exl3_gemv_ns::MultiView {});
+}
+
+// Small-m multi-matrix GEMV (mul1, staged tile words) under exl3_mgemm's launch signature, so the same graph sites (A, C,
+// indices, weights) patch it. Uniform mode (bszm_out matrices of width size_n, outputs C[j]) or sliced mode (equal-width
+// slices, per-source input transform); indices, weights and per-slot inputs are declined by the host. MMODE as in
+// exl3_gemv_kernel; the balanced split is m = 1 only
+template <int bits, bool c_fp32, int MMODE, int CFG, bool BAL>
+__global__ __launch_bounds__(CFG == 0 ? 512 : 256, BAL ? 2 : 1)
+void exl3_mgemv_kernel(EXL3_MGEMM_ARGS)
+{
+    const exl3_gemv_ns::MultiView mv
+    {
+        bszm_out, had_src_list ? num_had_src : bszm_out,
+        B_list, suh_list, svh_list, C, C_list, n_stride_list, had_src_list
+    };
+    exl3_gemv_body<bits, c_fp32, 2, MMODE, CFG, true, false, BAL, true>
+        (A, nullptr, nullptr, size_m, size_k, size_n, locks, nullptr, A_had, nullptr, mv);
 }

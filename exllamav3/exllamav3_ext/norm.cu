@@ -484,6 +484,153 @@ void rms_norm_gr
     rms_norm_impl(x, w, y, {}, epsilon, constant_bias, constant_scale, false, RES_NONE, graph);
 }
 
+// Post-norm residual then the next pre-norm, one row per block (post-norm models at decode / short rows):
+//   r += norm(x) * w1;  out = norm(r) * w2
+// The same arithmetic as rms_norm_kernel<RES_POST> followed by rms_norm_kernel<RES_NONE> over r (the second norm
+// reads r as stored, rounded to its dtype), so the result is bit-identical to the two launches. One float4 per thread
+template <typename input_t, typename weight_t, typename residual_t>
+__global__ __launch_bounds__(NUM_THREADS)
+void rms_norm_post_pre_kernel
+(
+    const input_t* __restrict__ x,
+    const weight_t* __restrict__ w1,
+    residual_t* __restrict__ r,
+    const weight_t* __restrict__ w2,
+    half* __restrict__ out,
+    const float eps1,
+    const float eps2,
+    const int dim,
+    const float cb1,
+    const float cs1,
+    const float cb2,
+    const float cs2
+)
+{
+    constexpr bool input_fp16 = std::is_same_v<input_t, half>;
+    constexpr bool weight_bf16 = std::is_same_v<weight_t, bfloat16>;
+    constexpr bool residual_fp16 = std::is_same_v<residual_t, half>;
+    const int t = threadIdx.x;
+    const int warp_id = t / 32, lane_id = t % 32;
+    const size_t row_off = (size_t) blockIdx.x * dim;
+    const int columns = dim / 4;
+    const bool active = t < columns;
+
+    auto read_w = [&] (float4& w4, const weight_t* w, float cb)
+    {
+        if constexpr (weight_bf16) read_bfloat164   (w4, ((const bfloat164*) w) + t);
+        else                       read_half4<false>(w4, ((const half4*)     w) + t);
+        if (cb != 0.0f) { w4.x += cb; w4.y += cb; w4.z += cb; w4.w += cb; }
+    };
+
+    float4 x4 = {};
+    float sum = 0.0f;
+    if (active)
+    {
+        if constexpr (input_fp16) read_half4<true>(x4, ((const half4*) (x + row_off)) + t);
+        else                      read_float4(x4, ((const float4*) (x + row_off)) + t);
+        sum = sum_sq4(sum, x4);
+    }
+    sum = reduce_dyn(sum, warp_id, lane_id);
+    const float rmf1 = rsqrtf(sum / (float) dim + eps1) * cs1;
+
+    float sum2 = 0.0f;
+    if (active)
+    {
+        if (w1) { float4 w4; read_w(w4, w1, cb1); apply4(x4, w4, rmf1); }
+        else    apply4_nw(x4, rmf1);
+        float4 r4;
+        if constexpr (residual_fp16) read_half4<false>(r4, ((const half4*) (r + row_off)) + t);
+        else                         read_float4(r4, ((const float4*) (r + row_off)) + t);
+        x4.x += r4.x;
+        x4.y += r4.y;
+        x4.z += r4.z;
+        x4.w += r4.w;
+        if constexpr (residual_fp16)
+        {
+            write_half4(x4, ((half4*) (r + row_off)) + t);
+            // The second norm sees r as stored, clamped like the standalone norm's input loader (an overflowing
+            // residual update stores inf; the stored r keeps it)
+            read_half4<true>(x4, ((const half4*) (r + row_off)) + t);
+        }
+        else
+            write_float4(x4, ((float4*) (r + row_off)) + t);
+        sum2 = sum_sq4(sum2, x4);
+    }
+    __syncthreads();   // reduce_dyn's partials are reused
+    sum2 = reduce_dyn(sum2, warp_id, lane_id);
+    const float rmf2 = rsqrtf(sum2 / (float) dim + eps2) * cs2;
+    if (active)
+    {
+        if (w2) { float4 w4; read_w(w4, w2, cb2); apply4(x4, w4, rmf2); }
+        else    apply4_nw(x4, rmf2);
+        write_half4(x4, ((half4*) (out + row_off)) + t);
+    }
+}
+
+// r += norm(x) * w1 (in place), out = norm(r) * w2 (fp16). Rows of up to 4 * NUM_THREADS values; the caller checks
+// rms_norm_post_pre_ok
+bool rms_norm_post_pre_ok(const at::Tensor& x, const at::Tensor& r)
+{
+    const int dim = x.size(-1);
+    return dim % 4 == 0 && dim / 4 <= NUM_THREADS && x.is_contiguous() && r.is_contiguous() &&
+           (x.scalar_type() == at::kFloat || x.scalar_type() == at::kHalf) &&
+           (r.scalar_type() == at::kFloat || r.scalar_type() == at::kHalf);
+}
+
+void rms_norm_post_pre
+(
+    at::Tensor x,
+    c10::optional<at::Tensor> w1,
+    at::Tensor r,
+    c10::optional<at::Tensor> w2,
+    at::Tensor out,
+    float eps1,
+    float cb1,
+    float cs1,
+    float eps2,
+    float cb2,
+    float cs2
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK(rms_norm_post_pre_ok(x, r), "rms_norm_post_pre: unsupported shape or dtype");
+    TORCH_CHECK_SHAPES_FULL(x, r);
+    TORCH_CHECK_SHAPES_FULL(x, out);
+    TORCH_CHECK_DTYPE(out, kHalf);
+    const int dim = x.size(-1);
+    int rows = 1;
+    for (int i = 0; i < x.dim() - 1; ++i) rows *= x.size(i);
+    if (!rows) return;
+    auto tw = w1 ? w1.value().scalar_type() : (w2 ? w2.value().scalar_type() : at::kHalf);
+    TORCH_CHECK(!w1 || w1.value().scalar_type() == tw, "rms_norm_post_pre: weights must share a dtype");
+    TORCH_CHECK(!w2 || w2.value().scalar_type() == tw, "rms_norm_post_pre: weights must share a dtype");
+    if (w1) TORCH_CHECK(w1.value().numel() == dim, "rms_norm_post_pre: w1 size");
+    if (w2) TORCH_CHECK(w2.value().numel() == dim, "rms_norm_post_pre: w2 size");
+    const int threads = MIN(NUM_THREADS, CEIL_DIVIDE(dim / 4, 32) * 32);
+
+    #define PP(_tx, __tx, _tw, __tw, _tr, __tr)                                                              \
+    if (x.scalar_type() == at::_tx && tw == at::_tw && r.scalar_type() == at::_tr)                          \
+    {                                                                                                        \
+        rms_norm_post_pre_kernel<__tx, __tw, __tr><<<rows, threads, 0, stream>>>                             \
+        (                                                                                                    \
+            (const __tx*) x.data_ptr(), (const __tw*) OPTPTR(w1), (__tr*) r.data_ptr(),                      \
+            (const __tw*) OPTPTR(w2), (half*) out.data_ptr(), eps1, eps2, dim, cb1, cs1, cb2, cs2            \
+        );                                                                                                   \
+    }
+         PP(kFloat, float, kBFloat16, bfloat16, kFloat, float)
+    else PP(kFloat, float, kHalf,     half,     kFloat, float)
+    else PP(kHalf,  half,  kBFloat16, bfloat16, kFloat, float)
+    else PP(kHalf,  half,  kHalf,     half,     kFloat, float)
+    else PP(kFloat, float, kBFloat16, bfloat16, kHalf,  half)
+    else PP(kFloat, float, kHalf,     half,     kHalf,  half)
+    else PP(kHalf,  half,  kBFloat16, bfloat16, kHalf,  half)
+    else PP(kHalf,  half,  kHalf,     half,     kHalf,  half)
+    else TORCH_CHECK(false, "rms_norm_post_pre: unsupported dtypes");
+    #undef PP
+    cuda_check(cudaPeekAtLastError());
+}
+
 // Fused pre-norm residual add: r += x (in place), y = norm(r) * w
 void rms_norm_res_in
 (

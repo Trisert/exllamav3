@@ -1,4 +1,4 @@
-// fa60: flash-attention forward for Pascal (sm_60, GP100), head_dim 256, fp16 in/out, for the prefill path.
+// fa60: flash-attention forward for Pascal (sm_60, GP100), head_dim 256 or 128, fp16 in/out, for the prefill path.
 // No tensor cores, no cp.async, 48 KB of shared memory per block: everything runs on HFMA2 (twice the fp32 FMA
 // rate on GP100). PyTorch's memory-efficient SDPA kernel for these shapes is a SIMT fp32 kernel.
 //
@@ -31,18 +31,18 @@
 namespace fa60
 {
 
-constexpr int HD = 256;
 constexpr int BM = 64;
 constexpr int BN = 16;
 constexpr int NT = 256;
-constexpr int QS = HD + 8;           // row stride (halves) of Q and K/V tiles: 528 B, rows 4 banks apart
 constexpr int PS = BM + 8;           // row stride (halves) of the transposed P tile: 144 B
 
 __device__ __forceinline__ half2 u2h(uint32_t u) { return *reinterpret_cast<half2*>(&u); }
 
-// DSLICE: head dims per fp16 partial of S (DSLICE / 2 HFMA2 terms per lane); PVK: keys per fp16 partial of P V
-template <int DSLICE, int PVK>
-__global__ void __launch_bounds__(NT, 1)
+// HD: head_dim (256 or 128). DSLICE: head dims per fp16 partial of S (DSLICE / 2 HFMA2 terms per lane); PVK: keys per
+// fp16 partial of P V. At HD 128 each thread of the P V mapping owns 4 rows x 8 columns (one half of the 256 form),
+// the tiles are half as wide and two blocks fit per SM
+template <int HD, int DSLICE, int PVK>
+__global__ void __launch_bounds__(NT, HD == 128 ? 2 : 1)
 fa60_kernel
 (
     const half* __restrict__ q, int64_t q_row, int64_t q_head,
@@ -50,10 +50,14 @@ fa60_kernel
     const half* __restrict__ v, int64_t v_row, int64_t v_head,
     half* __restrict__ o,
     int Tq, int Tkv, int Hq, int Hkv,
-    float scale_log2, int causal, int offs
+    float scale_log2, int causal, int offs, int window
 )
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 600
+    constexpr int QS = HD + 8;       // row stride (halves) of Q and K/V tiles: 528 / 272 B, rows 4 banks apart
+    constexpr int CPR = HD / 8;      // 16-byte chunks per row
+    constexpr int NH = HD / 128;     // 8-column groups per thread in the P V mapping (2 at HD 256, 1 at HD 128)
+    static_assert(HD == 256 || HD == 128, "fa60: head_dim 256 or 128");
     __shared__ __align__(16) half Qs[BM * QS];
     __shared__ __align__(16) half KVs[BN * QS];
     __shared__ __align__(16) half Ps[BN * PS];
@@ -73,12 +77,12 @@ fa60_kernel
     k += hk * k_head;
     v += hk * v_head;
 
-    // Stage Q: 64 rows x 32 16-byte chunks, 8 per thread
+    // Stage Q: 64 rows x CPR 16-byte chunks, (BM * CPR) / NT per thread
     #pragma unroll
     for (int j = 0; j < (BM * HD / 8) / NT; ++j)
     {
         const int idx = tid + j * NT;
-        const int r = idx >> 5, c = idx & 31;
+        const int r = idx / CPR, c = idx % CPR;
         uint4 val = make_uint4(0, 0, 0, 0);
         if (m0 + r < Tq) val = *reinterpret_cast<const uint4*>(q + (int64_t)(m0 + r) * q_row + c * 8);
         *reinterpret_cast<uint4*>(Qs + r * QS + c * 8) = val;
@@ -88,20 +92,23 @@ fa60_kernel
     // and eight keys of one load sit 4 banks apart)
     const int rg = lane >> 3, kg = lane & 7;
     const int sr0 = 8 * warp + rg, sr1 = sr0 + 4;
-    // PV mapping: rows 4 * pr .. 4 * pr + 3, columns pc * 8 + 0..7 and 128 + pc * 8 + 0..7
+    // PV mapping: rows 4 * pr .. 4 * pr + 3, columns pc * 8 + 0..7 (and 128 + pc * 8 + 0..7 at HD 256)
     const int pr = tid >> 4, pc = tid & 15;
 
-    float oacc[4][16];
+    float oacc[4][8 * NH];
     #pragma unroll
     for (int r = 0; r < 4; ++r)
         #pragma unroll
-        for (int c = 0; c < 16; ++c) oacc[r][c] = 0.0f;
+        for (int c = 0; c < 8 * NH; ++c) oacc[r][c] = 0.0f;
     float mrow[2] = { -1e30f, -1e30f };
     float lrow[2] = { 0.0f, 0.0f };
 
     int kv_end = causal ? min(Tkv, m0 + BM + offs) : Tkv;
     kv_end = max(kv_end, 0);
     const int n_tiles = (kv_end + BN - 1) / BN;
+    // Causal sliding window (window >= 0: query i sees keys i + offs - window .. i + offs): tiles below the first
+    // row's band are skipped
+    const int t0 = window >= 0 ? min(max(0, m0 + offs - window) / BN, n_tiles) : 0;
 
     uint4 st[(BN * HD / 8) / NT];
     auto gload = [&] (const half* src, int64_t rs, int n0)
@@ -110,7 +117,7 @@ fa60_kernel
         for (int j = 0; j < (BN * HD / 8) / NT; ++j)
         {
             const int idx = tid + j * NT;
-            const int r = idx >> 5, c = idx & 31;
+            const int r = idx / CPR, c = idx % CPR;
             st[j] = n0 + r < Tkv ? *reinterpret_cast<const uint4*>(src + (int64_t)(n0 + r) * rs + c * 8) : make_uint4(0, 0, 0, 0);
         }
     };
@@ -120,14 +127,14 @@ fa60_kernel
         for (int j = 0; j < (BN * HD / 8) / NT; ++j)
         {
             const int idx = tid + j * NT;
-            const int r = idx >> 5, c = idx & 31;
+            const int r = idx / CPR, c = idx % CPR;
             *reinterpret_cast<uint4*>(KVs + r * QS + c * 8) = st[j];
         }
     };
 
-    if (n_tiles > 0)
+    if (n_tiles > t0)
     {
-        gload(k, k_row, 0);
+        gload(k, k_row, t0 * BN);
         sstore();
     }
     __syncthreads();
@@ -137,7 +144,7 @@ fa60_kernel
     const half* ka = KVs + kg * QS;
     const half* kb = KVs + (kg + 8) * QS;
 
-    for (int kt = 0; kt < n_tiles; ++kt)
+    for (int kt = t0; kt < n_tiles; ++kt)
     {
         const int n0 = kt * BN;
 
@@ -185,7 +192,8 @@ fa60_kernel
         }
 
         // Mask, online softmax (log2 domain); P to shared memory as fp16, transposed
-        const bool need_mask = (n0 + BN > Tkv) || (causal && n0 + BN - 1 > m0 + offs);
+        const bool need_mask = (n0 + BN > Tkv) || (causal && n0 + BN - 1 > m0 + offs) ||
+                               (window >= 0 && n0 < m0 + BM - 1 + offs - window);
         #pragma unroll
         for (int hh = 0; hh < 2; ++hh)
         {
@@ -199,7 +207,8 @@ fa60_kernel
                 if (need_mask)
                 {
                     const int key = n0 + kg + 8 * e;
-                    if (key >= Tkv || (causal && key > row + offs)) x[e] = -1e30f;
+                    if (key >= Tkv || (causal && key > row + offs) || (window >= 0 && key < row + offs - window))
+                        x[e] = -1e30f;
                 }
             }
             float mx = fmaxf(x[0], x[1]);
@@ -209,8 +218,9 @@ fa60_kernel
             const float m_new = fmaxf(mrow[hh], mx);
             const float alpha = exp2f(mrow[hh] - m_new);
             mrow[hh] = m_new;
-            const float p0 = exp2f(x[0] - m_new);
-            const float p1 = exp2f(x[1] - m_new);
+            // With a window a row's first tiles can be fully masked (m_new still -1e30): masked keys weigh 0
+            const float p0 = (window >= 0 && x[0] <= -1e29f) ? 0.0f : exp2f(x[0] - m_new);
+            const float p1 = (window >= 0 && x[1] <= -1e29f) ? 0.0f : exp2f(x[1] - m_new);
             float sum = p0 + p1;
             sum += __shfl_xor_sync(0xffffffff, sum, 1);
             sum += __shfl_xor_sync(0xffffffff, sum, 2);
@@ -234,29 +244,28 @@ fa60_kernel
         #pragma unroll
         for (int j0 = 0; j0 < BN; j0 += PVK)
         {
-            half2 part[4][8];
+            half2 part[4][4 * NH];
             #pragma unroll
             for (int r = 0; r < 4; ++r)
                 #pragma unroll
-                for (int c = 0; c < 8; ++c) part[r][c] = __float2half2_rn(0.0f);
+                for (int c = 0; c < 4 * NH; ++c) part[r][c] = __float2half2_rn(0.0f);
             #pragma unroll
             for (int j = j0; j < j0 + PVK; ++j)
             {
                 const uint2 pp = *reinterpret_cast<const uint2*>(Ps + j * PS + 4 * pr);
-                const uint4 v0 = *reinterpret_cast<const uint4*>(KVs + j * QS + pc * 8);
-                const uint4 v1 = *reinterpret_cast<const uint4*>(KVs + j * QS + 128 + pc * 8);
                 const half2 p01 = u2h(pp.x), p23 = u2h(pp.y);
                 half2 ph[4] = { __low2half2(p01), __high2half2(p01), __low2half2(p23), __high2half2(p23) };
-                const uint32_t* V0 = reinterpret_cast<const uint32_t*>(&v0);
-                const uint32_t* V1 = reinterpret_cast<const uint32_t*>(&v1);
                 #pragma unroll
-                for (int c = 0; c < 4; ++c)
+                for (int g = 0; g < NH; ++g)
+                {
+                    const uint4 vv = *reinterpret_cast<const uint4*>(KVs + j * QS + 128 * g + pc * 8);
+                    const uint32_t* V = reinterpret_cast<const uint32_t*>(&vv);
                     #pragma unroll
-                    for (int r = 0; r < 4; ++r)
-                    {
-                        part[r][c] = __hfma2(ph[r], u2h(V0[c]), part[r][c]);
-                        part[r][4 + c] = __hfma2(ph[r], u2h(V1[c]), part[r][4 + c]);
-                    }
+                    for (int c = 0; c < 4; ++c)
+                        #pragma unroll
+                        for (int r = 0; r < 4; ++r)
+                            part[r][4 * g + c] = __hfma2(ph[r], u2h(V[c]), part[r][4 * g + c]);
+                }
             }
             // First slice of the tile rescales the running O by alpha (one FFMA per element)
             #pragma unroll
@@ -264,7 +273,7 @@ fa60_kernel
             {
                 const float a = j0 == 0 ? al[r] : 1.0f;
                 #pragma unroll
-                for (int c = 0; c < 8; ++c)
+                for (int c = 0; c < 4 * NH; ++c)
                 {
                     const float2 f = __half22float2(part[r][c]);
                     if (j0 == 0)
@@ -301,26 +310,28 @@ fa60_kernel
         const float l = l_s[4 * pr + r];
         const float inv = l > 0.0f ? 1.0f / l : 0.0f;
         half* o_ = o + ((int64_t) row * Hq + hq) * HD;
-        half2 h[8];
+        half2 h[4 * NH];
         #pragma unroll
-        for (int c = 0; c < 8; ++c) h[c] = __floats2half2_rn(oacc[r][2 * c] * inv, oacc[r][2 * c + 1] * inv);
-        *reinterpret_cast<uint4*>(o_ + pc * 8) = *reinterpret_cast<const uint4*>(&h[0]);
-        *reinterpret_cast<uint4*>(o_ + 128 + pc * 8) = *reinterpret_cast<const uint4*>(&h[4]);
+        for (int c = 0; c < 4 * NH; ++c) h[c] = __floats2half2_rn(oacc[r][2 * c] * inv, oacc[r][2 * c + 1] * inv);
+        #pragma unroll
+        for (int g = 0; g < NH; ++g)
+            *reinterpret_cast<uint4*>(o_ + 128 * g + pc * 8) = *reinterpret_cast<const uint4*>(&h[4 * g]);
     }
 #endif
 }
 
 } // namespace fa60
 
-// q [Tq, Hq, 256], k/v [Tkv, Hkv, 256] (last dim contiguous), o [Tq, Hq, 256] contiguous
-void fa60_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, double scale, bool causal)
+// q [Tq, Hq, D], k/v [Tkv, Hkv, D] (last dim contiguous), o [Tq, Hq, D] contiguous, D = 256 or 128
+static void fa60_launch(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, double scale, bool causal, int window)
 {
     const at::cuda::OptionalCUDAGuard guard(q.device());
     TORCH_CHECK(q.dtype() == at::kHalf && k.dtype() == at::kHalf && v.dtype() == at::kHalf && o.dtype() == at::kHalf, "fa60_fwd: fp16");
     TORCH_CHECK(q.is_cuda() && k.device() == q.device() && v.device() == q.device() && o.device() == q.device(),
                 "fa60_fwd: q, k, v, o on one CUDA device");
     TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && v.dim() == 3 && o.dim() == 3, "fa60_fwd: 3-d tensors");
-    TORCH_CHECK(q.size(2) == fa60::HD && k.size(2) == fa60::HD && v.size(2) == fa60::HD, "fa60_fwd: head_dim 256");
+    const int D = q.size(2);
+    TORCH_CHECK((D == 256 || D == 128) && k.size(2) == D && v.size(2) == D, "fa60_fwd: head_dim 256 or 128");
     TORCH_CHECK(q.stride(2) == 1 && k.stride(2) == 1 && v.stride(2) == 1 && o.is_contiguous(), "fa60_fwd: contiguous head dim");
     TORCH_CHECK(q.stride(1) % 8 == 0 && q.stride(0) % 8 == 0 && k.stride(0) % 8 == 0 && k.stride(1) % 8 == 0 &&
                 v.stride(0) % 8 == 0 && v.stride(1) % 8 == 0, "fa60_fwd: 16-byte aligned strides");
@@ -332,14 +343,26 @@ void fa60_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, double sca
     if (Tq == 0) return;
     dim3 grid((Tq + fa60::BM - 1) / fa60::BM, Hq);
     // DSLICE 16 (8 fp16 terms per lane), PVK 16: see the measurements in the header comment
-    auto kern = fa60::fa60_kernel<16, 16>;
+    auto kern = D == 256 ? fa60::fa60_kernel<256, 16, 16> : fa60::fa60_kernel<128, 16, 16>;
     kern<<<grid, fa60::NT, 0, at::cuda::getCurrentCUDAStream()>>>(
         (const half*) q.data_ptr(), q.stride(0), q.stride(1),
         (const half*) k.data_ptr(), k.stride(0), k.stride(1),
         (const half*) v.data_ptr(), v.stride(0), v.stride(1),
         (half*) o.data_ptr(),
-        Tq, Tkv, Hq, Hkv, (float)(scale * 1.4426950408889634), causal ? 1 : 0, Tkv - Tq);
+        Tq, Tkv, Hq, Hkv, (float)(scale * 1.4426950408889634), causal ? 1 : 0, Tkv - Tq, window);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void fa60_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, double scale, bool causal)
+{
+    fa60_launch(q, k, v, o, scale, causal, -1);
+}
+
+// Causal sliding window: query i (bottom-right aligned) sees keys j with i + Tkv - Tq - window <= j <= i + Tkv - Tq
+void fa60_fwd_window(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, double scale, int64_t window)
+{
+    TORCH_CHECK(window >= 0, "fa60_fwd_window: window must be >= 0");
+    fa60_launch(q, k, v, o, scale, true, (int) window);
 }
 
 #endif

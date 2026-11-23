@@ -157,6 +157,61 @@ void had_hf_r_128_inner
     ((half4*) output_ptr)[t] = v;
 }
 
+// Gated input (SwiGLU down projection): v = silu(g) * u per element, the half2 arithmetic of act_mul_kernel_h
+// (activation_kernels.cuh, ACT_SILU, act_limit 0), then the pre-scaled 128-point transform of had_hf_r_128_inner;
+// bit-identical to act_mul followed by had_hf_r_128_inner<true, false> on its output
+inline __device__
+void had_hf_r_128_gated
+(
+    const half* __restrict__ g_ptr,
+    const half* __restrict__ u_ptr,
+    half* __restrict__ output_ptr,
+    const half* __restrict__ scale,
+    const float r_scale
+)
+{
+    int t = threadIdx.x & 31;
+
+    const half4 g = load_half4_cg(((const half4*) g_ptr) + t);
+    const half4 u = load_half4_cg(((const half4*) u_ptr) + t);
+    auto silu2 = [] (half2 x)
+    {
+        half2 one = __float2half2_rn(1.0f);
+        half2 e = h2exp(__hneg2(x));
+        half2 r = h2rcp(__hadd2(one, e));
+        return __hmul2(x, r);
+    };
+    half4 v;
+    v.x = __hmul2(silu2(g.x), u.x);
+    v.y = __hmul2(silu2(g.y), u.y);
+
+    {
+        int i = blockIdx.y * 32 + t;
+        half4 scales = ((half4*) scale)[i];
+        v.x = __hmul2(v.x, scales.x);
+        v.y = __hmul2(v.y, scales.y);
+    }
+
+    float v0 = __half2float(__low2half(v.x));
+    float v1 = __half2float(__high2half(v.x));
+    float v2 = __half2float(__low2half(v.y));
+    float v3 = __half2float(__high2half(v.y));
+    float s0 = v0 + v1;
+    float d0 = v0 - v1;
+    float s1 = v2 + v3;
+    float d1 = v2 - v3;
+    float h0 = s0 + s1;
+    float h1 = d0 + d1;
+    float h2 = s0 - s1;
+    float h3 = d0 - d1;
+
+    shuffle_had_f4x32(h0, h1, h2, h3, t);
+    v.x = __floats2half2_rn(h0 * r_scale, h1 * r_scale);
+    v.y = __floats2half2_rn(h2 * r_scale, h3 * r_scale);
+
+    ((half4*) output_ptr)[t] = v;
+}
+
 // Float vector, half scales
 
 template <bool pre_scale, bool post_scale>

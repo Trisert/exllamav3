@@ -238,7 +238,31 @@ static bool enabled(int device)
     return on == 1;
 }
 
-// Scratch and counters for one (device, stream); null if they would have to be allocated during a capture.
+// Per-device set for graph captures: the capture stream is new, so a per-stream entry would have to be allocated
+// during the capture, which is not allowed, and every split-K call in a decode graph (the LFM3 headwise attention
+// gate, 2048 -> 16) fell back to cuBLAS (P100: ~18 us vs ~7 us). Allocated beside the first eager entry of the
+// device; captured launches of that device share it, as the other per-device ext workspaces (DevCtx) are shared.
+// Counters are zero on entry and on exit of every launch, so the replays find them clean. EXL3_HGEMV_GRAPH=0 keeps
+// the cuBLAS fallback inside captures
+static std::map<int, Buffers> g_graph_buffers;
+
+static bool graph_buffers_on()
+{
+    static const bool on = [] { const char* env = std::getenv("EXL3_HGEMV_GRAPH"); return !env || std::strcmp(env, "0") != 0; }();
+    return on;
+}
+
+static Buffers alloc_buffers(cudaStream_t stream)
+{
+    Buffers b;
+    cuda_check(cudaMalloc(&b.scratch, sizeof(float) * MAX_SCRATCH));
+    cuda_check(cudaMalloc(&b.counters, sizeof(int) * MAX_TILES));
+    cuda_check(cudaMemsetAsync(b.counters, 0, sizeof(int) * MAX_TILES, stream));
+    return b;
+}
+
+// Scratch and counters for one (device, stream); during a capture the per-device graph set above, or null if no
+// eager call on the device has allocated it yet.
 // Entries (about 4.25 MiB each) live for the process: torch hands out streams from a fixed pool (32 per device) and
 // the generator uses the current stream, so the map stays small. Code that creates fresh streams per request
 // would grow it, and then needs a release hook (not needed here)
@@ -250,12 +274,19 @@ static const Buffers* get_buffers(int device, cudaStream_t stream)
     if (it != g_buffers.end()) return &it->second;
     cudaStreamCaptureStatus status;
     cuda_check(cudaStreamIsCapturing(stream, &status));
-    if (status != cudaStreamCaptureStatusNone) return nullptr;
-    Buffers b;
-    cuda_check(cudaMalloc(&b.scratch, sizeof(float) * MAX_SCRATCH));
-    cuda_check(cudaMalloc(&b.counters, sizeof(int) * MAX_TILES));
-    cuda_check(cudaMemsetAsync(b.counters, 0, sizeof(int) * MAX_TILES, stream));
-    return &(g_buffers[key] = b);
+    if (status != cudaStreamCaptureStatusNone)
+    {
+        if (!graph_buffers_on()) return nullptr;
+        auto g = g_graph_buffers.find(device);
+        return g != g_graph_buffers.end() ? &g->second : nullptr;
+    }
+    if (graph_buffers_on() && !g_graph_buffers.count(device))
+    {
+        // Replays run on other streams: make the counter memset complete first (once per device)
+        g_graph_buffers[device] = alloc_buffers(stream);
+        cuda_check(cudaStreamSynchronize(stream));
+    }
+    return &(g_buffers[key] = alloc_buffers(stream));
 }
 
 static int num_sms(int device)

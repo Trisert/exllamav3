@@ -1835,6 +1835,17 @@ def _window_prefill_ok(q, q_len, window_left, window_right, softcap, has_sinks):
     )
 
 
+def _swa_prefill_ok(q, q_len, window_left, window_right, softcap, has_sinks):
+    """Sliding-window (left window, causal) chunks on the same dense-window SDPA path: chunked SDPA over each q
+    chunk's key band [first query - window_left, last query] with a banded mask (fa75 stays plain-causal only).
+    On sm_60 / sm_75 the Triton prefill kernel has no tensor-core path and ran LFM3's 256-token windows at
+    ~0.13 TFLOPS. EXL3_SDPA_SWA=0 keeps the Triton kernel (read per call)"""
+    return (
+        q_len > 8 and window_left >= 0 and window_right <= 0 and not softcap and not has_sinks and
+        q.dtype == torch.float16 and _sdpa_prefill(q.device) and os.environ.get("EXL3_SDPA_SWA", "1") != "0"
+    )
+
+
 def paged_attn_triton_prefill(
     q: torch.Tensor,
     k: torch.Tensor | None,
@@ -1993,17 +2004,18 @@ def paged_attn_triton_prefill(
     # kernel is kept for what the staging pass left out (short chunks below its threshold, non-causal).
     # Sliced staging only reaches SDPA through the fa75 sub-path below: SDPA exposes no lse, so a sliced
     # window cannot merge through it, while fa75 writes the unnormalized (o, m, l) the combine needs
+    swa = _swa_prefill_ok(q, q_len, window_left, window_right, softcap, has_sinks)
     if (
         staging_slices is None and
         qc is None and k_cache is not None and new_kv_mode == 0 and causal and
-        _window_prefill_ok(q, q_len, window_left, window_right, softcap, has_sinks)
+        (swa or _window_prefill_ok(q, q_len, window_left, window_right, softcap, has_sinks))
     ):
         from .torch import sdpa_prefill_paged
         if k is not None and kv_append_len:
             _paged_kv_update(k, v, k_cache, v_cache, block_table, cache_seqlens, block_table.shape[1], bsz,
                              kv_append_len, n_kv_heads, page_size, head_dim)
         return sdpa_prefill_paged(q, k_cache, v_cache, block_table, cache_seqlens, kv_append_len, causal,
-                                  softmax_scale, out)
+                                  softmax_scale, out, window_left = window_left if swa else -1)
 
     # Tile configs by head_dim, sized for ~100 KB of smem. Four warps over a 64-row tile keep
     # each warp on whole 16-row MMA tiles; eight warps split the rows below that granularity

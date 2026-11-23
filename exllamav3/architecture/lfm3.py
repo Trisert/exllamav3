@@ -100,6 +100,11 @@ class Lfm3Config(Config):
         # Sliding window, in tokens including the query (like the HF mask)
         self.sliding_window = self.read_cfg(int, f"{prefix}sliding_window", -1)
 
+        # Prefill GEMM on the P100 (sm_60 HFMA2 kernel): 64-element fp16 partials instead of 32 (+2.7..3.1 % prefill,
+        # LFM3-1.7B 8.0bpw prefill ppl 11.03210 -> 11.02903, top-1 4078/4096); other models keep the 32-element
+        # contract. EXL3_HGEMM_HFMA2_K64 = 0 / 1 overrides it for every model
+        self.prefill_gemm_k64 = True
+
         # RoPE is given per layer type, nested in rope_parameters (transformers v5 style)
         rope_parameters = config_dict.get("rope_parameters", None)
 

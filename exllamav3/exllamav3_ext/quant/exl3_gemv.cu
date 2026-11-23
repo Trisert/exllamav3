@@ -72,6 +72,19 @@ static bool exl3_gemv_sm75(int device)
     return is_sm75[device] == 2;
 }
 
+// Balanced split of the m = 1 GEMV (see exl3_gemv_kernel.cuh, BAL): EXL3_GEMV_BALANCE = 0 disables, 1 / unset = shape
+// heuristic, 2 = every eligible call (testing). Read once
+static int exl3_gemv_env_balance()
+{
+    static const int mode = [] { const char* env = std::getenv("EXL3_GEMV_BALANCE"); return env ? atoi(env) : 1; }();
+    return mode;
+}
+
+// Heuristic: every warp of the full wave needs at least this many cells (measured: below ~8 the partial-sum stage and
+// the prefetch fill outweigh the balance gain), and the unbalanced grid must fill less than this share of its rounds
+#define EXL3_GEMV_BAL_MIN_CELLS_PER_WARP 8
+#define EXL3_GEMV_BAL_UTIL_TENTHS 9
+
 static bool exl3_gemv_env_sm75_wide()
 {
     static const bool on = [] { const char* env = std::getenv("EXL3_GEMV_SM75_WIDE"); return !env || atoi(env) != 0; }();
@@ -81,6 +94,13 @@ static bool exl3_gemv_env_sm75_wide()
 static bool exl3_gemv_env_sm75_k5()
 {
     static const bool on = [] { const char* env = std::getenv("EXL3_GEMV_SM75_K5"); return !env || atoi(env) != 0; }();
+    return on;
+}
+
+// 7 / 8 bpw GEMV on Pascal (staged tile words, as on sm_75): EXL3_GEMV_PASCAL_K8 = 0 restores the tile GEMM (A/B testing)
+static bool exl3_gemv_env_pascal_k8()
+{
+    static const bool on = [] { const char* env = std::getenv("EXL3_GEMV_PASCAL_K8"); return !env || atoi(env) != 0; }();
     return on;
 }
 
@@ -101,8 +121,8 @@ static int exl3_gemv_cfg(int cc, bool sm75, int size_m, int size_k, int size_n, 
     // 2048 x 128000 lm_head). The gate was "only measured on Pascal", not a Turing defect: forced on the 2060 the
     // GEMV matches the tile GEMM within fp16 error. Wide beats narrow from n = 2048 up (6 bpw lm_head 672 vs 973 us,
     // tile GEMM 1038 us), narrow wins at n = 512 (9 vs 14 us). mcg / 3INST stay on Pascal
-    // 7 / 8 bpw (same staged form) are enabled on sm_75 only, where they are measured
-    if (K >= 7 && !sm75) return -1;
+    // 7 / 8 bpw (same staged form) are enabled on sm_75 and Pascal, where they are measured
+    if (K >= 7 && !sm75 && !(cc == CC_PASCAL && exl3_gemv_env_pascal_k8())) return -1;
     if (K >= 5 && cc != CC_PASCAL)
     {
         // m = 1 only (measured); EXL3_GEMV_SM75_K5=0 restores the tile GEMM for K >= 5 (A/B testing)
@@ -192,9 +212,12 @@ bool exl3_gemv_try_launch
     int device,
     cudaStream_t stream,
     void** launched_kernel,
-    bool force
+    bool force,
+    bool gated,
+    bool dry
 )
 {
+    if (gated && (size_m != 1 || half_k || cb != 2)) return false;
     // Free integer checks first; the env read (~64 ns) and device queries only run for calls
     // that could actually take this path
     if (!has_su_sv) return false;
@@ -252,6 +275,7 @@ bool exl3_gemv_try_launch
 
     auto select = [&] (int cfg_) -> void*
     {
+        if (gated) return exl3_gemv_select_kernel_gated(K, c_fp32, cfg_, false);
         return half_k ? exl3_gemv_select_kernel_half(K, c_fp32, mmode, cfg_, smem)
                       : exl3_gemv_select_kernel(K, cb, c_fp32, mmode, cfg_, smem);
     };
@@ -274,6 +298,42 @@ bool exl3_gemv_try_launch
     int grid = MIN(size_n / cols, max_blocks);
     if (grid < 1) return false;
 
+    // Balanced split (m = 1, mul1): the grid is the full co-resident wave and the (column group, k-slice) cells are
+    // spread evenly over its warps instead of one column group per block per round. Taken when the one-group-per-block
+    // path leaves the wave under-filled (rounds not full, or fewer groups than blocks) and every warp still gets enough
+    // cells to hide the extra partial-sum stage (measured on the RTX 2060 and the P100, see doc/pascal_bandwidth_research.md)
+    if (mmode == 0 && !half_k && cb == 2 && !(exl3_gemv_env_smem() == 1 && K < 5))
+    {
+        // The forced entry point (tests) takes the balanced split only when EXL3_GEMV_BALANCE = 2 asks for it explicitly
+        const int bal_mode = force ? (exl3_gemv_env_balance() == 2 ? 2 : 0) : exl3_gemv_env_balance();
+        if (bal_mode)
+        {
+            void* bal_kernel = gated ? exl3_gemv_select_kernel_gated(K, c_fp32, 1, true) : exl3_gemv_select_kernel_bal(K, c_fp32, 1);
+            if (bal_kernel)
+            {
+                const int bal_blocks = occupancy(bal_kernel, 256) * num_sms;
+                const int G = size_n / 64, ks = size_k / 16;
+                const long long cells = (long long) G * ks;
+                const int tw = bal_blocks * 8;
+                if (bal_blocks > 0 && cells < EXL3_GEMV_BAL_MAX_CELLS && (bal_mode == 2 || cells / tw >= EXL3_GEMV_BAL_MIN_CELLS_PER_WARP))
+                {
+                    const int groups_old = size_n / cols;
+                    const int rounds_old = (groups_old + max_blocks - 1) / max_blocks;
+                    const bool underfilled = groups_old * 10 < rounds_old * max_blocks * EXL3_GEMV_BAL_UTIL_TENTHS;
+                    const exl3_gemv_ns::BalPlan plan = exl3_gemv_ns::bal_plan(G, ks, tw);
+                    const bool fits = (size_t) exl3_gemv_ns::bal_max_slots(plan) * size_n <= (size_t) EXL3_GEMV_WS_FLOATS;
+                    if ((underfilled || bal_mode == 2) && fits)
+                    {
+                        kernel = bal_kernel;
+                        block_dim = 256;
+                        grid = bal_blocks;
+                    }
+                }
+            }
+        }
+    }
+
+    if (dry) return true;
     cuda_check(cudaLaunchCooperativeKernel
     (
         kernel,
@@ -284,6 +344,106 @@ bool exl3_gemv_try_launch
         stream
     ));
 
+    if (launched_kernel) *launched_kernel = kernel;
+    return true;
+}
+
+// Multi-matrix small-m GEMV (exl3_mgemv_kernel): EXL3_MGEMV = 0 disables, 1 / unset = Pascal, 2 = every CUDA device
+// (testing)
+static int exl3_mgemv_env_mode()
+{
+    static const int mode = [] { const char* env = std::getenv("EXL3_MGEMV"); return env ? atoi(env) : 1; }();
+    return mode;
+}
+
+bool exl3_mgemv_try_launch
+(
+    void** mgemm_args,
+    int size_m,
+    int size_k,
+    int size_n,
+    int num_slices,
+    int K,
+    bool half_k,
+    int cb,
+    bool c_fp32,
+    int device,
+    cudaStream_t stream,
+    void** launched_kernel
+)
+{
+    const int mmode_env = exl3_mgemv_env_mode();
+    if (!mmode_env || exl3_gemv_env_mode() == 0) return false;
+    if (size_m < 1 || size_m > EXL3_GEMV_MAX_M16 || half_k || cb != 2 || num_slices < 1) return false;
+    if (size_k % 128 || size_n % 128) return false;
+    const int cc = DevCtx::instance().get_cc(device);
+    if (mmode_env != 2 && !(cc == CC_PASCAL && exl3_gemv_env_pascal_k8())) return false;
+    const bool sm75 = cc == CC_OLD && exl3_gemv_sm75(device);
+    // Row modes as the single-matrix GEMV picks them on Pascal (m = 9..16 only with EXL3_GEMV_M16)
+    const bool m16 = size_m > EXL3_GEMV_MAX_M;
+    if (m16 && !exl3_gemv_env_m16()) return false;
+    int mmode = size_m == 1 ? 0 : (m16 ? 5 : (size_m == 2 ? 2 : 1));
+    if (mmode == 1 && size_m <= 4)
+    {
+        const char* env = std::getenv("EXL3_GEMV_M34");
+        if (!env || atoi(env) != 0) mmode = 4;
+    }
+    if (!exl3_mgemv_select_kernel(K, c_fp32, mmode, 0, false)) return false;
+    const int num_sms = DevCtx::instance().get_num_sms(device);
+
+    static std::map<void*, int> occ_cache[MAX_DEVICES];
+    auto& cache = occ_cache[device];
+    auto occupancy = [&] (void* kernel, int block_dim) -> int
+    {
+        auto it = cache.find(kernel);
+        if (it != cache.end()) return it->second;
+        int blocks_per_sm;
+        cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, block_dim, 0));
+        cache[kernel] = blocks_per_sm;
+        return blocks_per_sm;
+    };
+
+    // The slices run as one matrix of num_slices * size_n columns: the single-matrix shape heuristic and balanced-split
+    // test apply to that virtual width
+    const int size_nv = num_slices * size_n;
+    void* narrow_kernel = exl3_mgemv_select_kernel(K, c_fp32, mmode, 0, false);
+    const int narrow_coresident = occupancy(narrow_kernel, 512) * num_sms;
+    const int cfg = exl3_gemv_cfg(cc, sm75, size_m, size_k, size_nv, K, cb, 1, narrow_coresident);
+    if (cfg < 0) return false;
+    void* kernel = exl3_mgemv_select_kernel(K, c_fp32, mmode, cfg, false);
+    if (!kernel) return false;
+    int block_dim = cfg == 0 ? 512 : 256;
+    const int cols = cfg == 0 ? 32 : 64;
+    if (size_n % cols) return false;
+    const int max_blocks = occupancy(kernel, block_dim) * num_sms;
+    int grid = MIN(size_nv / cols, max_blocks);
+    if (grid < 1) return false;
+
+    const int bal_mode = exl3_gemv_env_balance();
+    void* bal_kernel = bal_mode && mmode == 0 ? exl3_mgemv_select_kernel(K, c_fp32, 0, 1, true) : nullptr;
+    if (bal_kernel && size_n % 64 == 0)
+    {
+        const int bal_blocks = occupancy(bal_kernel, 256) * num_sms;
+        const int G = size_nv / 64, ks = size_k / 16;
+        const long long cells = (long long) G * ks;
+        const int tw = bal_blocks * 8;
+        if (bal_blocks > 0 && cells < EXL3_GEMV_BAL_MAX_CELLS && (bal_mode == 2 || cells / tw >= EXL3_GEMV_BAL_MIN_CELLS_PER_WARP))
+        {
+            const int groups_old = size_nv / cols;
+            const int rounds_old = (groups_old + max_blocks - 1) / max_blocks;
+            const bool underfilled = groups_old * 10 < rounds_old * max_blocks * EXL3_GEMV_BAL_UTIL_TENTHS;
+            const exl3_gemv_ns::BalPlan plan = exl3_gemv_ns::bal_plan(G, ks, tw);
+            const bool fits = (size_t) exl3_gemv_ns::bal_max_slots(plan) * size_nv <= (size_t) EXL3_GEMV_WS_FLOATS;
+            if ((underfilled || bal_mode == 2) && fits)
+            {
+                kernel = bal_kernel;
+                block_dim = 256;
+                grid = bal_blocks;
+            }
+        }
+    }
+
+    cuda_check(cudaLaunchCooperativeKernel(kernel, dim3(grid), dim3(block_dim), mgemm_args, 0, stream));
     if (launched_kernel) *launched_kernel = kernel;
     return true;
 }

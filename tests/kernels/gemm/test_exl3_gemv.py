@@ -249,3 +249,59 @@ def test_empty_gemv(device, fp32, m, k, n):
     with pytest.raises(RuntimeError, match = "incorrect datatype"):
         ext.exl3_gemv(A, tr, C.bfloat16(), suh, torch.empty_like(A), svh, False, True)
     _device_still_works(device)
+
+
+# Balanced split of the m = 1 GEMV (EXL3_GEMV_BALANCE): cells spread evenly over all warps of the co-resident wave, fp32
+# partial rows reduced in a fixed order. Shapes with column-group counts that do not divide the block count (any device),
+# K = 2..8 mul1, fp16 and fp32 C. The balanced kernel must match the float64 reference to the same tolerance as the
+# regular path, agree with the regular path to fp16-roundoff level, and repeat launches must be bit-identical.
+BAL_CASES = [
+    # K, k, n, fp32
+    (4, 2048, 1920, False),
+    (4, 7680, 2176, False),
+    (4, 1920, 7808, True),
+    (4, 640, 4224, False),
+    (2, 2560, 2432, False),
+    (3, 1280, 3200, True),
+    (5, 2048, 2304, False),
+    (6, 1024, 8576, False),     # wide / many groups
+    (7, 1536, 2688, True),
+    (8, 2048, 1792, False),
+]
+
+
+def _bal_worker(A, tr, suh, svh, n, K, fp32):
+    import torch
+    from exllamav3.ext import exllamav3_ext as ext
+    from testlib.env import get_test_device
+    device = get_test_device()
+    torch.cuda.set_device(device)
+    A = A.to(device); tr = tr.to(device); suh = suh.to(device); svh = svh.to(device)
+    out = []
+    for _ in range(2):
+        C = torch.empty((A.shape[0], n), dtype = torch.float if fp32 else torch.half, device = device)
+        ext.exl3_gemv(A, tr, C, suh, torch.empty_like(A), svh, False, True)
+        out.append(C.cpu())
+    torch.cuda.synchronize(device)
+    return out
+
+
+def _bal_run(A, tr, suh, svh, n, K, fp32, balance):
+    return run_isolated(_bal_worker, A, tr, suh, svh, n, K, fp32, env = {"EXL3_GEMV_BALANCE": balance})
+
+
+@pytest.mark.parametrize("K, k, n, fp32", BAL_CASES)
+def test_gemv_balanced_matches_reference(device, K, k, n, fp32):
+    if is_rocm():
+        pytest.skip("RDNA GEMV has no balanced split")
+    p, suh, svh, g = _weights(k, n, K, 17 * k + n)
+    A = (torch.randn(1, k, generator = g) * 0.5).half()
+    ref = tref.linear(A, p, suh, svh, K, "mul1")
+    tr = torch.from_numpy(p.copy())
+    reg = _bal_run(A, tr, suh, svh, n, K, fp32, "0")
+    bal = _bal_run(A, tr, suh, svh, n, K, fp32, "2")
+    _assert_close(bal[0], ref)
+    assert torch.equal(bal[0], bal[1]), "repeat launch differs"
+    e = bal[0].double() - reg[0].double()
+    assert (e.pow(2).mean().sqrt() / reg[0].double().pow(2).mean().sqrt()).item() < 2e-3
+    assert torch.equal(reg[0], reg[1])

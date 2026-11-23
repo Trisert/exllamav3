@@ -26,8 +26,17 @@ struct TritonKernel
     int num_warps;
     int shared_bytes;
     int grid_y = 1;     // second launch-grid axis chosen at compile time (sub-tiles), read by the graph launch sites
+    // Values appended after the launch site's args (before the scratch params): the constants a CUDA-native
+    // stand-in takes as parameters where the Triton kernel has constexprs
+    std::vector<void*> extra_args;
+    // Graph node identity: the CUfunction for a Triton module, the runtime kernel symbol for a CUDA-native kernel
+    // (cudaGraphKernelNodeGetParams reports that as the node's func)
+    void* node_handle = nullptr;
 
     TritonKernel(py::bytes cubin, std::string name, int num_warps, int shared_bytes);
+    // CUDA-native kernel with the same leading parameters (see attn_decode_native.cu); no module to unload
+    TritonKernel(CUfunction fn, void* runtime_symbol, std::string name, int num_warps, int shared_bytes,
+                 std::vector<void*> extra_args);
     ~TritonKernel();
     TritonKernel(const TritonKernel&) = delete;
     TritonKernel& operator=(const TritonKernel&) = delete;
@@ -36,5 +45,5 @@ struct TritonKernel
     // slot), without the trailing scratch params
     void launch(int gx, int gy, int gz, std::vector<void*>& args, cudaStream_t stream) const;
 
-    void* handle() const { return (void*) fn; }
+    void* handle() const { return node_handle ? node_handle : (void*) fn; }
 };

@@ -262,6 +262,8 @@ def main(args):
                     print_info("Press Alt-Enter to submit")
                     user_prompt = context[-1][0]
                     last_reply = context[-1][-1]
+                    if think:
+                        last_reply = prompt_format.edit_prefill(last_reply)
                     try:
                         prefix = read_input_fn(args, bot_name, True, last_reply)
                         context = context[:-1]
@@ -478,10 +480,15 @@ def main(args):
         # Add to context
         context.append((user_prompt, None))
 
+        # An edited reply resumes as the answer, after a closed think block, where the format has one
+        edit_think_block = prompt_format.edited_reply_think_block() if (prefix and think) else None
+
         # Tokenize context and trim from head if too long
         def get_input_ids(_prefix):
             frm_context = prompt_format.format(system_prompt, context, think)
             if _prefix:
+                if edit_think_block:
+                    frm_context += edit_think_block
                 frm_context += prefix
             elif think and prompt_format.thinktag()[0] is not None and prompt_format.inject_thinktag():
                 frm_context += prompt_format.thinktag()[0]
@@ -538,7 +545,7 @@ def main(args):
         stop_reason = None
         with (
             KeyReader() as keyreader,
-            streamer_cm(args, bot_name, tt[0], tt[1], args.updates_per_second, think) as s
+            streamer_cm(args, bot_name, tt[0], tt[1], args.updates_per_second, think and not edit_think_block) as s
         ):
             if prefix:
                 s.stream(prefix)

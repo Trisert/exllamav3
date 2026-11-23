@@ -15,8 +15,16 @@ int exl3_gemm_gr
     bool mcg,
     bool mul1,
     int force_num_sms,
-    Graph* graph
+    Graph* graph,
+    bool gated = false     // A = [gate row | up row], silu(gate) * up fed to the GEMV (see exl3_gemv_gated_ok)
 );
+
+// The m = 1 gated-input GEMV applies to this down projection (k, n, bitrate, codebook, output dtype, device): the
+// caller then skips its SwiGLU product kernel and passes the [gate | up] rows with gated = true. EXL3_GATED_DOWN=0
+// disables it
+bool exl3_gemv_gated_ok(const at::Tensor& A, const at::Tensor& B, const at::Tensor& C, bool mcg, bool mul1,
+                        const c10::optional<at::Tensor>& suh, const c10::optional<at::Tensor>& A_had,
+                        const c10::optional<at::Tensor>& svh);
 
 int exl3_gemm
 (

@@ -28,6 +28,23 @@ void rms_norm_gr
     Graph* graph
 );
 
+// Post-norm residual then pre-norm in one launch: r += norm(x) * w1, out = norm(r) * w2 (fp16)
+bool rms_norm_post_pre_ok(const at::Tensor& x, const at::Tensor& r);
+void rms_norm_post_pre
+(
+    at::Tensor x,
+    c10::optional<at::Tensor> w1,
+    at::Tensor r,
+    c10::optional<at::Tensor> w2,
+    at::Tensor out,
+    float eps1,
+    float cb1,
+    float cs1,
+    float eps2,
+    float cb2,
+    float cs2
+);
+
 void rms_norm_res_in
 (
     at::Tensor x,

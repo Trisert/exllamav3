@@ -14,3 +14,15 @@ void fa60_fwd
     double scale,
     bool causal
 );
+
+// Causal sliding window form: query i sees keys i + Tkv - Tq - window .. i + Tkv - Tq; tiles outside the band are
+// skipped
+void fa60_fwd_window
+(
+    at::Tensor q,
+    at::Tensor k,
+    at::Tensor v,
+    at::Tensor o,
+    double scale,
+    int64_t window
+);

@@ -1,3 +1,4 @@
+import os
 import torch
 from .common import AttnArgs, AttnFn, get_non_causal_span_arglist
 from ...util.backend import sdpa_prefill, fa75_prefill, fa60_prefill
@@ -160,8 +161,11 @@ def _attend_window(q_b, k_buf, v_buf, total_len, causal, softmax_scale, chunk_si
     or fa60 (sm_60) kernel where it applies (head_dim 256, fp16), else chunked SDPA"""
     seqlen_q, nheads, headdim = q_b.shape
     nheads_k = k_buf.shape[1]
+    # head_dim 128 runs fa60 only (fa75 is 256-only); EXL3_FA60_HD128=0 keeps SDPA for it (read per call)
+    hd128_fa60 = (headdim == 128 and fa60_prefill(q_b.device) and not fa75_prefill(q_b.device) and
+                  os.environ.get("EXL3_FA60_HD128", "1") != "0")
     if (
-        fa75 and headdim == 256 and q_b.dtype == torch.float16 and k_buf.dtype == torch.float16 and
+        fa75 and (headdim == 256 or hd128_fa60) and q_b.dtype == torch.float16 and k_buf.dtype == torch.float16 and
         total_len >= seqlen_q
     ):
         # One fa75 / fa60 call covers every q chunk and the whole GQA group
@@ -176,10 +180,23 @@ def _attend_window(q_b, k_buf, v_buf, total_len, causal, softmax_scale, chunk_si
                         chunk_size, group_gqa)
 
 
+def _fa60_window_ok(q_b, k_buf, total_len) -> bool:
+    """The sliding-window fa60 form applies: sm_60, fp16, head_dim 256 or 128 (128 under EXL3_FA60_HD128),
+    EXL3_FA60_SWA on"""
+    headdim = q_b.shape[-1]
+    return (
+        os.environ.get("EXL3_FA60_SWA", "1") != "0" and fa60_prefill(q_b.device) and not fa75_prefill(q_b.device) and
+        q_b.dtype == torch.float16 and k_buf.dtype == torch.float16 and total_len >= q_b.shape[0] and
+        (headdim == 256 or (headdim == 128 and os.environ.get("EXL3_FA60_HD128", "1") != "0"))
+    )
+
+
 def sdpa_prefill_paged(q, k_cache, v_cache, block_table, cache_seqlens, kv_append_len, causal, softmax_scale, out,
-                       chunk_size = 512):
+                       chunk_size = 512, window_left = -1):
     """Prefill attention over a dense fp16 paged cache whose new rows are already written (the sm_75 path
-    of paged_attn_triton_prefill): per sequence, its window viewed or gathered, then fa75 / SDPA"""
+    of paged_attn_triton_prefill): per sequence, its window viewed or gathered, then fa75 / SDPA.
+    window_left >= 0 (causal sliding window: key j is visible to query p for p - window_left <= j <= p) runs the
+    banded chunked SDPA"""
     bsz, seqlen_q, nheads, headdim = q.shape
     page_size = k_cache.shape[1]
     nheads_k = k_cache.shape[2]
@@ -188,13 +205,25 @@ def sdpa_prefill_paged(q, k_cache, v_cache, block_table, cache_seqlens, kv_appen
         total_len = seqlens[b] + kv_append_len
         num_blocks = (total_len + page_size - 1) // page_size
         k_buf, v_buf = _window_buffers(k_cache, v_cache, block_table[b, :num_blocks], nheads_k, headdim)
-        out[b] = _attend_window(q[b], k_buf, v_buf, total_len, causal, softmax_scale, chunk_size,
-                                fa75 = True, group_gqa = True)
+        if window_left >= 0 and causal and _fa60_window_ok(q[b], k_buf, total_len):
+            # sm_60: one fa60 call over the whole sequence, key tiles outside each query block's band skipped
+            # (EXL3_FA60_SWA=0 keeps the banded chunked SDPA; read per call)
+            from ...ext import exllamav3_ext as ext
+            scale = softmax_scale if softmax_scale is not None else headdim ** -0.5
+            ext.fa60_fwd_window(q[b], k_buf[:total_len], v_buf[:total_len], out[b], scale, window_left)
+        elif window_left >= 0:
+            out[b] = _sdpa_chunks(q[b], k_buf, v_buf, total_len, seqlen_q, nheads, nheads_k, causal, softmax_scale,
+                                  chunk_size, True, window_left = window_left)
+        else:
+            out[b] = _attend_window(q[b], k_buf, v_buf, total_len, causal, softmax_scale, chunk_size,
+                                    fa75 = True, group_gqa = True)
     return out
 
 
-def _sdpa_chunks(q_b, k_buf, v_buf, total_len, seqlen_q, nheads, nheads_k, causal, softmax_scale, chunk_size, turing):
-    """Chunked SDPA over one sequence's gathered cache (bottom-right causal per q chunk)"""
+def _sdpa_chunks(q_b, k_buf, v_buf, total_len, seqlen_q, nheads, nheads_k, causal, softmax_scale, chunk_size, turing,
+                 window_left = -1):
+    """Chunked SDPA over one sequence's gathered cache (bottom-right causal per q chunk). window_left >= 0 (causal
+    only): each chunk attends over its key band [first query - window_left, last query] with a banded bool mask"""
     # Transpose kv once for all chunks: (1, nheads_k, buf_len, headdim)
     k_sdpa_full = k_buf.transpose(0, 1).unsqueeze(0)
     v_sdpa_full = v_buf.transpose(0, 1).unsqueeze(0)
@@ -207,7 +236,16 @@ def _sdpa_chunks(q_b, k_buf, v_buf, total_len, seqlen_q, nheads, nheads_k, causa
         q_sdpa = q_chunk.transpose(0, 1).unsqueeze(0)
         chunk_len = chunk_end - chunk_start
 
-        if causal:
+        if causal and window_left >= 0:
+            q0 = total_len - seqlen_q + chunk_start
+            kv_end = total_len - seqlen_q + chunk_end
+            kv_start = max(0, q0 - window_left)
+            k_sdpa = k_sdpa_full[:, :, kv_start:kv_end]
+            v_sdpa = v_sdpa_full[:, :, kv_start:kv_end]
+            q_pos = torch.arange(q0, q0 + chunk_len, device = q_b.device)[:, None]
+            k_pos = torch.arange(kv_start, kv_end, device = q_b.device)[None, :]
+            attn_mask = (k_pos <= q_pos) & (k_pos >= q_pos - window_left)
+        elif causal:
             # This chunk's last query sits at absolute position: (total_len - seqlen_q) + chunk_end - 1
             # So it only needs kv up to that position (inclusive)
             kv_end = total_len - seqlen_q + chunk_end
