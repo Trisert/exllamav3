@@ -237,7 +237,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("n_stride_list") = py::none(), py::arg("had_src_list") = py::none(), py::arg("num_had_src") = 0);
     m.def("hgemm", &hgemm, "hgemm");
     m.def("hgemm_batched", &hgemm_batched, "hgemm_batched");
-    m.def("hgemm_recon", &hgemm_recon, "hgemm_recon");
+    m.def("hgemm_recon", &hgemm_recon, "hgemm_recon", py::arg("a"), py::arg("b"), py::arg("c"), py::arg("k64") = false);
 #if !defined(USE_ROCM)
     m.def("hgemm_f16acc", &hgemm_f16acc, "hgemm_f16acc");
     m.def("hgemm_f16acc_status", &hgemm_f16acc_status, "hgemm_f16acc_status");

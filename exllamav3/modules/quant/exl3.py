@@ -58,6 +58,8 @@ class LinearEXL3:
             from ...model.config import NullConfig
             config = NullConfig()
         self.config = config
+        # 64-element fp16 partials in the sm_60 prefill GEMM, where the model asks for it (Lfm3Config)
+        self.gemm_k64 = bool(getattr(config, "prefill_gemm_k64", False))
         self.transformers_fix = transformers_fix
         self.key = key
 
@@ -209,7 +211,7 @@ class LinearEXL3:
                 ext.reconstruct_had_slice(w, self.trellis, self.suh, self.svh, self.K, self.mcg, self.mul1, 0)
             else:
                 self._reconstruct_inner(w, 0)
-            ext.hgemm_recon(xh, w, y_)
+            ext.hgemm_recon(xh, w, y_, self.gemm_k64)
         else:
             numel_ = self.in_features * MAX_RECONSTRUCT_SLICE_N
             w_ = torch.empty((numel_,), dtype = torch.half, device = self.trellis.device)
@@ -222,7 +224,7 @@ class LinearEXL3:
                         w, self.trellis, self.suh, self.svh[n_start:], self.K, self.mcg, self.mul1, n_start)
                 else:
                     self._reconstruct_inner(w, n_start)
-                ext.hgemm_recon(xh, w, y_[:, n_start:n_end])
+                ext.hgemm_recon(xh, w, y_[:, n_start:n_end], self.gemm_k64)
 
         if not use_fused:
             ext.had_r_128(y_, y_, None, self.svh, 1.0)

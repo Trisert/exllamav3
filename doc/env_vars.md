@@ -309,6 +309,13 @@ identical, needle 3/3 at 49k. `tests/kernels/attention/test_decode_native.py`.
 Split target of the native decode kernel, in multiples of the SM count (the Triton kernel keeps 2). On the P100 4 gained
 1 % at 32k and lost 0.7 % at 512; 8 lost at every depth.
 
+### `EXL3_HGEMM_HFMA2_K64` (default: unset = per model)
+
+The sm_60 HFMA2 prefill GEMM with 64-element fp16 partials instead of 32 (half the fp16 -> fp32 flushes; rel RMS vs fp32
+8.5e-4 -> 1.2e-3). Unset: only where the model's config asks for it (`prefill_gemm_k64`: LFM3, measured: prefill
++2.7..3.1 % on the P100, prefill ppl 11.03210 -> 11.02903); every other model keeps the 32-element contract. `0` / `1`
+force it off / on for every call. Read once.
+
 ### `EXL3_FA60_SWA` (default: `1`)
 
 Sliding-window prefill layers on sm_60 (with `EXL3_SDPA_SWA`): one `fa60_fwd_window` call per sequence (key tiles

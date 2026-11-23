@@ -29,12 +29,13 @@ void hgemm_batched
 // when the device gains (rate probe, EXL3_HGEMM_F16ACC=0/1 overrides) and the shape is covered
 // (K % 64, N % 128, aligned packed input rows and nonoverlapping output rows/batches).
 // Shape/batch heuristics decide whether it pays; hgemm_recon adds the cuBLAS fallback.
-bool hgemm_f16acc_try(const at::Tensor& a, const at::Tensor& b, at::Tensor& c);
+// k64: 64-element fp16 partials on the sm_60 HFMA2 kernel (per model, see hgemm_f16acc.cu)
+bool hgemm_f16acc_try(const at::Tensor& a, const at::Tensor& b, at::Tensor& c, bool k64 = false);
 void hgemm_f16acc(at::Tensor a, at::Tensor b, at::Tensor c);
 int hgemm_f16acc_status(int device);
-void hgemm_recon(at::Tensor a, at::Tensor b, at::Tensor c);
+void hgemm_recon(at::Tensor a, at::Tensor b, at::Tensor c, bool k64 = false);
 
 // Pascal sm_60 counterpart (hgemm_f16acc.cu): HFMA2 with 32-term fp16 partials added into fp32, tried first by
 // hgemm_f16acc_try on sm_60 (EXL3_HGEMM_HFMA2=0 keeps cuBLAS). K % 32, N % 128, packed aligned rows
-bool hgemm_hfma2_try(const at::Tensor& a, const at::Tensor& b, at::Tensor& c);
+bool hgemm_hfma2_try(const at::Tensor& a, const at::Tensor& b, at::Tensor& c, bool k64 = false);
 void hgemm_hfma2(at::Tensor a, at::Tensor b, at::Tensor c, int64_t bm);

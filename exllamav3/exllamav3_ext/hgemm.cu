@@ -140,8 +140,9 @@ void hgemm
 
 #if defined(USE_ROCM)
 // Reconstruct-path GEMM. On CUDA this lives in hgemm_f16acc.cu, which ROCm builds leave out: always hipBLAS
-void hgemm_recon(at::Tensor a, at::Tensor b, at::Tensor c)
+void hgemm_recon(at::Tensor a, at::Tensor b, at::Tensor c, bool k64)
 {
+    (void) k64;
     hgemm(a, b, c);
 }
 #endif

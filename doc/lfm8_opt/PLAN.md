@@ -295,6 +295,17 @@ sliding-window layers, banded chunks) 57 ms, fa60 (6 full-attention layers) 55 m
   ctl EXL3_FA60_SWA=0 / fa60 / ctl, t/s): 512 3194 / 3257 / 3078, 2048 3546 / 3679 / 3504, 4096 3596 / 3738 / 3532,
   8192 3431 / 3571 / 3377, 16384 3148 / 3264 / 3098 (+3.9 / +4.4 / +4.9 / +4.9 / +4.5 %). Prefill ppl 11.03115 ->
   11.03210 (4096 tokens), top-1 4082/4096, needle 6/6.
+- **E19 ACCEPTED for LFM3 only: 64-element fp16 partials in the hfma2 prefill GEMM** (labelled numerics change, user
+  approved; `KS` template parameter: the fp16 accumulators open / flush per pair of 32-element K tiles). Microbench
+  (pf_gemm_bench.sh --check, M = 4096): gate/up 79.6 -> 83.5 % of the HFMA2 peak, down 75.9 -> 76.9, conv in 79.1 ->
+  83.3, 2048 x 2048 74.9 -> 77.7, k/v 69.7 -> 74.0; rel RMS vs fp32 8.5e-4 -> 1.19e-3. A/B (doc/lfm8_opt/ab_e19.sh, ctl /
+  K64 / ctl, t/s): 512 3384 / 3461 / 3347, 2048 3872 / 3948 / 3794, 4096 3894 / 3993 / 3854, 8192 3712 / 3801 / 3675,
+  16384 3399 / 3469 / 3359 (+2.7..3.1 %). Prefill ppl 11.03210 -> 11.02903, top-1 4078/4096, needle 6/6.
+  Scope: the GEMM serves every model on the P100, so the 64-element form is a per-call flag (`hgemm_recon(..., k64)`)
+  that LinearEXL3 sets from `config.prefill_gemm_k64`, True in Lfm3Config only (Lfm3VlConfig resets it: the vision
+  tower is unmeasured). Qwen3.6 / QNF / Ornith keep the 32-element contract bit for bit
+  (tests/kernels/gemm/test_hgemm_hfma2.py::test_hfma2_k64_flag, 53 passed). `EXL3_HGEMM_HFMA2_K64` = 0 / 1 forces it
+  off / on for every model. Default run re-checked: LFM3 prefill ppl 11.02903.
 
 ## STATUS after rounds 4-5 (final build 60280f40, re-measured)
 | metric | start | now |
